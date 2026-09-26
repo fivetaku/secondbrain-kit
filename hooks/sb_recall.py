@@ -204,17 +204,23 @@ def main():
         json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt": prompt.strip(), "updated": time.time()}, open(state_path, "w", encoding="utf-8"))
     except Exception:
         pass
-    try:   # recall_gate 의 Stop 게이트가 "이 프롬프트 이후 회상했나"를 보는 기준 시각
-        import hashlib, pathlib
-        gate_dir = pathlib.Path(os.environ.get("SB_RECALL_GATE_DIR", sb_config.sb_path("logs", "recall-gate")))
-        gate_dir.mkdir(parents=True, exist_ok=True)
-        (gate_dir / (hashlib.sha256(sid.encode()).hexdigest() + ".needs")).touch()
-    except Exception:
-        pass
+    # recall_gate 의 Stop 게이트 기준 시각 — 기간·이력 질문에만 건다(회수 목록만 붙은 프롬프트는 제외: 매 답변 되돌림 방지)
+    if hint:
+        try:
+            import hashlib, pathlib
+            gate_dir = pathlib.Path(os.environ.get("SB_RECALL_GATE_DIR", sb_config.sb_path("logs", "recall-gate")))
+            gate_dir.mkdir(parents=True, exist_ok=True)
+            (gate_dir / (hashlib.sha256(sid.encode()).hexdigest() + ".needs")).touch()
+        except Exception:
+            pass
     if os.environ.get("SB_RECALL_DEBUG") == "1":
         sys.stderr.write(f"sb-recall: {len(fresh)} items in {time.time()-t0:.2f}s\n")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}, ensure_ascii=False))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))  # ASCII 이스케이프(윈도우 인코딩)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # noqa: BLE001 — 훅은 어떤 이유로도 세션을 막지 않는다
+        pass
+    sys.exit(0)

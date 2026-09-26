@@ -34,11 +34,15 @@ def _get(url: str, timeout: float = 3):
         return r.read().decode('utf-8', 'replace')
 
 
+# 자식 파이썬 출력은 UTF-8 로 받는다 — 윈도우 cp949 파이프에서 한국어·이모지가 깨지거나 죽지 않게
+UTF8 = dict(capture_output=True, text=True, encoding='utf-8', errors='replace',
+            env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'})
+
+
 def check_venv():
     if not VPY.exists():
         return rec('❌', 'venv', '%s 없음 — install.py 재실행' % VPY)
-    r = subprocess.run([str(VPY), '-c', 'import chromadb, kiwipiepy, openai; print(chromadb.__version__)'],
-                       capture_output=True, text=True)
+    r = subprocess.run([str(VPY), '-c', 'import chromadb, kiwipiepy, openai; print(chromadb.__version__)'], **UTF8)
     rec('✅' if r.returncode == 0 else '❌', 'venv 패키지', (r.stdout or r.stderr).strip()[-120:])
 
 
@@ -71,7 +75,12 @@ def check_embedding():
         return rec('⚠', '벡터 컬렉션', str(exc))
     text = (row or [''])[0] or ''
     name = 'openai' if '"name":"openai"' in text else 'ollama' if '"name":"ollama"' in text else 'default'
-    rec('✅' if name != 'default' else '⚠', '벡터 임베딩', name + ('' if name != 'default' else ' (영어 전용 — 한국어 검색 약함)'))
+    if name == 'default':
+        rec('⚠', '벡터 임베딩', 'default (영어 전용 — 한국어 검색 약함)')
+    elif 'bge-m3' not in text:
+        rec('⚠', '벡터 임베딩', name + ' 이지만 bge-m3 가 아님 — 키트 설정과 다른 기존 컬렉션(docs/embedding.md)')
+    else:
+        rec('✅', '벡터 임베딩', name + ' / bge-m3')
     if name in ('openai', 'ollama'):
         try:
             tags = json.loads(_get('http://127.0.0.1:11434/api/tags'))
@@ -130,7 +139,7 @@ def check_codex():
     missing = [e for e in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop') if not _has_kit_hook(p, e)]
     rec('✅' if not missing else '❌', 'Codex 훅', '등록' if not missing else '누락: ' + ', '.join(missing))
     r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'installer' / 'codex_trust.py'),
-                        'list', '--json'], capture_output=True, text=True, timeout=60)
+                        'list', '--json'], timeout=60, **UTF8)
     try:
         hs = json.loads(r.stdout or '[]')
     except ValueError:
@@ -155,7 +164,7 @@ def check_rules():
 
 def check_state_and_capture():
     r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'bin' / 'sb_search.py'),
-                        '--mode', 'current', '--scope', 'global'], capture_output=True, text=True)
+                        '--mode', 'current', '--scope', 'global'], **UTF8)
     rec('✅' if r.returncode in (0,) else '❌', '상태층(state.db)', (r.stdout or r.stderr).strip().splitlines()[0][:100]
         if (r.stdout or r.stderr).strip() else 'rc=%d' % r.returncode)
     db = Path(sb_config.claude_mem_db())

@@ -23,7 +23,7 @@ class SessionContextTests(unittest.TestCase):
         # 기본: openchat-bridge 프로젝트 ↔ <root>/openchat-bridge 경로
         self.set_aliases({'openchat-bridge': [str(self.root / 'openchat-bridge')]})
         self.env = dict(os.environ, HOME=str(self.root), USERPROFILE=str(self.root),
-                        SB_HOME=str(self.root / 'sbhome'),
+                        SB_HOME=str(self.root / 'sbhome'), SB_CODEX_CAPTURE_EXEC='1',
                         SB_LOOPS_PATH=str(self.ledger),
                         SB_PROJECT_ALIASES=str(self.aliases),
                         SB_STATE_BRIEFING='0')

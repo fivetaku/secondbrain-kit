@@ -30,6 +30,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 KIT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
@@ -48,6 +49,7 @@ HOOK_TAG = 'secondbrain-kit'
 STAMP = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
 
 DRY = False
+WARNINGS = []  # 설치는 계속하되 끝에 다시 보여 줄 문제
 LOG = []
 
 
@@ -83,10 +85,17 @@ def backup(path: Path) -> None:
 
 
 def read_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
+    """없으면 빈 설정. 깨진 JSON 은 빈 설정으로 간주해 덮어쓰지 않고 중단한다(사용자 설정 보호)."""
+    if not path.exists():
         return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8') or '{}')
+    except ValueError as exc:
+        raise SystemExit('%s 의 JSON 이 깨져 있습니다(%s). 고친 뒤 다시 실행하세요 — 설정을 덮어쓰지 않았습니다.'
+                         % (path, exc))
+    if not isinstance(data, dict):
+        raise SystemExit('%s 가 JSON 객체가 아닙니다. 고친 뒤 다시 실행하세요.' % path)
+    return data
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -95,7 +104,9 @@ def write_json(path: Path, data: dict) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     backup(path)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    tmp = path.with_name(path.name + '.sbkit-tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    os.replace(tmp, path)  # 원자적 교체 — 중간에 끊겨도 반쪽 JSON 이 남지 않는다
 
 
 def py_cmd(script: str, *args: str) -> str:
@@ -156,7 +167,7 @@ def find_ollama() -> str:
     for c in cands:
         if c and Path(c).exists():
             return c
-    return 'ollama'
+    return None
 
 
 def ensure_ollama_running(exe: str) -> None:
@@ -241,7 +252,11 @@ def chroma_ef_name(chroma_dir: Path) -> str:
     if not row or not row[0]:
         return ''
     m = re.search(r'"embedding_function":\{"type":"known","name":"([^"]+)"', row[0])
-    return m.group(1) if m else 'default'
+    if not m:
+        return 'default'
+    if m.group(1) in ('openai', 'ollama') and 'bge-m3' not in row[0]:
+        return m.group(1) + '(bge-m3 아님)'
+    return m.group(1)
 
 
 def setup_embedding(args, tools) -> None:
@@ -249,8 +264,10 @@ def setup_embedding(args, tools) -> None:
     if args.no_embed:
         say('  --no-embed: 건너뜀 (claude-mem 기본 영어 임베딩 사용)')
         return
-    ensure_ollama_running(tools['ollama'] or 'ollama')
-    run([tools['ollama'] or 'ollama', 'pull', 'bge-m3'])
+    if not tools.get('ollama'):
+        raise SystemExit('ollama 실행 파일을 찾지 못했습니다. 방금 설치했다면 새 터미널에서 다시 실행하세요(또는 --no-embed).')
+    ensure_ollama_running(tools['ollama'])
+    run([tools['ollama'], 'pull', 'bge-m3'])
     env_file = HOME / '.chroma_env'
     line = 'CHROMA_OPENAI_API_KEY=ollama'
     text = env_file.read_text(encoding='utf-8') if env_file.exists() else ''
@@ -324,14 +341,22 @@ def merge_claude_mem_settings(args) -> None:
 
 
 # ── 6·7 훅 ──────────────────────────────────────────────────────────
+OUR_HOOK_SCRIPTS = ('hooks/session_context.py', 'hooks/sb_recall.py', 'hooks/recall_gate.py', 'hooks/codex_hook.py')
+
+
+def _is_ours(command: str) -> bool:
+    """우리 훅인가: 현재 kit 경로를 담았거나, 키트 venv 파이썬으로 우리 훅 스크립트를 부른다(키트 폴더를 옮긴 뒤의 옛 항목)."""
+    c = posix(command)
+    return posix(KIT) + '/' in c or (posix(VENV) + '/' in c and any(s in c for s in OUR_HOOK_SCRIPTS))
+
+
 def _strip_ours(hooks: dict) -> dict:
-    """이전 설치가 넣은 우리 훅(명령에 kit 경로 포함)을 뺀다 — 재설치 멱등."""
-    kit = posix(KIT)
+    """이전 설치가 넣은 우리 훅을 뺀다 — 재설치 멱등, 키트 폴더를 옮겨도 옛 항목이 남지 않는다."""
     out = {}
     for event, groups in (hooks or {}).items():
         kept = []
         for g in groups:
-            hs = [h for h in g.get('hooks', []) if kit not in posix(h.get('command', ''))]
+            hs = [h for h in g.get('hooks', []) if not _is_ours(h.get('command', ''))]
             if hs:
                 kept.append(dict(g, hooks=hs))
         if kept:
@@ -379,10 +404,11 @@ CODEX_CAPTURE = [  # (이벤트, matcher, codex_hook 인자, timeout) — claude
 def _codex_add(hooks: dict, event: str, matcher, script: str, args: list, timeout: int) -> None:
     """Codex 훅 항목. 신뢰 키가 인덱스 기반이라 기존 배열의 맨 끝에만 붙인다(_strip_ours 뒤라 멱등)."""
     cmd = py_cmd(script, *args)
-    win = '%s %s %s' % (posix(VPY), posix(KIT / script), ' '.join(args))  # PowerShell: 따옴표 없는 토큰
-    h = {'type': 'command', 'command': cmd, 'timeout': timeout}
-    if ' ' not in posix(VPY) + posix(KIT):
-        h['commandWindows'] = win.strip()
+    # 윈도우 Codex 는 cmd.exe /C "<명령>" 으로 돌린다. cmd 는 따옴표 없는 C:/... 의 '/' 를 스위치로 읽으므로
+    # 네이티브 역슬래시 경로를 쓴다. 공백이 있을 때만 따옴표(선두 따옴표 경로는 2026-07 Codex 수정 이후 동작).
+    q = (lambda x: '"%s"' % x) if ' ' in str(VPY) + str(KIT) else (lambda x: x)
+    win = ' '.join([q(str(VPY).replace('/', '\\')), q(str(KIT / script).replace('/', '\\'))] + list(args))
+    h = {'type': 'command', 'command': cmd, 'timeout': timeout, 'commandWindows': win}
     group = {'hooks': [h]}
     if matcher is not None:
         group['matcher'] = matcher
@@ -416,10 +442,16 @@ def codex_setup(args, tools) -> None:
     if DRY:
         say('  [dry-run] codex_trust trust/disable')
         return
-    run(trust + ['disable', '--plugin', 'claude-mem', '--codex', codex], check=False)
-    run(trust + ['trust', '--match', posix(KIT), '--codex', codex], check=False)
+    # 키트 훅 신뢰가 확인된 뒤에만 플러그인 훅을 끈다 — 실패하면 캡처가 통째로 사라지지 않게 플러그인 훅을 남긴다
+    ok = run(trust + ['trust', '--match', posix(KIT), '--codex', codex], check=False).returncode == 0
     if IS_WIN:
-        run(trust + ['trust', '--match', str(KIT), '--codex', codex], check=False)
+        ok = run(trust + ['trust', '--match', str(KIT), '--codex', codex], check=False).returncode == 0 and ok
+    if not ok:
+        WARNINGS.append('Codex 훅 신뢰 등록 실패 — 플러그인 훅은 그대로 둠. 수리: "%s" "%s" trust --match "%s"'
+                        % (VPY, KIT / 'installer' / 'codex_trust.py', KIT))
+        return
+    if run(trust + ['disable', '--plugin', 'claude-mem', '--codex', codex], check=False).returncode != 0:
+        WARNINGS.append('claude-mem 플러그인 Codex 훅 끄기 실패 — 세션이 이중 캡처될 수 있음(codex_trust.py disable --plugin claude-mem)')
 
 
 # ── 8 규칙 블록 ─────────────────────────────────────────────────────
@@ -469,7 +501,8 @@ def sb_launcher() -> None:
                                    text=True, capture_output=True).stdout.strip()
         if str(bindir).lower() not in user_path.lower():
             run(['powershell', '-NoProfile', '-c',
-                 "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';%s', 'User')" % bindir])
+                 "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';%s', 'User')"
+             % str(bindir).replace("'", "''")])
             say('  PATH 에 %s 추가 — 새 터미널부터 적용' % bindir)
     else:
         sb = bindir / 'sb'
@@ -477,9 +510,12 @@ def sb_launcher() -> None:
         sb.chmod(0o755)
         link = HOME / '.local' / 'bin' / 'sb'
         link.parent.mkdir(parents=True, exist_ok=True)
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(sb)
+        if link.is_symlink() and Path(os.readlink(link)) == sb:
+            pass
+        elif link.is_symlink() or link.exists():
+            WARNINGS.append('%s 가 이미 다른 명령입니다 — 덮어쓰지 않음. 키트 런처: %s' % (link, sb))
+        else:
+            link.symlink_to(sb)
         if str(link.parent) not in os.environ.get('PATH', '').split(os.pathsep):
             say('  ⚠ ~/.local/bin 이 PATH 에 없습니다. 셸 설정에 추가하세요: export PATH="$HOME/.local/bin:$PATH"')
 
@@ -507,7 +543,7 @@ def schedule(args) -> None:
 def _launchd(name, argv, when) -> None:
     label = 'com.secondbrain-kit.' + name
     plist = HOME / 'Library' / 'LaunchAgents' / (label + '.plist')
-    prog = ''.join('<string>%s</string>' % s for s in [str(VPY)] + [str(KIT / argv[0])] + argv[1:])
+    prog = ''.join('<string>%s</string>' % xml_escape(s) for s in [str(VPY)] + [str(KIT / argv[0])] + argv[1:])
     if 'interval' in when:
         sched = '<key>StartInterval</key><integer>%d</integer>' % when['interval']
     else:
@@ -521,9 +557,10 @@ def _launchd(name, argv, when) -> None:
            '<key>SB_RECALL</key><string>0</string><key>PATH</key><string>%s</string></dict>'
            '<key>Nice</key><integer>5</integer>'
            '<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>'
-           '</dict></plist>\n') % (label, prog, sched, SB_HOME,
-                                   os.pathsep.join([str(HOME / '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin',
-                                                    '/usr/bin', '/bin']), log, log)
+           '</dict></plist>\n') % (label, prog, sched, xml_escape(str(SB_HOME)),
+                                   xml_escape(os.pathsep.join([str(HOME / '.local/bin'), '/opt/homebrew/bin',
+                                                               '/usr/local/bin', '/usr/bin', '/bin'])),
+                                   xml_escape(str(log)), xml_escape(str(log)))
     if DRY:
         say('  [dry-run] %s' % plist)
         return
@@ -566,18 +603,25 @@ def uninstall() -> None:
                 backup(path)
                 path.write_text(n, encoding='utf-8')
     for name in ('koindex', 'nightly', 'consolidate'):
-        if IS_MAC:
+        if DRY:
+            say('  [dry-run] 스케줄 제거: %s' % name)
+        elif IS_MAC:
             label = 'com.secondbrain-kit.' + name
             subprocess.run(['launchctl', 'bootout', 'gui/%d/%s' % (os.getuid(), label)], capture_output=True)
             p = HOME / 'Library' / 'LaunchAgents' / (label + '.plist')
-            if p.exists() and not DRY:
+            if p.exists():
                 p.unlink()
         elif IS_WIN:
             subprocess.run(['schtasks', '/Delete', '/F', '/TN', 'secondbrain-kit\\' + name], capture_output=True)
     link = HOME / '.local' / 'bin' / 'sb'
-    if link.is_symlink() and not DRY:
+    if link.is_symlink() and Path(os.readlink(link)) == SB_HOME / 'bin' / 'sb' and not DRY:
         link.unlink()
-    say('claude-mem 플러그인 자체 제거: claude plugin uninstall claude-mem@thedotmack / codex plugin remove claude-mem@thedotmack')
+    # 설치 때 끈 claude-mem 플러그인의 Codex 훅을 되돌린다
+    codex = which('codex')
+    if codex and VPY.exists() and not DRY:
+        run([str(VPY), str(KIT / 'installer' / 'codex_trust.py'), 'enable', '--plugin', 'claude-mem',
+             '--codex', codex], check=False)
+    say('claude-mem 플러그인 자체 제거: claude plugin uninstall claude-mem@thedotmack / codex plugin remove claude-mem@claude-mem-local')
 
 
 def main() -> None:
@@ -615,7 +659,12 @@ def main() -> None:
     rules(args, tools)
     sb_launcher()
     schedule(args)
-    say('\n완료. 확인: python installer/install.py --doctor  (새 세션을 열면 재개 브리핑이 뜹니다)')
+    if WARNINGS:
+        say('\n완료(경고 %d건) — 아래를 처리한 뒤 --doctor 로 확인하세요:' % len(WARNINGS))
+        for w in WARNINGS:
+            say('  ⚠ ' + w)
+    else:
+        say('\n완료. 확인: python installer/install.py --doctor  (새 세션을 열면 재개 브리핑이 뜹니다)')
 
 
 if __name__ == '__main__':

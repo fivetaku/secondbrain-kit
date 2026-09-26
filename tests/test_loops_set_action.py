@@ -18,7 +18,7 @@ class SetActionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'loops.jsonl'
         self.env = mock.patch.dict(os.environ, {
-            'SB_HOME': str(Path(self.temp.name) / 'sbhome'), 'PYTHONIOENCODING': 'utf-8',
+            'SB_HOME': str(Path(self.temp.name) / 'sbhome'), 'PYTHONIOENCODING': 'utf-8', 'SB_CODEX_CAPTURE_EXEC': '1',
             'SB_STATE_DB': str(Path(self.temp.name) / 'no-state.db'),
             'SB_CLAUDE_MEM_DIR': str(Path(self.temp.name) / 'no-claude-mem'),
             'SB_LOOPS_PATH': str(self.path), 'LOOPS_DIR': self.temp.name,

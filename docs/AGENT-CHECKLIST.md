@@ -26,6 +26,8 @@
   - 윈도우: `irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps1 | iex`
   - 옵션(필요 시): 맥 `| sh -s -- --provider gemini`, 윈도우 `$env:SBKIT_ARGS='--provider gemini'` 먼저 설정
 - [ ] 출력에 `[1]`~`[10]`이 모두 지나가고 `완료.`가 나왔는지
+- [ ] `완료(경고 N건)`이면 경고 줄마다 처리(예: Codex 훅 신뢰 실패, `~/.local/bin/sb`가 다른 명령이라 덮어쓰지 않음)
+- [ ] 설정 JSON이 깨져 있다며 중단되면 해당 파일을 사용자와 함께 고친 뒤 재실행(설치기는 깨진 설정을 덮어쓰지 않는다)
 - [ ] 중간 실패 시: 실패한 단계 번호와 마지막 20줄을 확보 → "E. 실패 대응" 참고 → 고친 뒤 **같은 명령 재실행**(멱등)
 
 ## C. 설치 직후 점검

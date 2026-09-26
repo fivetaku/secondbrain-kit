@@ -71,7 +71,7 @@ def emit(harness: str, text: str) -> str:
     payload = {'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}}
     if harness == 'claude':
         payload['systemMessage'] = '🗂 세컨브레인\n' + text
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload)  # ASCII 이스케이프: 윈도우 cp949 파이프에서도 인코딩 오류 없음
 
 
 def main() -> None:
@@ -84,6 +84,14 @@ def main() -> None:
         raw = json.loads(sys.stdin.read() or '{}')
     except ValueError:
         raw = {}
+    if args.harness == 'codex':  # exec 자동화 세션에는 브리핑을 넣지 않는다
+        try:
+            sys.path.insert(0, str(HERE))
+            from codex_hook import is_automation
+            if is_automation(raw):
+                return
+        except Exception:
+            pass
     cwd = str(raw.get('cwd') or os.getcwd())
     try:
         text, scope_id, method, shown, omitted, used = build(cwd)

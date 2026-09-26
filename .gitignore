@@ -3,3 +3,4 @@ __pycache__/
 *.sbkit-bak-*
 .DS_Store
 .codegraph/
+.insane-review/

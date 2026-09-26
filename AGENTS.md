@@ -26,7 +26,7 @@ Claude Code 훅 ─┐   Codex 훅(hooks/codex_hook.py: exec 자동화 제외) �
 | `install.sh` / `install.ps1` | uv 확보 후 `installer/install.py` 실행 |
 | `installer/install.py` | 설치·제거(`--uninstall`)·점검(`--doctor`). 모든 단계 멱등, 설정 파일은 `.sbkit-bak-<시각>` 백업 |
 | `installer/doctor.py` | 설치 상태 점검(읽기 전용) |
-| `installer/codex_trust.py` | Codex 훅 신뢰 등록·목록·끄기 (app-server JSON-RPC) |
+| `installer/codex_trust.py` | Codex 훅 신뢰 등록·목록·끄기·되돌리기 (app-server JSON-RPC) |
 | `bin/sb.py` | `sb` 단일 CLI |
 | `bin/sb_config.py`, `bin/sb_lock.py` | 경로·포트·실행파일 기본값 / 맥·윈도우 공용 파일 잠금 |
 | `bin/sb_*.py`, `loops.py`, `consolidate.py`, `nightly.py`, `sync_automemory.py` | 저장·검색·상태층·배치 |
@@ -76,7 +76,7 @@ venv 파이썬: 맥 `~/.secondbrain/.venv/bin/python`, 윈도우 `~/.secondbrain
 
 - **공개 저장소다.** 개인 경로·계정명·키·기록을 커밋하지 않는다. 테스트 픽스처도 `demo` 같은 중립 이름을 쓴다. 커밋 전 `git grep -n -i -E "Users/[a-z]+/|api[_-]?key\s*=" -- .`로 확인.
 - 경로·포트·실행파일은 반드시 `sb_config`를 거친다(하드코딩 금지). 파일 잠금은 `sb_lock`(fcntl 직접 사용 금지).
-- 맥·윈도우 양쪽을 생각한다: 경로 구분자, `os.pathsep`, 셸 차이, Codex `commandWindows`(따옴표로 시작하지 않는 토큰).
+- 맥·윈도우 양쪽을 생각한다: 경로 구분자, `os.pathsep`, 셸 차이, Codex `commandWindows`(윈도우 Codex는 `cmd.exe /C "<명령>"`으로 실행 — 역슬래시 경로, 공백 있을 때만 따옴표).
 - 훅은 어떤 오류에도 exit 0 — 세션을 막지 않는다.
 - Codex 훅 명령 문자열을 바꾸면 해시가 바뀌어 **재신뢰가 필요**하다(설치기가 처리). Codex hooks.json 항목은 기존 배열의 **맨 끝에만** 추가(신뢰 키가 인덱스 기반).
 - 테스트: `~/.secondbrain/.venv/bin/python -m unittest discover -s tests -t .` (세션 환경변수 `SB_STATE_BRIEFING`이 새면 일부 테스트가 깨진다 — `env -u SB_STATE_BRIEFING`으로 실행).

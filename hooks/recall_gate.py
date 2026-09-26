@@ -56,7 +56,7 @@ SHELL_TOOLS = ("Bash", "PowerShell")
 
 # Stop: 과거 맥락이 걸린 질문(sb_recall 이 .needs 마커를 남김)에 기억층을 안 보고 답을 끝내려 할 때 1회 되돌린다.
 STOP_MSG = (
-    "기억층 조회 없이 답을 끝내려 합니다. 이 질문은 과거 작업·상태와 관련 있습니다(회수 목록 또는 기간·이력 질문).\n"
+    "기억층 조회 없이 답을 끝내려 합니다. 이 질문은 기간·이력 질문이라 과거 기록 확인이 필요합니다.\n"
     "  - 기간 질문: sb timeline --since YYYY-MM-DD [--until D]\n"
     "  - 주제: sb search '<주제>' --global --limit 5  →  관련 ID는 get_observations([ID])\n"
     "  - 확정 사실: sb search --mode current\n"
@@ -127,7 +127,7 @@ def main() -> None:
 
     def emit(payload: dict) -> None:
         payload["hookEventName"] = "PreToolUse"
-        sys.stdout.write(json.dumps({"hookSpecificOutput": payload}, ensure_ascii=False))
+        sys.stdout.write(json.dumps({"hookSpecificOutput": payload}))  # ASCII 이스케이프(윈도우 인코딩)
 
     def touch(suffix: str) -> None:
         try:

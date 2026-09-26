@@ -39,7 +39,7 @@ class BriefingBase(unittest.TestCase):
         self.state = sb / 'state.db'; self.log = sb / 'logs' / 'injection.jsonl'
         self.env = {'HOME': str(self.home), 'USERPROFILE': str(self.home), 'SB_HOME': str(sb),
                     'SB_CLAUDE_MEM_DIR': str(self.home / '.claude-mem'),
-                    'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8', 'PYTHONIOENCODING': 'utf-8',
+                    'PATH': os.environ['PATH'], 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8', 'PYTHONIOENCODING': 'utf-8', 'SB_CODEX_CAPTURE_EXEC': '1',
                     'PYTHONDONTWRITEBYTECODE': '1', 'SB_PROJECT_ALIASES': str(sb / 'config' / 'project_aliases.json'),
                     'SB_LOOPS_PATH': str(self.loops), 'SB_STATE_DB': str(self.state), 'SB_INJECTION_LOG': str(self.log),
                     'SB_STATE_PILOT_SCOPES': 'alpha,beta', 'SB_VERIFY_ALLOWED_ROOTS': str(self.tmp),

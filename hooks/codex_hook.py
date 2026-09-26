@@ -39,15 +39,18 @@ def is_automation(payload: dict) -> bool:
         except (OSError, ValueError, KeyError):
             pass
     tp = payload.get('transcript_path')
-    automation = True
-    if tp:
-        try:
-            with open(tp, encoding='utf-8') as fh:
-                first = json.loads(fh.readline() or '{}')
-            originator = str((first.get('payload') or {}).get('originator') or '')
-            automation = originator == 'codex_exec'
-        except (OSError, ValueError):
-            automation = False  # 파일을 못 읽으면 대화형으로 간주(캡처 누락보다 과캡처가 낫다)
+    if not tp:
+        return True  # 세션 로그가 없는 실행은 자동화로 본다(캐시하지 않음)
+    try:
+        with open(tp, encoding='utf-8') as fh:
+            first = json.loads(fh.readline() or '{}')
+        originator = str((first.get('payload') or {}).get('originator') or '')
+    except (OSError, ValueError):
+        originator = ''
+    if not originator:
+        # 로그가 아직 없거나 첫 줄이 덜 쓰였다 — 대화형으로 간주하되 캐시하지 않고 다음 이벤트에서 다시 판정
+        return False
+    automation = originator == 'codex_exec'
     if cached:
         try:
             CACHE.mkdir(parents=True, exist_ok=True)

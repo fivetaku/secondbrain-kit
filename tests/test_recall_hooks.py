@@ -110,3 +110,30 @@ class TimelineTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StopGateScopeTest(unittest.TestCase):
+    """Stop 게이트 표식(.needs)은 기간·이력 질문에만 남는다 — 회수 목록만 붙은 프롬프트는 되돌리지 않는다."""
+
+    def _run(self, prompt):
+        import hashlib
+        import io
+        from unittest import mock
+        sys.path.insert(0, str(KIT / 'hooks'))
+        import sb_recall
+        with tempfile.TemporaryDirectory() as gate, tempfile.TemporaryDirectory() as state, \
+                mock.patch.dict(os.environ, {'SB_RECALL_GATE_DIR': gate}), \
+                mock.patch.object(sb_recall, 'STATE_DIR', state), \
+                mock.patch.object(sb_recall, 'gate', return_value=True), \
+                mock.patch.object(sb_recall, 'search', return_value=[{'id': 1}]), \
+                mock.patch.object(sb_recall, 'enrich', return_value=[{'id': 1, 'date': '09-01', 'title': 't'}]), \
+                mock.patch('sys.stdin', io.StringIO(json.dumps({'prompt': prompt, 'session_id': 's'}))), \
+                mock.patch('sys.stdout', io.StringIO()):
+            sb_recall.main()
+            return (Path(gate) / (hashlib.sha256(b's').hexdigest() + '.needs')).exists()
+
+    def test_plain_prompt_with_recall_items_sets_no_marker(self):
+        self.assertFalse(self._run('배포 스크립트 고쳐줘'))
+
+    def test_period_question_sets_marker(self):
+        self.assertTrue(self._run('이번달에 한 거 정리해줘'))
