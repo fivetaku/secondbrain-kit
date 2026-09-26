@@ -128,6 +128,8 @@ def check_prereqs(args) -> dict:
             run(['sh', '-c', 'curl -LsSf https://astral.sh/uv/install.sh | sh'])
         found['uv'] = which('uv') or str(HOME / ('.local/bin/uv.exe' if IS_WIN else '.local/bin/uv'))
         found['uvx'] = which('uvx') or str(Path(found['uv']).with_name('uvx.exe' if IS_WIN else 'uvx'))
+    if not found['ollama'] and find_ollama() != 'ollama':  # 설치돼 있지만 PATH 에 없는 경우
+        found['ollama'] = find_ollama()
     if not args.no_embed and not found['ollama']:
         say('  ollama 설치')
         if IS_WIN:
@@ -138,8 +140,46 @@ def check_prereqs(args) -> dict:
             run(['brew', 'services', 'start', 'ollama'], check=False)
         else:
             raise SystemExit('ollama 가 필요합니다: https://ollama.com/download (또는 --no-embed)')
-        found['ollama'] = which('ollama') or 'ollama'
+        found['ollama'] = find_ollama()
     return found
+
+
+def find_ollama() -> str:
+    """설치 직후엔 PATH 가 갱신되지 않은 창일 수 있다 — 기본 설치 위치도 본다."""
+    cands = [which('ollama')]
+    if IS_WIN:
+        local = os.environ.get('LOCALAPPDATA', str(HOME / 'AppData' / 'Local'))
+        cands.append(str(Path(local) / 'Programs' / 'Ollama' / 'ollama.exe'))
+    else:
+        cands += ['/opt/homebrew/bin/ollama', '/usr/local/bin/ollama',
+                  '/Applications/Ollama.app/Contents/Resources/ollama']
+    for c in cands:
+        if c and Path(c).exists():
+            return c
+    return 'ollama'
+
+
+def ensure_ollama_running(exe: str) -> None:
+    """11434 가 응답할 때까지 최대 60초 기다리고, 안 뜨면 ollama serve 를 백그라운드로 띄운다."""
+    import time
+    import urllib.request
+
+    def up() -> bool:
+        try:
+            urllib.request.urlopen('http://127.0.0.1:11434/api/tags', timeout=2).close()
+            return True
+        except Exception:
+            return False
+    if DRY or up():
+        return
+    say('  Ollama 서버 기동')
+    flags = {'creationflags': 0x00000008 | 0x00000200} if IS_WIN else {'start_new_session': True}
+    subprocess.Popen([exe, 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **flags)
+    for _ in range(60):
+        if up():
+            return
+        time.sleep(1)
+    raise SystemExit('Ollama 서버가 뜨지 않습니다. Ollama 앱을 직접 실행한 뒤 다시 설치하세요 (또는 --no-embed).')
 
 
 # ── 2 venv ──────────────────────────────────────────────────────────
@@ -209,6 +249,7 @@ def setup_embedding(args, tools) -> None:
     if args.no_embed:
         say('  --no-embed: 건너뜀 (claude-mem 기본 영어 임베딩 사용)')
         return
+    ensure_ollama_running(tools['ollama'] or 'ollama')
     run([tools['ollama'] or 'ollama', 'pull', 'bge-m3'])
     env_file = HOME / '.chroma_env'
     line = 'CHROMA_OPENAI_API_KEY=ollama'

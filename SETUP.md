@@ -4,6 +4,8 @@
 
 소요 시간: 약 10~20분 (모델 다운로드 1.2GB 포함)
 
+> 에이전트(Claude Code·Codex)에게 맡기려면: "https://github.com/fivetaku/secondbrain-kit 의 docs/AGENT-CHECKLIST.md 대로 이 PC에 세팅해줘"
+
 ---
 
 ## 0단계. 준비물 확인

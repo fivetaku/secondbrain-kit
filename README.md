@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/boots
 irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps1 | iex           # Windows
 ```
 
-단계별 안내·문제 해결은 [SETUP.md](SETUP.md).
+단계별 안내·문제 해결은 [SETUP.md](SETUP.md). 에이전트에게 세팅을 맡길 때는 "[docs/AGENT-CHECKLIST.md](docs/AGENT-CHECKLIST.md) 따라서 세팅해줘"라고 하면 된다(운영 매뉴얼: [AGENTS.md](AGENTS.md)).
 
 설치 옵션(`sh -s -- <옵션>` / 윈도우는 `$env:SBKIT_ARGS`): `--no-embed`(한국어 임베딩 생략) · `--no-codex` · `--no-schedule` · `--with-consolidate`(주간 LLM 통합 요약) · `--provider gemini|openrouter` · `--lang en` · `--dry-run`
 
