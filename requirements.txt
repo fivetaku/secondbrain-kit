@@ -1,0 +1,4 @@
+# secondbrain-kit venv (Python 3.12). claude-mem 의 chroma-mcp 0.2.6 이 쓰는 chromadb 와 디스크 포맷을 맞춘다.
+chromadb==1.5.9
+openai>=1.0
+kiwipiepy>=0.23

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.sbkit-bak-*
+.DS_Store
+.codegraph/
