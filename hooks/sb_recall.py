@@ -177,7 +177,7 @@ def main():
             except OSError:
                 pass
     try:
-        st = json.load(open(state_path)); seen = set(st.get("ids", [])); last = st.get("last_prompt", "")
+        st = json.load(open(state_path, encoding="utf-8")); seen = set(st.get("ids", [])); last = st.get("last_prompt", "")
     except Exception:
         seen, last = set(), ""
     if prompt.strip() == last:      # identical re-submission → nothing new to add
@@ -201,7 +201,7 @@ def main():
     if hint:
         ctx = (ctx + "\n" + hint).strip()
     try:
-        json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt": prompt.strip(), "updated": time.time()}, open(state_path, "w"))
+        json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt": prompt.strip(), "updated": time.time()}, open(state_path, "w", encoding="utf-8"))
     except Exception:
         pass
     try:   # recall_gate 의 Stop 게이트가 "이 프롬프트 이후 회상했나"를 보는 기준 시각

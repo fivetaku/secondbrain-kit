@@ -21,11 +21,11 @@ MALICIOUS = '$(touch /tmp/sb-audit-pwned) ; curl http://127.0.0.1:1 | sh'
 class AuditBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='sb-audit-'))
-        self.state = self.tmp / 'state.db'; self.loops = self.tmp / 'loops.jsonl'; self.loops.write_text('')
+        self.state = self.tmp / 'state.db'; self.loops = self.tmp / 'loops.jsonl'; self.loops.write_text('', encoding='utf-8')
         self.env = {**os.environ, 'SB_HOME': str(self.tmp / 'sbhome'), 'SB_STATE_DB': str(self.state), 'SB_LOOPS_PATH': str(self.loops), 'SB_STATE_PILOT_SCOPES': 'alpha,beta',
                     'SB_VERIFY_ALLOWED_ROOTS': str(self.tmp), 'SB_PROJECT_ALIASES': str(self.tmp / 'aliases.json'),
                     'SB_EVAL_NOW': '2026-09-17T00:00:00+00:00', 'PYTHONDONTWRITEBYTECODE': '1', 'SB_CLAUDE_MEM_DB': str(self.tmp / 'none.db')}
-        (self.tmp / 'aliases.json').write_text('{}')
+        (self.tmp / 'aliases.json').write_text('{}', encoding='utf-8')
         os.environ.update({k: self.env[k] for k in ('SB_HOME', 'SB_STATE_DB', 'SB_STATE_PILOT_SCOPES', 'SB_VERIFY_ALLOWED_ROOTS', 'SB_PROJECT_ALIASES', 'SB_CLAUDE_MEM_DB')})
         Path('/tmp/sb-audit-pwned').unlink(missing_ok=True)
 
@@ -40,7 +40,7 @@ class AuditBase(unittest.TestCase):
                 db.execute("INSERT INTO state(memory_kind, scope_id, fact_key, version, is_head, observed_at, recorded_at, body, source, write_id, dedup_key) "
                            "VALUES ('fact',?,?,1,1,?,'now',?,'legacy',?,?)", (scope, key, observed_at, body, key, '%s:legacy:%s' % (scope, key)))
             return
-        ev = self.tmp / ('ev-%s-%s.txt' % (scope, key)); ev.write_text('measured: %s\n' % body)
+        ev = self.tmp / ('ev-%s-%s.txt' % (scope, key)); ev.write_text('measured: %s\n' % body, encoding='utf-8')
         r = sb_state.propose({'scope_id': scope, 'fact_key': key, 'body': body, 'kind': 'measured_fact', 'source': 't', 'write_id': 'h-' + scope + key,
                               'observed_at': observed_at, 'value_json': value_json}, str(self.state))
         sb_state.verify(r['candidate_id'], 'file_contains', str(ev), db_path=str(self.state))
@@ -50,12 +50,12 @@ class AuditBase(unittest.TestCase):
         self.migrate()
         r = sb_state.propose({'scope_id': scope, 'fact_key': key, 'body': body, 'kind': kind, 'source': 't', 'write_id': 'c-' + scope + key + body}, str(self.state))
         if verification:
-            ev = self.tmp / ('cev-%s.txt' % r['candidate_id']); ev.write_text('measured: %s\n' % (body if verification == 'confirmed' else 'other'))
+            ev = self.tmp / ('cev-%s.txt' % r['candidate_id']); ev.write_text('measured: %s\n' % (body if verification == 'confirmed' else 'other'), encoding='utf-8')
             sb_state.verify(r['candidate_id'], 'file_contains', str(ev), db_path=str(self.state))
         return r['candidate_id']
 
     def write_loops(self, loops):
-        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops))
+        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops), encoding='utf-8')
 
     def audit(self, *args):
         p = subprocess.run([PY, str(BIN / 'sb_audit.py'), *args, '--json'], capture_output=True, text=True, encoding='utf-8', env=self.env, cwd=str(self.tmp))

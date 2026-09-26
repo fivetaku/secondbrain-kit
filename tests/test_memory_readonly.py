@@ -45,7 +45,7 @@ class ReadonlyBase(unittest.TestCase):
                     'SB_CLAUDE_MEM_DB': str(self.tmp / 'claude-mem.db'), 'PYTHONDONTWRITEBYTECODE': '1',
                     'SB_LOOPS_PATH': str(self.tmp / 'loops.jsonl'), 'SB_RULES_DIR': str(self.tmp / 'rules'),
                     'SB_KO_INDEX': str(self.tmp / 'never-created-index.sqlite')}
-        (self.tmp / 'aliases.json').write_text('{}')
+        (self.tmp / 'aliases.json').write_text('{}', encoding='utf-8')
 
     def run_cli(self, script, *args):
         return subprocess.run([PY, str(BIN / script), *args], capture_output=True, text=True, encoding='utf-8',
@@ -90,7 +90,7 @@ class ReadonlyNoWriteTests(ReadonlyBase):
         os.environ.update({k: self.env[k] for k in ('SB_HOME', 'SB_STATE_DB', 'SB_STATE_PILOT_SCOPES', 'SB_VERIFY_ALLOWED_ROOTS',
                                                      'SB_PROJECT_ALIASES', 'SB_CLAUDE_MEM_DB')})
         sb_state.migrate(str(self.db))
-        ev = self.tmp / 'ev.txt'; ev.write_text(MALICIOUS + '\n')
+        ev = self.tmp / 'ev.txt'; ev.write_text(MALICIOUS + '\n', encoding='utf-8')
         r = sb_state.propose({'scope_id': 'proj-a', 'fact_key': 'deploy.target', 'body': MALICIOUS,
                               'kind': 'measured_fact', 'source': 'cli', 'write_id': 'w1'})
         self.assertEqual(sb_state.verify(r['candidate_id'], 'file_contains', str(ev))['result'], 'confirmed')

@@ -88,6 +88,9 @@ def main() -> None:
     try:
         text, scope_id, method, shown, omitted, used = build(cwd)
     except Exception:
+        if os.environ.get('SB_HOOK_DEBUG') == '1':   # 조용한 실패 진단용
+            import traceback
+            traceback.print_exc()
         return
     if not text:
         return

@@ -12,6 +12,25 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
+# URI 특수문자 경로 처리 검증용. 윈도우는 파일명에 '?'를 못 쓰므로 '#%'로 대신한다.
+URI_CHARS = '#%' if os.name == 'nt' else '?#'
+
+
+@contextlib.contextmanager
+def module_override(name, value):
+    """sys.modules 의 키 하나만 바꿨다 되돌린다.
+    patch.dict(sys.modules, ...) 는 종료 시 도중에 import 된 모듈을 전부 지워서, 뒤 테스트가
+    PyO3 확장(chromadb 의존성)을 다시 import 하다 'may only be initialized once' 로 실패한다."""
+    missing = object()
+    old = sys.modules.get(name, missing)
+    sys.modules[name] = value
+    try:
+        yield
+    finally:
+        if old is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = old
 
 try:
     import chromadb
@@ -28,7 +47,7 @@ class SearchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.db = Path(self.temp.name).resolve() / "observations?#.db"
+        self.db = Path(self.temp.name).resolve() / ("observations" + URI_CHARS + ".db")
         self.chroma = Path(self.temp.name).resolve() / "missing-chroma"
         self.snapshot = Path(self.temp.name).resolve() / "chroma-snapshot"
         env = patch.dict(os.environ, {
@@ -41,9 +60,9 @@ class SearchTests(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
-        ko = patch.dict(sys.modules, {"sb_fts_ko": None})
-        ko.start()
-        self.addCleanup(ko.stop)
+        ko = module_override("sb_fts_ko", None)
+        ko.__enter__()
+        self.addCleanup(ko.__exit__, None, None, None)
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.executescript("""
                 CREATE TABLE observations (
@@ -198,7 +217,7 @@ class SearchTests(unittest.TestCase):
         module = types.ModuleType("sb_fts_ko")
         with patch.object(module, "search_ko", create=True, return_value=[(3, 4.0)]) as ko, \
                 patch.object(module, "ensure_current", create=True) as ensure:
-            with patch.dict(sys.modules, {"sb_fts_ko": module}):
+            with module_override("sb_fts_ko", module):
                 result = searcher.search("apple", searcher.Scope("project", ["alpha"]), db_path=str(self.db))
                 self.assertEqual(result["meta"]["fts_backend"], "ko")
                 self.assertEqual(result["results"][0]["obs_id"], 3)
@@ -302,7 +321,7 @@ class SearchTests(unittest.TestCase):
             self.assertFalse(meta["snapshot"]["reused"])
             self.assertEqual(Path(meta["snapshot"]["path"]), self.snapshot)
             snapshot_meta = self.snapshot / "snapshot_meta.json"
-            created = json.loads(snapshot_meta.read_text())["created_at_epoch"]
+            created = json.loads(snapshot_meta.read_text(encoding='utf-8'))["created_at_epoch"]
             snapshot_mtime = self.snapshot.stat().st_mtime_ns
             with patch.object(searcher.shutil, "copytree", side_effect=AssertionError("cache hit must not copy")):
                 hits, meta = searcher.vector_search("apple", searcher.Scope("multi", ["alpha", "beta"]), 5, str(self.chroma))
@@ -310,7 +329,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual({hit.obs_id for hit in hits}, {1, 2, 3})
             self.assertTrue(meta["snapshot"]["reused"])
             self.assertGreaterEqual(meta["snapshot"]["age_s"], 0)
-            self.assertEqual(json.loads(snapshot_meta.read_text())["created_at_epoch"], created)
+            self.assertEqual(json.loads(snapshot_meta.read_text(encoding='utf-8'))["created_at_epoch"], created)
             self.assertEqual(self.snapshot.stat().st_mtime_ns, snapshot_mtime)
             with patch.dict(os.environ, {"SB_CHROMA_SNAPSHOT_TTL": "0"}):
                 with patch.object(searcher.shutil, "copytree", wraps=searcher.shutil.copytree) as copy:
@@ -318,7 +337,7 @@ class SearchTests(unittest.TestCase):
                 self.assertTrue(copy.called)
             self.assertTrue(meta["ok"], meta["error"])
             self.assertFalse(meta["snapshot"]["reused"])
-            self.assertGreater(json.loads(snapshot_meta.read_text())["created_at_epoch"], created)
+            self.assertGreater(json.loads(snapshot_meta.read_text(encoding='utf-8'))["created_at_epoch"], created)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(searcher.main(["apple", "--global", "--json", "--fresh"]), 0)
@@ -368,7 +387,7 @@ class SearchTests(unittest.TestCase):
         with searcher._vector_snapshot(self.chroma) as path:
             self.assertEqual(Path(path), self.snapshot)
         metadata = self.snapshot / "snapshot_meta.json"
-        metadata.write_text("broken json")
+        metadata.write_text("broken json", encoding='utf-8')
         with patch.object(searcher.shutil, "copytree", wraps=searcher.shutil.copytree) as copy:
             with searcher._vector_snapshot(self.chroma):
                 self.assertTrue(copy.called)
@@ -415,10 +434,10 @@ class SearchTests(unittest.TestCase):
             self.assertFalse((cm / "chroma").exists())
         rules = home / "rules"
         rules.mkdir(parents=True)
-        (rules / "alpha.md").write_text("rule body")
+        (rules / "alpha.md").write_text("rule body", encoding='utf-8')
         loops = home / "loops"
         loops.mkdir()
-        (loops / "loops.jsonl").write_text(json.dumps({"id": "L1", "title": "t", "project": "alpha", "status": "open"}) + "\n")
+        (loops / "loops.jsonl").write_text(json.dumps({"id": "L1", "title": "t", "project": "alpha", "status": "open"}) + "\n", encoding='utf-8')
         with patch.dict(os.environ):
             os.environ.pop("SB_RULES_DIR", None)
             os.environ.pop("SB_LOOPS_PATH", None)

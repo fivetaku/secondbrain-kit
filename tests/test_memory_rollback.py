@@ -41,7 +41,7 @@ class RollbackTests(unittest.TestCase):
         self.sb_home = self.tmp / 'sbhome'
         os.environ.update({'SB_HOME': str(self.sb_home), 'SB_STATE_DB': str(self.db), 'SB_STATE_PILOT_SCOPES': 'alpha', 'SB_VERIFY_ALLOWED_ROOTS': str(self.tmp),
                            'SB_PROJECT_ALIASES': str(self.tmp / 'aliases.json'), 'SB_CLAUDE_MEM_DB': str(self.tmp / 'none.db')})
-        (self.tmp / 'aliases.json').write_text('{}')
+        (self.tmp / 'aliases.json').write_text('{}', encoding='utf-8')
 
     def legacy_state(self, path: Path):
         from sb_memory import _STATE_SCHEMA
@@ -51,7 +51,7 @@ class RollbackTests(unittest.TestCase):
                        "VALUES ('fact','alpha','legacy.key',1,1,'2026-09-01T00:00:00+00:00','old','legacy','w','alpha:legacy:w')")
 
     def add_verified(self, path: Path, key: str, body: str):
-        ev = self.tmp / (key + '.txt'); ev.write_text('measured: %s\n' % body)
+        ev = self.tmp / (key + '.txt'); ev.write_text('measured: %s\n' % body, encoding='utf-8')
         r = sb_state.propose({'scope_id': 'alpha', 'fact_key': key, 'body': body, 'kind': 'measured_fact', 'source': 't', 'write_id': key}, str(path))
         sb_state.verify(r['candidate_id'], 'file_contains', str(ev), db_path=str(path))
         sb_state.accept(r['candidate_id'], 0, str(path))

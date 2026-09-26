@@ -34,8 +34,8 @@ class BriefingBase(unittest.TestCase):
         self.home = self.tmp / 'home'; self.cwd = self.home / 'work' / 'alpha'; self.cwd.mkdir(parents=True)
         (self.home / 'work' / 'beta').mkdir()
         sb = self.home / '.secondbrain'; (sb / 'loops').mkdir(parents=True); (sb / 'logs').mkdir(); (sb / 'config').mkdir()
-        (sb / 'config' / 'project_aliases.json').write_text(json.dumps({'alpha': [str(self.cwd)], 'beta': [str(self.home / 'work' / 'beta')]}))
-        self.loops = sb / 'loops' / 'loops.jsonl'; self.loops.write_text('')
+        (sb / 'config' / 'project_aliases.json').write_text(json.dumps({'alpha': [str(self.cwd)], 'beta': [str(self.home / 'work' / 'beta')]}), encoding='utf-8')
+        self.loops = sb / 'loops' / 'loops.jsonl'; self.loops.write_text('', encoding='utf-8')
         self.state = sb / 'state.db'; self.log = sb / 'logs' / 'injection.jsonl'
         self.env = {'HOME': str(self.home), 'USERPROFILE': str(self.home), 'SB_HOME': str(sb),
                     'SB_CLAUDE_MEM_DIR': str(self.home / '.claude-mem'),
@@ -50,7 +50,7 @@ class BriefingBase(unittest.TestCase):
                                                      'SB_CLAUDE_MEM_DB', 'SB_LOOPS_PATH', 'SB_EVAL_NOW')})
 
     def write_loops(self, loops):
-        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops))
+        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops), encoding='utf-8')
 
     def put_head(self, scope, key, body, verified=True):
         if not self.state.exists():
@@ -65,19 +65,20 @@ class BriefingBase(unittest.TestCase):
                 db.execute("INSERT INTO state(memory_kind, scope_id, fact_key, version, is_head, recorded_at, body, source, write_id, dedup_key) "
                            "VALUES ('fact',?,?,1,1,'now',?,'legacy',?,?)", (scope, key, body, key, '%s:legacy:%s' % (scope, key)))
             return
-        ev = self.tmp / ('ev-%s.txt' % key); ev.write_text('measured: %s\n' % body)
+        ev = self.tmp / ('ev-%s.txt' % key); ev.write_text('measured: %s\n' % body, encoding='utf-8')
         r = sb_state.propose({'scope_id': scope, 'fact_key': key, 'body': body, 'kind': 'measured_fact', 'source': 't', 'write_id': key}, str(self.state))
         sb_state.verify(r['candidate_id'], 'file_contains', str(ev), db_path=str(self.state))
         sb_state.accept(r['candidate_id'], 0, str(self.state))
 
     def hook(self, briefing='1', cwd=None):
-        env = dict(self.env)
+        env = dict(self.env, SB_HOOK_DEBUG='1')
         if briefing is not None:
             env['SB_STATE_BRIEFING'] = briefing
         where = str(cwd or self.cwd)
         p = subprocess.run([PY, str(HOOK), '--harness', 'codex'], cwd=where, env=env, input=json.dumps({'cwd': where}),
                            capture_output=True, text=True, encoding='utf-8', timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.strip(), 'hook printed nothing; stderr:\n' + p.stderr)
         payload = json.loads(p.stdout.strip().splitlines()[-1])
         return payload['hookSpecificOutput']['additionalContext'], p
 
@@ -141,7 +142,7 @@ class BudgetAndDegradationTests(BriefingBase):
         self.assertFalse(self.state.exists(), 'hook must not create the state db')
 
     def test_malformed_loops_line_still_emits_hook_json(self):
-        self.loops.write_text(json.dumps(loop(21, 'alpha', '트랙1', 'open', 'high', 'a')) + '\n{broken\n')
+        self.loops.write_text(json.dumps(loop(21, 'alpha', '트랙1', 'open', 'high', 'a')) + '\n{broken\n', encoding='utf-8')
         text, p = self.hook()
         self.assertIn('L0021', text); self.assertNotIn('Traceback', p.stderr)
         text_off, p2 = self.hook(briefing='0')

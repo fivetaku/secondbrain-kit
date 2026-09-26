@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+# URI 특수문자 경로 처리 검증용. 윈도우는 파일명에 '?'를 못 쓰므로 '#%'로 대신한다.
+URI_CHARS = '#%' if os.name == 'nt' else '?#'
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 import sb_memory as memory
@@ -26,7 +28,7 @@ class MemoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.db = str(Path(self.temp.name) / 'memory?#.db')
+        self.db = str(Path(self.temp.name) / ('memory' + URI_CHARS + '.db'))
         self.log = str(Path(self.temp.name) / 'journal.jsonl')
         with contextlib.closing(sqlite3.connect(self.db)) as db:
             db.execute('CREATE TABLE observations (id INTEGER, title TEXT, metadata TEXT)')

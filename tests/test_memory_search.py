@@ -37,7 +37,7 @@ class SearchModeBase(unittest.TestCase):
                                                                'SB_CLAUDE_MEM_DB', 'SB_STATE_PILOT_SCOPES', 'SB_VERIFY_ALLOWED_ROOTS')})
         env.start()
         self.addCleanup(env.stop)
-        self.loops.write_text('')
+        self.loops.write_text('', encoding='utf-8')
 
     def build_claude_mem(self, observations):
         with sqlite3.connect(self.cm) as db:
@@ -54,7 +54,7 @@ class SearchModeBase(unittest.TestCase):
     def put_head(self, scope, key, body):
         if not self.state.exists():
             sb_state.migrate(str(self.state))
-        ev = self.tmp / ('ev-%s-%s.txt' % (scope, key)); ev.write_text('measured: %s\n' % body)
+        ev = self.tmp / ('ev-%s-%s.txt' % (scope, key)); ev.write_text('measured: %s\n' % body, encoding='utf-8')
         r = sb_state.propose({'scope_id': scope, 'fact_key': key, 'body': body, 'kind': 'measured_fact', 'source': 't', 'write_id': scope + key + body},
                              str(self.state))
         sb_state.verify(r['candidate_id'], 'file_contains', str(ev), db_path=str(self.state))
@@ -129,6 +129,7 @@ class HistoryModeTests(SearchModeBase):
         obs = [('beta', '배포 대상 변경', '배포 대상 변경 배포 대상 변경 prod-9')] * 8 + [('alpha', '배포 대상 변경', '알파 배포 대상 staging-2')]
         self.build_claude_mem(obs)
         code, j, p = self.cli('--mode', 'history', '--scope', 'alpha', '--json', '--limit', '3', '배포 대상 변경')
+        self.assertIsNotNone(j, 'no JSON; rc=%s stdout=%r stderr=%r' % (code, p.stdout[-500:], p.stderr[-1500:]))
         self.assertEqual((code, j['status']), (0, 'ok'))
         self.assertEqual({i['scope_id'] for i in j['items']}, {'alpha'})
         self.assertEqual(j['items'][0]['evidence_ref'], 'observation:9')
@@ -151,7 +152,7 @@ class HistoryModeTests(SearchModeBase):
 
 class NextAndRulesTests(SearchModeBase):
     def write_loops(self, loops):
-        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops))
+        self.loops.write_text(''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in loops), encoding='utf-8')
 
     def test_next_filters_scope_and_flags_missing_action(self):
         self.write_loops([{'id': 'L1', 'title': 'a', 'project': 'alpha', 'status': 'open', 'value': 'high', 'next_action': 'do'},
@@ -164,13 +165,13 @@ class NextAndRulesTests(SearchModeBase):
         self.assertIn('missing_next_action', j['items'][1]['reason_codes'])
 
     def test_malformed_loops_line_is_degraded_not_crash(self):
-        self.loops.write_text('{"id": "L1", "title": "a", "project": "alpha", "status": "open"}\n{broken\n')
+        self.loops.write_text('{"id": "L1", "title": "a", "project": "alpha", "status": "open"}\n{broken\n', encoding='utf-8')
         code, j, p = self.cli('--mode', 'next', '--scope', 'alpha', '--json')
         self.assertEqual((code, j['status'], j['warnings']), (0, 'degraded', ['malformed_line:2']))
         self.assertEqual(len(j['items']), 1); self.assertNotIn('Traceback', p.stderr)
 
     def test_rules_are_scoped_and_paths_stay_inside_dir(self):
-        (self.rules / 'alpha.md').write_text('- 알파 규칙: smoke 테스트\n'); (self.rules / 'beta.md').write_text('- 베타 규칙: mock 금지\n')
+        (self.rules / 'alpha.md').write_text('- 알파 규칙: smoke 테스트\n', encoding='utf-8'); (self.rules / 'beta.md').write_text('- 베타 규칙: mock 금지\n', encoding='utf-8')
         code, j, p = self.cli('--mode', 'rules', '--scope', 'alpha', '--json')
         self.assertIn('smoke 테스트', j['items'][0]['body']); self.assertNotIn('mock 금지', p.stdout)
         code, j, _ = self.cli('--mode', 'rules', '--scope', '../alpha', '--json')
