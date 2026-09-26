@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
+# URI 특수문자 경로 처리 검증용. 윈도우는 파일명에 '?'를 못 쓰므로 '#%'로 대신한다.
+URI_CHARS = '#%' if os.name == 'nt' else '?#'
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 import consolidate as cons
@@ -25,7 +27,7 @@ class ConsolidateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.db = str(Path(self.temp.name) / 'observations?#.db')
+        self.db = str(Path(self.temp.name) / ('observations' + URI_CHARS + '.db'))
         with contextlib.closing(sqlite3.connect(self.db)) as db:
             db.execute('CREATE TABLE observations (id INTEGER, project TEXT, type TEXT, '
                        'title TEXT, narrative TEXT, facts TEXT, created_at TEXT, '
@@ -176,7 +178,7 @@ class ConsolidateTests(unittest.TestCase):
         self.llm.return_value = 'bad'
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cons.main(['run', '--since-days', '1', '--json']), 1)
-        lines = (Path(self.temp.name) / 'consolidation_journal.jsonl').read_text().splitlines()
+        lines = (Path(self.temp.name) / 'consolidation_journal.jsonl').read_text(encoding='utf-8').splitlines()
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])['status'], 'failed')
 
@@ -189,12 +191,14 @@ class ConsolidateTests(unittest.TestCase):
         with patch.object(cons.subprocess, 'run') as run:
             run.return_value.stdout = 'response'
             self.assertEqual(cons._call_llm('prompt'), 'response')
+        # 윈도우는 명령줄 길이 제한 때문에 프롬프트를 stdin 으로 넘긴다(consolidate._call_llm)
+        via_stdin = sb_config.IS_WINDOWS
         self.assertEqual(run.call_args.args[0], [
-            '/fake/bin/claude', '-p', 'prompt',
+            '/fake/bin/claude', '-p'] + ([] if via_stdin else ['prompt']) + [
             '--model', 'claude-sonnet-5', '--output-format', 'text'])
         self.assertEqual(run.call_args.kwargs['timeout'], 600)
         self.assertTrue(run.call_args.kwargs['check'])
-        self.assertIsNone(run.call_args.kwargs['input'])
+        self.assertEqual(run.call_args.kwargs['input'], 'prompt' if via_stdin else None)
         child_env = run.call_args.kwargs['env']
         self.assertEqual((child_env['SB_RECALL'], child_env['CLAUDE_MEM_INTERNAL']), ('0', '1'))
         self.assertEqual(child_env['SB_CLAUDE_MEM_DB'], self.db)  # rest of env inherited
@@ -221,7 +225,8 @@ class ConsolidateTests(unittest.TestCase):
             cons._call_llm('prompt')
             self.assertEqual(cons.consolidate('demo', '2026-W35', self.db)['status'], 'saved')
         self.assertEqual(run.call_args.args[0][0], '/other/claude')
-        self.assertEqual(run.call_args.args[0][3:5], ['--model', 'opus'])
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index('--model'):command.index('--model') + 2], ['--model', 'opus'])
         self.assertEqual(self.post.call_args.args[1]['metadata']['created_by'], 'opus')
 
     def test_journal_defaults_to_sb_home_logs(self) -> None:
@@ -385,7 +390,7 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         journal = Path(self.temp.name) / 'consolidation_journal.jsonl'
-        self.assertEqual(events, [json.loads(line) for line in journal.read_text().splitlines()])
+        self.assertEqual(events, [json.loads(line) for line in journal.read_text(encoding='utf-8').splitlines()])
         self.assertEqual(len(events), 5)
         self.assertEqual(len({event['sid'] for event in events}), 5)
         self.assertEqual(sum(event['input_count'] for event in events), 5)
@@ -402,7 +407,7 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(event['input_count'], 5)
         self.assertEqual(event['status'], 'dry_run')
         journal = Path(self.temp.name) / 'consolidation_journal.jsonl'
-        self.assertEqual(json.loads(journal.read_text()), event)
+        self.assertEqual(json.loads(journal.read_text(encoding='utf-8')), event)
         targets = subprocess.run([PYTHON, '-B', script, 'targets', '--json',
                                   '--since-days', '36500'],
                                  capture_output=True, text=True, timeout=10, check=False)

@@ -36,7 +36,9 @@
   - [ ] claude-mem 설정 (mode=code--ko)
   - [ ] 벡터 임베딩 = `openai` (기존 사용자면 `ollama`도 정상)
   - [ ] Ollama bge-m3, `~/.chroma_env`
-  - [ ] Claude 훅 4종, Claude claude-mem 플러그인 (Claude 쓰는 경우)
+  - [ ] Claude 훅 6종(SessionStart·UserPromptSubmit·PreToolUse·PostToolUse·Stop·SubagentStart), Claude claude-mem 플러그인 (Claude 쓰는 경우)
+  - [ ] **회수 훅 실동작** — 한국어 프롬프트를 실제로 넣어 주입이 나오는지(등록 여부만으론 부족: 윈도우 cp949에서 조용히 전부 빗나간 사례)
+  - [ ] 윈도우: `sb 명령(Git Bash)` — Claude Code 의 Bash 도구는 `sb.cmd` 를 `sb` 로 못 부른다
   - [ ] Codex 훅, **Codex 훅 신뢰 N개**, Codex claude-mem 플러그인 훅 = 꺼짐 (Codex 쓰는 경우)
   - [ ] 규칙 블록 (CLAUDE.md / AGENTS.md)
   - [ ] 상태층(state.db)
@@ -48,6 +50,9 @@
 - [ ] **D-2 Codex 캡처**: 같은 방식으로 Codex **대화형**(TUI)에서 한 번 → `캡처 codex` ✅
   - `codex exec`로 시험하면 **설계상 기록되지 않는다**. 시험용 강제 기록: `SB_CODEX_CAPTURE_EXEC=1 codex exec "..."`
 - [ ] **D-3 회수**: 그 폴더에서 새 세션을 열고 "방금 전에 뭐 했지?" → 에이전트가 `sb search` 또는 claude-mem 검색으로 찾아 답하는지
+  - Bash 도구와 PowerShell 도구 **양쪽에서** `sb scope`가 실행되는지 (세션을 설치 전에 열었으면 PATH가 안 잡혀 있다 → Claude Code 재시작)
+  - 기간 질문("이번달에 한 것 정리해줘")에 `sb timeline`을 쓰는지. 소급 적재분은 created_at 이 적재일로 몰려 있어 claude-mem timeline 으로는 기간 조회가 안 된다
+  - 답을 git·파일만 보고 끝내려 하면 Stop 게이트가 1회 되돌리는지
 - [ ] **D-4 한국어 검색**: `sb search '<방금 작업 키워드(한국어)>' --global --limit 5` 에 결과가 나오는지. 기존 claude-mem 사용자인데 임베딩이 `default`면 `docs/embedding.md` 절차를 사용자에게 제안(자동 실행 금지 — 재색인 필요)
 - [ ] **D-5 결정 기록**: 사용자에게 간단한 결정 하나(예: "이 프로젝트 기본 브랜치는 main")를 말하게 하고 → `sb prompt-id` → `sb state propose/verify/accept` → 새 세션에서 브리핑에 `user-confirmed`로 뜨는지
 - [ ] **D-6 스케줄**: 맥 `launchctl list | grep secondbrain-kit` (koindex·nightly), 윈도우 `schtasks /Query /TN "secondbrain-kit\nightly"`

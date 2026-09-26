@@ -24,9 +24,10 @@ def stub(code: str) -> list:
 
 
 def ok(marker: str = '') -> list:
-    body = "print('out-{0}'); import sys; print('err-{0}', file=sys.stderr)".format(marker)
+    # repr 로 감싼다 — 윈도우 경로(C:\Users\...)를 그대로 넣으면 '\U' 이스케이프로 SyntaxError
+    body = "print({0!r}); import sys; print({1!r}, file=sys.stderr)".format('out-' + marker, 'err-' + marker)
     if marker:
-        body += "; open(r'{}', 'w').close()".format(marker)
+        body += "; open({!r}, 'w').close()".format(marker)
     return stub(body)
 
 

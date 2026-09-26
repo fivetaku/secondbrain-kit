@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+# URI 특수문자 경로 처리 검증용. 윈도우는 파일명에 '?'를 못 쓰므로 '#%'로 대신한다.
+URI_CHARS = '#%' if os.name == 'nt' else '?#'
 
 try:
     from kiwipiepy import Kiwi
@@ -32,8 +34,8 @@ class KoreanFTSTests(unittest.TestCase):
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.source = str(Path(temp.name) / 'source?#.sqlite')
-        self.index = str(Path(temp.name) / 'index?#.sqlite')
+        self.source = str(Path(temp.name) / ('source' + URI_CHARS + '.sqlite'))
+        self.index = str(Path(temp.name) / ('index' + URI_CHARS + '.sqlite'))
         with contextlib.closing(sqlite3.connect(self.source)) as db:
             db.execute('''CREATE TABLE observations (
                 id INTEGER PRIMARY KEY, project TEXT, title TEXT, subtitle TEXT,

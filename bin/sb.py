@@ -3,6 +3,7 @@
 
   sb search '<질의>' [--global] [--limit N] [--no-vector]   과거 경위 검색(L0)
   sb search --mode current|next|rules|history [--scope S]    확정 사실·미결·규칙(L1~L3)
+  sb timeline --since YYYY-MM-DD [--until D] [--days N] [--global]  기간별 과거 작업(세션 날짜 기준)
   sb state propose|verify|accept|head|history ...             상태층(사실 채택)
   sb save --title T --text X [--project P]                    기억 1건 저장(claude-mem 관측)
   sb loops add|list|close|snooze|drop|reopen|set-action ...   미결
@@ -23,7 +24,7 @@ sys.path.insert(0, str(BIN))
 ROUTES = {
     'search': 'sb_search.py', 'state': 'sb_state.py', 'loops': 'loops.py',
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
-    'automemory': 'sync_automemory.py',
+    'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py',
 }
 
 

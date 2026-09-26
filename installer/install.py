@@ -357,8 +357,10 @@ def claude_hooks(args) -> None:
     gate = py_cmd('hooks/recall_gate.py')
     _add(hooks, 'PreToolUse', 'AskUserQuestion', gate, 5)
     _add(hooks, 'PreToolUse', 'Edit|Write|NotebookEdit', gate, 5)
-    _add(hooks, 'PostToolUse', 'Bash', gate, 5)
+    _add(hooks, 'PostToolUse', 'Bash|PowerShell', gate, 5)
     _add(hooks, 'PostToolUse', 'mcp__plugin_claude-mem.*|mcp__.*mcp-search.*', gate, 5)
+    _add(hooks, 'Stop', None, gate, 5)            # 과거 맥락 질문에 회상 없이 끝내면 1회 되돌림
+    _add(hooks, 'SubagentStart', None, gate, 5)   # 서브에이전트에 기록층 사용법 주입
     cur['hooks'] = hooks
     env = cur.setdefault('env', {})
     env.setdefault('SB_HOME', str(SB_HOME))
@@ -459,6 +461,9 @@ def sb_launcher() -> None:
     bindir.mkdir(parents=True, exist_ok=True)
     if IS_WIN:
         (bindir / 'sb.cmd').write_text('@echo off\r\n"%s" "%s" %%*\r\n' % (VPY, KIT / 'bin' / 'sb.py'), encoding='utf-8')
+        # Git Bash(Claude Code 의 Bash 도구)는 .cmd 를 `sb` 로 못 부른다 — sh 런처를 같이 둔다.
+        (bindir / 'sb').write_text('#!/bin/sh\nexport PYTHONIOENCODING=utf-8\nexec "%s" "%s" "$@"\n'
+                                   % (Path(VPY).as_posix(), (KIT / 'bin' / 'sb.py').as_posix()), encoding='utf-8', newline='\n')
         user_path = subprocess.run(['powershell', '-NoProfile', '-c',
                                     "[Environment]::GetEnvironmentVariable('Path','User')"],
                                    text=True, capture_output=True).stdout.strip()

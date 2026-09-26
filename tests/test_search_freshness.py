@@ -13,6 +13,8 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+# URI 특수문자 경로 처리 검증용. 윈도우는 파일명에 '?'를 못 쓰므로 '#%'로 대신한다.
+URI_CHARS = '#%' if os.name == 'nt' else '?#'
 
 from chromadb.api.client import Client
 from chromadb.config import Settings
@@ -34,7 +36,7 @@ class FreshnessTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
-        self.db = self.root / 'source?#.sqlite'
+        self.db = self.root / ('source' + URI_CHARS + '.sqlite')
         self.index = self.root / 'ko.sqlite'
         self.chroma = self.root / 'chroma'
         self.snapshot = self.root / 'snapshot'
@@ -273,7 +275,7 @@ class FreshnessTests(unittest.TestCase):
                 patch.object(ko, '_flock', side_effect=lock), ThreadPoolExecutor(max_workers=2) as pool:
             builder = pool.submit(ko.build)
             try:
-                self.assertTrue(building.wait(10))
+                self.assertTrue(building.wait(10), builder.exception(0) if builder.done() else 'builder still running')
                 # Inspection does not join a refresh or expose uncommitted rows.
                 self.assertEqual(ko.search_ko('우주망원경', 20), [])
                 query = pool.submit(self.query, '우주망원경')
@@ -307,7 +309,7 @@ class FreshnessTests(unittest.TestCase):
             sb_lock.lock(pin, sb_lock.LOCK_SH)
             future = pool.submit(self.query, '우주망원경')
             try:
-                self.assertTrue(publishing.wait(10))
+                self.assertTrue(publishing.wait(10), future.exception(0) if future.done() else 'query still running')
                 self.assertFalse(future.done())
                 self.assertEqual((self.snapshot / 'snapshot_meta.json').read_bytes(), before)
             finally:

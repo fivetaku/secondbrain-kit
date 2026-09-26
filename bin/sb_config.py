@@ -18,6 +18,19 @@ from pathlib import Path
 
 IS_WINDOWS = os.name == 'nt'
 
+if IS_WINDOWS:
+    # 파이프로 연결된 stdout/stderr 는 코드페이지(cp949 등)로 인코딩된다 — '—'·이모지 한 글자에
+    # UnicodeEncodeError 로 CLI 가 통째로 죽지 않게, 인코딩은 그대로 두고 표현 못 하는 글자만 \uXXXX 로 바꾼다
+    # (JSON 문자열 안이면 파서가 원래 글자로 복원한다). 인코딩을 UTF-8 로 바꾸면 PowerShell 이 코드페이지로
+    # 해석해 한국어가 깨진다. 훅은 따로 UTF-8 로 고정한다. errors 기본값은 strict 또는 surrogateescape.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if (_stream is not None and (_stream.encoding or '').lower().replace('-', '') != 'utf8'
+                    and _stream.errors in ('strict', 'surrogateescape')):
+                _stream.reconfigure(errors='backslashreplace')
+        except Exception:  # noqa: BLE001
+            pass
+
 
 def home() -> Path:
     return Path(os.environ.get('SB_HOME') or '~/.secondbrain').expanduser()

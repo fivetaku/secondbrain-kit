@@ -1,5 +1,4 @@
 """sb_lock contention contract: two handles on one lock file, NB second lock must fail."""
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -9,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 import sb_lock  # noqa: E402
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX flock semantics (Windows treats SH as EX)')
 class LockContentionTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()

@@ -28,9 +28,9 @@ class StateOpsBase(unittest.TestCase):
         os.environ.update(self.env_patch)
         os.environ.pop('SB_STATE_FAIL_BEFORE_INSERT', None)
         sb_state.migrate(str(self.db))
-        (self.tmp / 'aliases.json').write_text(json.dumps({'proj-a': ['/nonexistent/proj-a', 'legacy-a']}))
+        (self.tmp / 'aliases.json').write_text(json.dumps({'proj-a': ['/nonexistent/proj-a', 'legacy-a']}), encoding='utf-8')
         self.evidence = self.tmp / 'deploy.txt'
-        self.evidence.write_text('deploy target: staging-2\nport: 8443\n')
+        self.evidence.write_text('deploy target: staging-2\nport: 8443\n', encoding='utf-8')
 
     def tearDown(self):
         for k, v in self._old.items():
@@ -88,7 +88,7 @@ class CandidateGateTests(StateOpsBase):
 
     def test_user_decision_requires_user_utterance_check_and_is_labelled_user_confirmed(self):
         record = self.tmp / 'chat.md'
-        record.write_text('user: 배포 대상은 staging-2 로 확정한다\n')
+        record.write_text('user: 배포 대상은 staging-2 로 확정한다\n', encoding='utf-8')
         r = self.propose(kind='user_decision', write_id='d1')
         wrong = sb_state.verify(r['candidate_id'], 'file_contains', str(record))
         self.assertEqual(wrong['result'], 'rejected')
@@ -120,7 +120,7 @@ class CandidateGateTests(StateOpsBase):
 
     def test_line_span_forms_and_hash_in_filename(self):
         record = self.tmp / 'notes#v2.md'
-        record.write_text('header\nuser: 배포 대상은 staging-2 로 확정한다\nfooter\n')
+        record.write_text('header\nuser: 배포 대상은 staging-2 로 확정한다\nfooter\n', encoding='utf-8')
         r = self.propose(kind='user_decision', write_id='span')
         for target in (str(record) + '#L2-L2', str(record) + '#2-3', str(record) + '#L2', str(record)):
             with self.subTest(target=target):
@@ -141,18 +141,18 @@ class CandidateGateTests(StateOpsBase):
 
     def test_allowed_roots_split_on_os_pathsep_and_default_to_sb_home(self):
         other = Path(tempfile.mkdtemp(prefix='sb-state-ops-other-'))
-        ev = other / 'ev.txt'; ev.write_text('staging-2\n')
+        ev = other / 'ev.txt'; ev.write_text('staging-2\n', encoding='utf-8')
         r = self.propose()
         os.environ['SB_VERIFY_ALLOWED_ROOTS'] = os.pathsep.join([str(self.tmp), str(other)])
         self.assertEqual(sb_state.verify(r['candidate_id'], 'file_contains', str(ev))['result'], 'confirmed')
         # 기본값(env 없음): SB_HOME + 별칭 경로만 — 임시 루트 밖은 거부
         os.environ.pop('SB_VERIFY_ALLOWED_ROOTS')
         home = self.tmp / 'sbhome'; home.mkdir(exist_ok=True)
-        inside = home / 'ev.txt'; inside.write_text('staging-2\n')
+        inside = home / 'ev.txt'; inside.write_text('staging-2\n', encoding='utf-8')
         self.assertEqual(sb_state.verify(r['candidate_id'], 'file_contains', str(inside))['result'], 'confirmed')
         with self.assertRaises(sb_state.StateError):
             sb_state.verify(r['candidate_id'], 'file_contains', str(ev))
-        (self.tmp / 'aliases.json').write_text(json.dumps({'proj-a': [str(other)]}))
+        (self.tmp / 'aliases.json').write_text(json.dumps({'proj-a': [str(other)]}), encoding='utf-8')
         self.assertEqual(sb_state.verify(r['candidate_id'], 'file_contains', str(ev))['result'], 'confirmed')
 
     def test_pilot_gate_default_is_all_scopes(self):
@@ -232,7 +232,7 @@ class IdempotencyTests(StateOpsBase):
 
     def _write_req(self, **over):
         p = self.tmp / ('req-%d.json' % len(list(self.tmp.glob('req-*.json'))))
-        p.write_text(json.dumps(self.req(**over)))
+        p.write_text(json.dumps(self.req(**over)), encoding='utf-8')
         return str(p)
 
 
@@ -283,7 +283,7 @@ class AtomicityTests(StateOpsBase):
         cids = []
         for i in range(8):
             r = self.propose(write_id='p%d' % i, body='v%d' % i, value_json=None)
-            self.evidence.write_text(self.evidence.read_text() + 'v%d\n' % i)
+            self.evidence.write_text(self.evidence.read_text(encoding='utf-8') + 'v%d\n' % i, encoding='utf-8')
             self.assertEqual(self.confirm(r['candidate_id'])['result'], 'confirmed')
             cids.append(r['candidate_id'])
         procs = [subprocess.Popen([PY, str(BIN / 'sb_state.py'), '--db', str(self.db), 'accept', '--candidate',
@@ -372,7 +372,7 @@ class ScopeIsolationTests(StateOpsBase):
     def test_history_lists_all_versions_oldest_first(self):
         r = self.propose(); self.confirm(r['candidate_id']); sb_state.accept(r['candidate_id'], 0)
         r2 = self.propose(write_id='w2', body='staging-3', value_json=None, expected_version=1)
-        self.evidence.write_text('staging-3\n'); self.confirm(r2['candidate_id']); sb_state.accept(r2['candidate_id'], 1)
+        self.evidence.write_text('staging-3\n', encoding='utf-8'); self.confirm(r2['candidate_id']); sb_state.accept(r2['candidate_id'], 1)
         hist = sb_state.query('history', 'proj-a', 'deploy.target')
         self.assertEqual([(i['version'], i['is_head']) for i in hist['items']], [(1, False), (2, True)])
 

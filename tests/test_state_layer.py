@@ -1,4 +1,5 @@
 import os
+import contextlib
 import sqlite3
 import sys
 import tempfile
@@ -29,7 +30,8 @@ class StateLayerTests(unittest.TestCase):
 
     def test_schema_columns(self):
         self.put()
-        cols = [r[1] for r in sqlite3.connect(self.db).execute('PRAGMA table_info(state)')]
+        with contextlib.closing(sqlite3.connect(self.db)) as db:  # 윈도우는 열린 DB 파일을 못 지운다
+            cols = [r[1] for r in db.execute('PRAGMA table_info(state)')]
         for c in ('memory_kind', 'scope_id', 'fact_key', 'version', 'is_head',
                   'observation_ref', 'observed_at', 'recorded_at', 'body'):
             self.assertIn(c, cols)
@@ -137,8 +139,9 @@ class StateLayerTests(unittest.TestCase):
         threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
         for t in threads: t.start()
         for t in threads: t.join()
-        heads = sqlite3.connect(self.db).execute(
-            "SELECT count(*) FROM state WHERE scope_id='demo-proj' AND fact_key='port' AND is_head=1").fetchone()[0]
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            heads = db.execute(
+                "SELECT count(*) FROM state WHERE scope_id='demo-proj' AND fact_key='port' AND is_head=1").fetchone()[0]
         self.assertEqual(heads, 1)
         total = len(sb_memory.state_history('demo-proj', 'port'))
         self.assertEqual(total + len(errors), 8)

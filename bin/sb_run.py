@@ -106,7 +106,7 @@ class HeldLock:
     def __enter__(self) -> "HeldLock":
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         # Keep the inode: unlinking a lock file lets concurrent runs bypass it.
-        self.stream = open(self.path, "a+")
+        self.stream = open(self.path, "a+", encoding="utf-8", errors="replace")
         try:
             sb_lock.lock(self.stream, sb_lock.LOCK_EX | sb_lock.LOCK_NB)
         except BlockingIOError as error:  # sb_lock maps Windows lock conflicts to this too
