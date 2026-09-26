@@ -4,8 +4,10 @@
 배경: 이미 끝난 일이 기억층에 있는데 조회 없이 "할까요"를 다시 묻는 사고를 막는다.
 규칙(CLAUDE.md)만으로는 안 지켜져서 훅으로 내린 하한선이다.
 
-세 갈래:
-  PostToolUse(Bash)           → 명령이 실제 회상이면 .recalled 마커 기록
+갈래:
+  PostToolUse(Bash|PowerShell|claude-mem MCP) → 실제 회상이면 .recalled(+.recalled_at) 마커 기록
+  Stop                        → sb_recall 이 남긴 .needs(과거 맥락 질문) 이후 회상이 없으면 1회 block
+  SubagentStart               → 서브에이전트에 기록층 사용법 주입(회수 주입을 못 받으므로)
   PreToolUse(AskUserQuestion) → 마커 없으면 1차 deny(재시도는 통과). 질문은 나가는 순간이 사고다
   PreToolUse(Edit|Write)      → 마커 없으면 세션 1회 넛지만(차단 아님)
 
@@ -23,6 +25,13 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import sb_config  # noqa: E402
 
+# Windows 기본 코드페이지(cp949)로 읽으면 한국어 프롬프트가 깨져 회수가 전부 빗나간다 — 훅 입출력은 UTF-8 고정.
+for _s in (sys.stdin, sys.stdout):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SB = "sb search"
 
 ASK_MSG = (
@@ -39,10 +48,31 @@ EDIT_MSG = (
     "이미 고친 것을 다시 고치거나 사용자 결정을 덮는 것을 막는 리마인더입니다."
 )
 
-RECALL_PAT = ("sb search", "sb state", "sb_search", "sb_state", "sb_briefing", "claude-mem", "claude_mem",
-              "mcp-search", "observations_fts", "user_prompts_fts", "recall")
+RECALL_PAT = ("sb search", "sb state", "sb timeline", "sb loops", "sb_search", "sb_state", "sb_timeline",
+              "sb_briefing", "claude-mem", "claude_mem", "mcp-search", "observations_fts", "user_prompts_fts", "recall")
 
 EDIT_TOOLS = ("Edit", "Write", "NotebookEdit")
+SHELL_TOOLS = ("Bash", "PowerShell")
+
+# Stop: 과거 맥락이 걸린 질문(sb_recall 이 .needs 마커를 남김)에 기억층을 안 보고 답을 끝내려 할 때 1회 되돌린다.
+STOP_MSG = (
+    "기억층 조회 없이 답을 끝내려 합니다. 이 질문은 과거 작업·상태와 관련 있습니다(회수 목록 또는 기간·이력 질문).\n"
+    "  - 기간 질문: sb timeline --since YYYY-MM-DD [--until D]\n"
+    "  - 주제: sb search '<주제>' --global --limit 5  →  관련 ID는 get_observations([ID])\n"
+    "  - 확정 사실: sb search --mode current\n"
+    "조회 결과로 답을 확인·보강하고 근거(#ID·파일·커밋)를 붙여 다시 답하세요. "
+    "정말 무관하면 한 줄로 이유를 밝히고 끝내도 됩니다(이번 한 번만 멈춥니다)."
+)
+
+# SubagentStart: 서브에이전트는 UserPromptSubmit 회수 주입을 못 받는다 — 사용법을 직접 넣는다.
+SUBAGENT_MSG = (
+    "[세컨브레인 — 서브에이전트용] 이 PC의 과거 작업 기록층을 자유롭게 써라(읽기 전용, 0.2~수 초).\n"
+    "- 과거 경위: `sb search '<주제>' --global --limit 5` (Bash/PowerShell 모두 `sb`), 본문은 claude-mem MCP get_observations([ID])\n"
+    "- 기간별 목록: `sb timeline --since YYYY-MM-DD [--until D]`\n"
+    "- 확정 사실·미결·규칙: `sb search --mode current|next|rules`\n"
+    "과제에 과거 결정·상태·수치가 걸리면 추측 말고 먼저 조회하고, 결과에 근거(#ID·파일)를 적는다. "
+    "과거 기록은 기록 당시 스냅샷이라 현재 상태 주장은 실측을 우선한다."
+)
 
 
 def main() -> None:
@@ -99,15 +129,53 @@ def main() -> None:
         payload["hookEventName"] = "PreToolUse"
         sys.stdout.write(json.dumps({"hookSpecificOutput": payload}, ensure_ascii=False))
 
+    def touch(suffix: str) -> None:
+        try:
+            gate.mkdir(parents=True, exist_ok=True)
+            (gate / (key + suffix)).touch()
+        except OSError:
+            pass
+
+    def mtime(suffix: str) -> float:
+        try:
+            return (gate / (key + suffix)).stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def recalled() -> None:
+        claim(".recalled")
+        touch(".recalled_at")   # 프롬프트 단위 판정용(Stop 게이트) — 매 회상마다 갱신
+
+    event = str(job.get("hook_event_name") or job.get("hookEventName") or "")
+
+    # ── 서브에이전트 시작: 기록층 사용법 주입 ───────────────────────
+    if event == "SubagentStart":
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SubagentStart", "additionalContext": SUBAGENT_MSG}}, ensure_ascii=False))
+        return
+
+    # ── Stop: 과거 맥락 질문인데 이번 프롬프트 이후 회상이 없으면 1회 되돌림 ──
+    if event == "Stop":
+        if job.get("stop_hook_active"):
+            return
+        needs = mtime(".needs")
+        if needs and mtime(".recalled_at") < needs:
+            try:
+                (gate / (key + ".needs")).unlink()   # 프롬프트당 1회만
+            except OSError:
+                pass
+            sys.stdout.write(json.dumps({"decision": "block", "reason": STOP_MSG}, ensure_ascii=False))
+        return
+
     # ── 회상 마커 기록 ───────────────────────────────────────────────
     low = tool.lower()
     if "recall" in low or "mcp-search" in low or "mcp__plugin_claude-mem" in tool:
-        claim(".recalled")
+        recalled()
         return
-    if tool == "Bash":
+    if tool in SHELL_TOOLS:
         command = str(tool_input.get("command") or "")
         if any(pat in command for pat in RECALL_PAT):
-            claim(".recalled")
+            recalled()
         return
 
     if has(".recalled"):

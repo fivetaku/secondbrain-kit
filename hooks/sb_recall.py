@@ -16,6 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 import sb_config  # noqa: E402
 
+# Windows 기본 코드페이지(cp949)로 읽으면 한국어 프롬프트가 깨져 회수가 전부 빗나간다 — 훅 입출력은 UTF-8 고정.
+for _s in (sys.stdin, sys.stdout):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 WORKER = os.environ.get("SB_RECALL_WORKER") or sb_config.worker_base_url()
 MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "5"))
 MAX_CHARS = 700
@@ -94,6 +101,12 @@ def search(q: str, project: str):
     return out
 
 
+# 기간·이력·상태 질문 — 제목 몇 줄로는 부족하니 기간 조회를 안내한다(2026-09-26).
+TIME_PAT = re.compile(r"이번\s*(달|주|분기)|지난\s*(달|주|번|분기)|저번|요즘|최근|그동안|어제|그저께|오늘\s*한|월간|주간|회고|"
+                      r"\d{1,2}\s*월\s*(에|달|중|한)|\d{1,2}/\d{1,2}|어떻게\s*됐|진행\s*상황|진행\s*상태|히스토리|이력|경위|했었|했던")
+TIME_HINT = ("[세컨브레인 회수·기간/이력 질문] 답하기 전에 `sb timeline --since YYYY-MM-DD [--until D]`(세션 날짜 기준 목록)와 "
+             "`sb search '<주제>' --global --limit 5`로 기록층을 먼저 훑고, git·파일 실측과 교차 확인한다. 답 끝에 근거(#ID·파일·커밋)를 적는다.")
+
 FRESH_MINUTES = 20   # observations younger than this are "what is happening right now", not recall
 
 
@@ -109,8 +122,8 @@ def enrich(items, content_session_id: str):
             "SELECT o.id FROM observations o JOIN sdk_sessions s ON s.memory_session_id=o.memory_session_id "
             "WHERE s.content_session_id=?", (content_session_id,))}
         ids = [it["id"] for it in items]
-        meta = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
-            f"SELECT id, substr(created_at,1,10), project, created_at_epoch FROM observations WHERE id IN ({','.join('?'*len(ids))})", ids)}
+        meta = {r[0]: (r[1], r[2], r[3], r[4] or "") for r in con.execute(
+            f"SELECT id, substr(created_at,1,10), project, created_at_epoch, metadata FROM observations WHERE id IN ({','.join('?'*len(ids))})", ids)}
         con.close()
     except Exception:
         return items
@@ -119,9 +132,14 @@ def enrich(items, content_session_id: str):
     for it in items:
         if it["id"] in own:
             continue
-        d, proj, ep = meta.get(it["id"], ("", "", 0))
-        if ep and ep > cutoff:
+        d, proj, ep, md = meta.get(it["id"], ("", "", 0, ""))
+        # 소급 적재(import/backfill/automemory-sync)는 created_at 이 적재 시각일 뿐 "지금 벌어지는 일"이 아니다.
+        imported = any(k in md for k in ('"kind":"import"', '"kind":"automemory-sync"', 'backfill'))
+        if ep and ep > cutoff and not imported:
             continue
+        sd = re.search(r'"session_date":"(\d{4}-\d{2}-\d{2})"', md)
+        if sd:
+            d = sd.group(1)
         it["date"] = d[5:] if d else ""; it["project"] = proj or ""
         out.append(it)
     return out
@@ -168,19 +186,29 @@ def main():
     try:
         items = search(prompt, project)
     except Exception:
-        return
+        items = []
     items = enrich(items, sid)
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
-    if not fresh:
+    hint = TIME_HINT if TIME_PAT.search(prompt) else ""
+    if not fresh and not hint:
         return
     lines = [f"- #{it['id']} {it['date']} {it.get('project','')[:18]} · {it['title'][:70]}" for it in fresh]
     body = "\n".join(lines)
     while len(body) > MAX_CHARS and len(lines) > 1:
         lines.pop(); body = "\n".join(lines)
     ctx = ("[세컨브레인 회수] 이 프롬프트와 관련 있을 수 있는 과거 기록(제목만). "
-           "실제로 관련 있으면 get_observations([ID])로 본문을 가져오고, 아니면 무시한다.\n" + body)
+           "실제로 관련 있으면 get_observations([ID])로 본문을 가져오고, 아니면 무시한다.\n" + body) if fresh else ""
+    if hint:
+        ctx = (ctx + "\n" + hint).strip()
     try:
         json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt": prompt.strip(), "updated": time.time()}, open(state_path, "w"))
+    except Exception:
+        pass
+    try:   # recall_gate 의 Stop 게이트가 "이 프롬프트 이후 회상했나"를 보는 기준 시각
+        import hashlib, pathlib
+        gate_dir = pathlib.Path(os.environ.get("SB_RECALL_GATE_DIR", sb_config.sb_path("logs", "recall-gate")))
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        (gate_dir / (hashlib.sha256(sid.encode()).hexdigest() + ".needs")).touch()
     except Exception:
         pass
     if os.environ.get("SB_RECALL_DEBUG") == "1":

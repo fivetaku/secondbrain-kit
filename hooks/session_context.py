@@ -12,6 +12,13 @@ import os
 import sys
 from pathlib import Path
 
+# Windows 기본 코드페이지(cp949)로 읽으면 한국어 프롬프트가 깨져 회수가 전부 빗나간다 — 훅 입출력은 UTF-8 고정.
+for _s in (sys.stdin, sys.stdout):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'bin'))
 

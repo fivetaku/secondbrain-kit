@@ -77,11 +77,33 @@ def parse_memory_file(path: str) -> Dict[str, Any]:
     return {**fields, 'body': body, 'title': fields['description'] or fields['name']}
 
 
+def excluded_projects() -> set:
+    """~/.secondbrain/config/automemory_exclude.txt 의 프로젝트명(한 줄에 하나)은 가져오지 않는다."""
+    path = Path(sb_path('config', 'automemory_exclude.txt'))
+    if not path.is_file():
+        return set()
+    return {line.strip() for line in path.read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.startswith('#')}
+
+
+def project_map() -> Dict[str, str]:
+    """~/.secondbrain/config/automemory_project_map.json {"슬러그 프로젝트명": "claude-mem 프로젝트명"}.
+    claude-mem 은 cwd 폴더 이름을 project 로 쓰므로, 같은 폴더의 기록이 한 이름으로 모이게 맞춘다."""
+    path = Path(sb_path('config', 'automemory_project_map.json'))
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
 def discover(root: str = None) -> List[Tuple[str, str]]:
     base = Path(os.path.abspath(os.path.expanduser(root or '~/.claude/projects')))
-    return [(project_from_slug(path.parent.parent.name), str(path))
+    skip = excluded_projects()
+    mapping = project_map()
+    return [(mapping.get(project_from_slug(path.parent.parent.name), project_from_slug(path.parent.parent.name)),
+             str(path))
             for path in sorted(base.glob('*/memory/*.md'))
-            if path.name != 'MEMORY.md' and path.is_file()]
+            if path.name != 'MEMORY.md' and path.is_file()
+            and project_from_slug(path.parent.parent.name) not in skip]
 
 
 def _state_path(path: Optional[str] = None) -> Path:

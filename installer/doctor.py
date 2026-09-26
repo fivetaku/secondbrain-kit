@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.request
@@ -93,12 +94,30 @@ def _has_kit_hook(path: Path, event: str) -> bool:
     return any(kit in str(h.get('command', '')).replace('\\', '/') for g in hooks.get(event, []) for h in g.get('hooks', []))
 
 
+def check_recall_smoke():
+    """등록만 보지 않고 실제로 돌려 본다 — 한국어 프롬프트가 깨지면 회수가 조용히 전부 빗나간다(윈도우 cp949)."""
+    env = {k: v for k, v in os.environ.items() if k not in ('PYTHONIOENCODING', 'PYTHONUTF8')}
+    env['SB_RECALL_GATE_DIR'] = tempfile.mkdtemp(prefix='sb-doctor-')
+    payload = json.dumps({'prompt': '지난주에 한 작업 어떻게 됐지', 'session_id': 'sb-doctor-%d' % os.getpid(),
+                          'cwd': str(HOME)}, ensure_ascii=False).encode('utf-8')
+    try:
+        r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'hooks' / 'sb_recall.py')],
+                           input=payload, capture_output=True, timeout=30, env=env)
+        ctx = json.loads(r.stdout.decode('utf-8') or '{}').get('hookSpecificOutput', {}).get('additionalContext', '')
+    except Exception as e:  # noqa: BLE001
+        return rec('❌', '회수 훅 실동작', '실행 실패: %s' % e)
+    ok = 'sb timeline' in ctx
+    rec('✅' if ok else '❌', '회수 훅 실동작', '한국어 프롬프트 → 회수 주입 정상' if ok else '한국어 프롬프트에 주입 없음(인코딩 확인)')
+
+
 def check_claude():
     if not shutil.which('claude'):
         return rec('⚠', 'Claude Code', '미설치 — 건너뜀')
     p = HOME / '.claude' / 'settings.json'
-    missing = [e for e in ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse') if not _has_kit_hook(p, e)]
-    rec('✅' if not missing else '❌', 'Claude 훅', '4종 등록' if not missing else '누락: ' + ', '.join(missing))
+    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'SubagentStart')
+    missing = [e for e in events if not _has_kit_hook(p, e)]
+    rec('✅' if not missing else '❌', 'Claude 훅', '%d종 등록' % len(events) if not missing else '누락: ' + ', '.join(missing))
+    check_recall_smoke()
     cache = HOME / '.claude/plugins/cache/thedotmack/claude-mem'
     rec('✅' if cache.exists() else '❌', 'Claude claude-mem 플러그인', str(cache) if cache.exists() else '미설치')
 
@@ -156,9 +175,16 @@ def check_state_and_capture():
 def check_sb():
     found = shutil.which('sb')
     rec('✅' if found else '⚠', 'sb 명령', found or 'PATH 에 없음(새 터미널에서 다시 확인)')
+    if IS_WIN:   # Claude Code 의 Bash 도구(Git Bash)는 sb.cmd 를 `sb` 로 못 부른다
+        sh = sb_config.home() / 'bin' / 'sb'
+        rec('✅' if sh.is_file() else '❌', 'sb 명령(Git Bash)', str(sh) if sh.is_file() else '없음 — install 재실행')
 
 
 def main() -> int:
+    try:   # 파이프·리디렉션 시 cp949 콘솔에서 ✅ 출력이 UnicodeEncodeError 로 죽는다
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:  # noqa: BLE001
+        pass
     for fn in (check_venv, check_worker, check_settings, check_embedding, check_claude, check_codex,
                check_rules, check_state_and_capture, check_sb):
         try:
