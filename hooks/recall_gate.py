@@ -156,7 +156,7 @@ def main() -> None:
 
     # ── Stop: 과거 맥락 질문인데 이번 프롬프트 이후 회상이 없으면 1회 되돌림 ──
     if event == "Stop":
-        if job.get("stop_hook_active"):
+        if job.get("stop_hook_active") or os.environ.get("SB_STOP_GATE", "1") == "0":
             return
         needs = mtime(".needs")
         if needs and mtime(".recalled_at") < needs:

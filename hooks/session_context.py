@@ -93,6 +93,12 @@ def main() -> None:
         except Exception:
             pass
     cwd = str(raw.get('cwd') or os.getcwd())
+    try:   # 회수 상주 서버를 미리 띄운다 — 첫 프롬프트부터 형태소 회수가 바로 되게(떠 있으면 확인만)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'bin'))
+        import sb_recalld
+        sb_recalld.ensure_running()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         text, scope_id, method, shown, omitted, used = build(cwd)
     except Exception:

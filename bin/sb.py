@@ -3,6 +3,7 @@
 
   sb search '<질의>' [--global] [--limit N] [--no-vector]   과거 경위 검색(L0)
   sb search --mode current|next|rules|history [--scope S]    확정 사실·미결·규칙(L1~L3)
+  sb recall '<질의>' [--global] [--json]                     빠른 회수(상주 서버, ~0.3초) + 관련도 판정
   sb timeline --since YYYY-MM-DD [--until D] [--days N] [--global]  기간별 과거 작업(세션 날짜 기준)
   sb state propose|verify|accept|head|history ...             상태층(사실 채택)
   sb save --title T --text X [--project P]                    기억 1건 저장(claude-mem 관측)
@@ -24,7 +25,7 @@ sys.path.insert(0, str(BIN))
 ROUTES = {
     'search': 'sb_search.py', 'state': 'sb_state.py', 'loops': 'loops.py',
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
-    'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py',
+    'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py',
 }
 
 
@@ -72,6 +73,10 @@ def main() -> int:
         rows = con.execute('SELECT id, created_at, substr(prompt_text,1,120) FROM user_prompts '
                            'WHERE prompt_text LIKE ? ORDER BY id DESC LIMIT 5', ('%' + argv[0] + '%',)).fetchall()
         print(json.dumps([{'id': r[0], 'created_at': r[1], 'text': r[2]} for r in rows], ensure_ascii=False))
+        return 0
+    if cmd == 'recall':   # 상주 서버 경유 빠른 회수 (sb_recalld.py query)
+        sys.argv = [str(BIN / 'sb_recalld.py'), 'query'] + argv
+        runpy.run_path(str(BIN / 'sb_recalld.py'), run_name='__main__')
         return 0
     if cmd == 'index':
         cmd, argv = 'sb_fts_ko.py', ['build'] + argv

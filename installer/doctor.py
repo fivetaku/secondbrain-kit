@@ -184,6 +184,12 @@ def check_state_and_capture():
 def check_sb():
     found = shutil.which('sb')
     rec('✅' if found else '⚠', 'sb 명령', found or 'PATH 에 없음(새 터미널에서 다시 확인)')
+    try:   # 회수 상주 서버 — 세션 시작 훅이 띄운다(꺼져 있어도 다음 세션에서 자동 기동)
+        import sb_recalld
+        up = sb_recalld.is_up()
+        rec('✅' if up else '⚠', '회수 상주 서버(sb_recalld)', sb_recalld.base_url() if up else '꺼짐 — 새 세션을 열거나 `sb recall` 한 번이면 뜸')
+    except Exception as exc:  # noqa: BLE001
+        rec('⚠', '회수 상주 서버(sb_recalld)', str(exc)[:80])
     if IS_WIN:   # Claude Code 의 Bash 도구(Git Bash)는 sb.cmd 를 `sb` 로 못 부른다
         sh = sb_config.home() / 'bin' / 'sb'
         rec('✅' if sh.is_file() else '❌', 'sb 명령(Git Bash)', str(sh) if sh.is_file() else '없음 — install 재실행')
