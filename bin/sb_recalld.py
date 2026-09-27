@@ -40,6 +40,10 @@ SYNC_EVERY = 20.0          # 색인 동기화 최소 간격(초)
 FRESH_MINUTES = 20         # 이보다 새 실시간 관찰은 회상 대상에서 뺀다(훅의 enrich 와 같은 기준)
 GATE_MATCHED, GATE_MATCHED_LOW, GATE_COVERAGE = 3, 2, 0.6
 RARE_DF = 0.10             # 이 비율 미만의 기록에만 나오는 단어를 '드문 단어'로 본다
+# 작업 지시·진행 질문에 흔한 일반 명사 — 판정에서 세지 않는다("원인 파악해서 수정해", "남은 이슈 개선해줘").
+# DOE 재검증: 관련 유지 0.99·모호 0.96 그대로, 진행·지시 질문 주입 4/12 → 0/12, 무관 주입 0.33 → 0.27.
+TASK_WORDS = frozenset('원인 파악 수정 확인 정리 진행 작업 문제 이슈 개선 상태 결과 내용 부분 방법 지금 다음 단계 남 뭐 '
+                       '것 거 이거 그거 저거 해결 처리 검토 보고 테스트 다시 전체 관련 사항 요청 필요'.split())
 
 
 def gate_pass(matched: int, coverage: float, rare: int = 1) -> bool:
@@ -131,7 +135,7 @@ class Engine:
         if kiwi is None:
             return list(dict.fromkeys(self.ko.ko_query_tokens(text)))
         toks = ident + [t.form.lower() for t in kiwi.tokenize(text)
-                        if t.tag.startswith('NN') or t.tag in {'SL', 'SN', 'SH'}]
+                        if (t.tag.startswith('NN') and t.tag != 'NNB') or t.tag in {'SL', 'SN', 'SH'}]   # NNB: 의존명사(거·것·수)
         return list(dict.fromkeys(toks))
 
     def _search(self, conn, match, project, limit):
@@ -160,13 +164,14 @@ class Engine:
         rows = [r for r in rows if not (meta.get(r[0], {}).get('live') and meta[r[0]].get('epoch', 0) > cutoff)]
         rows = rows[:limit]
         matched, cov, rare = 0, 0.0, 0
-        if rows:
+        counted = [t for t in toks if t not in TASK_WORDS]   # 판정은 주제 단어로만(검색에는 모두 씀)
+        if rows and counted:
             body = set((rows[0][3] or '').lower().split())
-            hit = [t for t in toks if t in body]
+            hit = [t for t in counted if t in body]
             matched = len(hit)
             rare = (sum(1 for t in hit if self.df.get(t, 0) / self.n_docs < RARE_DF)
                     if self.n_docs >= 50 else matched)   # 기록이 적으면 빈도 비율이 무의미
-            cov = matched / len(toks)
+            cov = matched / len(counted)
         gate = gate_pass(matched, cov, rare)
         items = []
         for oid, score, proj, _body in rows:
@@ -257,6 +262,14 @@ def serve(port, idle_hours):
                     if cfg and cfg.get('work_projects'):
                         with contextlib.redirect_stdout(io.StringIO()):
                             sb_relabel.auto_env(cfg['work_projects'], cfg.get('to') or 'secondbrain-kit', since_hours=24)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:   # 실시간 관찰기가 옮겨 적은 실명 가리기(SQLite만 — 벡터는 야간 pii 단계)
+                    import sb_memory
+                    import sb_pii_sweep
+                    mask = sb_memory._pii_masker()
+                    if mask is not None and any(sb_pii_sweep.sweep_sqlite(mask).values()):
+                        engine.ko.build(full=True)
                 except Exception:  # noqa: BLE001
                     pass
     threading.Thread(target=reaper, daemon=True).start()

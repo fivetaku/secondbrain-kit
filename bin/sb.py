@@ -25,7 +25,7 @@ sys.path.insert(0, str(BIN))
 ROUTES = {
     'search': 'sb_search.py', 'state': 'sb_state.py', 'loops': 'loops.py',
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
-    'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py',
+    'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py', 'pii-sweep': 'sb_pii_sweep.py',
 }
 
 

@@ -49,6 +49,10 @@ def build_stages(with_consolidate: bool = False) -> List[Stage]:
         Stage('snapshot', [py, str(BIN / 'sb_search.py'), 'warmup', '--global',
                            '--limit', '1', '--fresh', '--json'], 600, quiet=True),
     ]
+    if (Path(os.environ.get('SB_PII_MASK') or sb_config.sb_path('local', 'pii_mask.py')).is_file()
+            and os.environ.get('SB_PII_MASK') != '0'):
+        # 마스킹 모듈이 있는 PC만: 실시간 관찰기가 옮겨 적은 실명을 SQLite·벡터에서 가린다(워커를 잠시 멈춤)
+        stages.insert(0, Stage('pii', [py, str(BIN / 'sb_pii_sweep.py'), '--chroma', '--json'], 900))
     if with_consolidate:
         stages.append(Stage('consolidate', [py, str(BIN / 'consolidate.py'), 'run',
                                             '--since-days', os.environ.get('SB_CONS_SINCE_DAYS', '7'),
