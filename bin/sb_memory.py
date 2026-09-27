@@ -88,6 +88,29 @@ def _http_post(url: str, payload: Dict[str, Any], timeout: int) -> Tuple[int, st
 _post = _http_post
 
 
+_MASKER = []
+
+
+def _pii_masker():
+    """선택형 개인정보 마스킹 — SB_PII_MASK(경로) 또는 $SB_HOME/local/pii_mask.py 에 mask(str)->str 이 있으면 쓴다.
+    사람 이름 사전 등은 PC마다 다르므로 키트에는 두지 않고, 있으면 연결만 한다. SB_PII_MASK=0 이면 끈다."""
+    if _MASKER:
+        return _MASKER[0]
+    fn = None
+    path = os.environ.get('SB_PII_MASK') or sb_config.sb_path('local', 'pii_mask.py')
+    if path != '0' and os.path.isfile(path):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('sb_local_pii_mask', path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fn = getattr(mod, 'mask', None)
+        except Exception:  # noqa: BLE001 — 마스킹 모듈 오류로 저장이 막히면 안 된다
+            fn = None
+    _MASKER.append(fn)
+    return fn
+
+
 def save_memory(text: str, title: str, project: str, prov: Dict[str, Any],
                 base_url: str = None, db_path: str = None, retries: int = 2) -> int:
     if not text.strip() or not title.strip():
@@ -101,6 +124,9 @@ def save_memory(text: str, title: str, project: str, prov: Dict[str, Any],
     if already_saved(key, db_path):
         journal({**event, 'event': 'skipped'})
         return -1
+    masker = _pii_masker()
+    if masker is not None:   # 모든 저장 경로(sb save·automemory 동기화·통합)에서 개인정보를 가린다
+        text, title = masker(text), masker(title)
     payload = {'text': text, 'title': title, 'project': project,
                'metadata': {**prov, 'dedup_key': key}}
     # SB_MEM_BASE_URL 이 있으면 worker_base_url() 이 그대로 돌려준다(env 우선).

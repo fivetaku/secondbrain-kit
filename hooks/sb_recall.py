@@ -103,9 +103,66 @@ def search(q: str, project: str):
 
 # 기간·이력·상태 질문 — 제목 몇 줄로는 부족하니 기간 조회를 안내한다(2026-09-26).
 TIME_PAT = re.compile(r"이번\s*(달|주|분기)|지난\s*(달|주|번|분기)|저번|요즘|최근|그동안|어제|그저께|오늘\s*한|월간|주간|회고|"
-                      r"\d{1,2}\s*월\s*(에|달|중|한)|\d{1,2}/\d{1,2}|어떻게\s*됐|진행\s*상황|진행\s*상태|히스토리|이력|경위|했었|했던")
+                      r"\d{1,2}\s*월\s*(에|달|중|한)|\d{1,2}/\d{1,2}|어떻게\s*됐|히스토리|이력|경위|했었|했던")
 TIME_HINT = ("[세컨브레인 회수·기간/이력 질문] 답하기 전에 `sb timeline --since YYYY-MM-DD [--until D]`(세션 날짜 기준 목록)와 "
              "`sb search '<주제>' --global --limit 5`로 기록층을 먼저 훑고, git·파일 실측과 교차 확인한다. 답 끝에 근거(#ID·파일·커밋)를 적는다.")
+
+# 상위 N건에 요지(facts/narrative 앞부분)를 붙인다. 0 = 제목만.
+BODIES = int(os.environ.get("SB_RECALL_BODIES", "3") or 0)
+BODY_CHARS = 220
+
+
+def _bodies(ids):
+    if not ids:
+        return {}
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{os.environ.get('SB_CLAUDE_MEM_DB') or sb_config.claude_mem_db()}?mode=ro", uri=True, timeout=1)
+        rows = con.execute(f"SELECT id, facts, narrative, text FROM observations WHERE id IN ({','.join('?'*len(ids))})", ids).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    out = {}
+    for oid, facts, narrative, text in rows:
+        src = narrative or text or ""
+        try:   # facts 는 JSON 배열 문자열인 경우가 많다
+            fl = json.loads(facts) if facts else None
+            if isinstance(fl, list) and fl:
+                src = " / ".join(str(x) for x in fl)
+        except Exception:
+            pass
+        src = re.sub(r"\s+", " ", src).strip()
+        if src:
+            out[oid] = src[:BODY_CHARS] + ("…" if len(src) > BODY_CHARS else "")
+    return out
+
+
+# 검색 백엔드: worker(claude-mem 의미검색, 문턱 없음) | recalld(상주 형태소 색인 + 문턱)
+BACKEND = os.environ.get("SB_RECALL_BACKEND", "recalld")
+
+
+def recalld_search(prompt: str, project: str):
+    """상주 서버 결과. 문턱 미달이면 [] (주입 안 함), 서버가 없으면 None(띄우고 폴백)."""
+    try:
+        import sb_recalld
+        url = sb_recalld.base_url() + "/recall?" + urllib.parse.urlencode(
+            {"q": prompt[:500], "project": project, "limit": str(MAX_ITEMS)})
+        with urllib.request.urlopen(url, timeout=1.5) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        try:
+            import sb_recalld
+            sb_recalld.ensure_running()
+        except Exception:
+            pass
+        return None
+    if d.get("db") and d["db"] != sb_recalld.db_path():   # 다른 DB 를 보는 서버(테스트 등) — 쓰지 않는다
+        return None
+    if not (d.get("gate") or {}).get("pass"):
+        return []
+    return [{"id": it["id"], "date": it.get("date", ""), "kind": "", "title": it.get("title", ""),
+             "project": it.get("project", "")} for it in d.get("items", [])]
+
 
 FRESH_MINUTES = 20   # observations younger than this are "what is happening right now", not recall
 
@@ -183,21 +240,31 @@ def main():
     if prompt.strip() == last:      # identical re-submission → nothing new to add
         return
     t0 = time.time()
-    try:
-        items = search(prompt, project)
-    except Exception:
-        items = []
+    items = None
+    gated = False              # 관련도 문턱을 통과한 주입인가(Stop 게이트는 이때만 되돌린다)
+    if BACKEND == "recalld":   # 상주 한국어 형태소 색인 + 관련도 문턱(eval/retrieval_eval.py 근거)
+        items = recalld_search(prompt, project)
+        gated = bool(items)
+    if items is None:          # 서버가 아직 안 떴으면 이번만 워커로(서버는 백그라운드로 띄워 둔다)
+        try:
+            items = search(prompt, project)
+        except Exception:
+            items = []
     items = enrich(items, sid)
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
     hint = TIME_HINT if TIME_PAT.search(prompt) else ""
     if not fresh and not hint:
         return
     lines = [f"- #{it['id']} {it['date']} {it.get('project','')[:18]} · {it['title'][:70]}" for it in fresh]
+    bodies = _bodies([it["id"] for it in fresh[:BODIES]]) if BODIES > 0 else {}
+    if bodies:   # 상위 N건은 요지 한 줄을 같이 — 제목만으로는 관련 여부 판단·활용이 안 된다
+        lines = [ln + (("\n    ↳ " + bodies[it["id"]]) if it["id"] in bodies else "") for ln, it in zip(lines, fresh)]
     body = "\n".join(lines)
-    while len(body) > MAX_CHARS and len(lines) > 1:
+    while len(body) > MAX_CHARS + BODY_CHARS * BODIES and len(lines) > 1:
         lines.pop(); body = "\n".join(lines)
-    ctx = ("[세컨브레인 회수] 이 프롬프트와 관련 있을 수 있는 과거 기록(제목만). "
-           "실제로 관련 있으면 get_observations([ID])로 본문을 가져오고, 아니면 무시한다.\n" + body) if fresh else ""
+    ctx = ("[세컨브레인 회수] 이 프롬프트와 관련 있을 수 있는 과거 기록"
+           + ("(상위 %d건은 요지 포함)" % len(bodies) if bodies else "(제목만)")
+           + ". 실제로 관련 있으면 get_observations([ID])로 본문을 가져오고, 아니면 무시한다.\n" + body) if fresh else ""
     if hint:
         ctx = (ctx + "\n" + hint).strip()
     try:

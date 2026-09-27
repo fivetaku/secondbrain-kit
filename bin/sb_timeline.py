@@ -63,7 +63,7 @@ def main(argv=None):
     until = a.until or today.isoformat()
     project = None if a.glob else (a.project or os.path.basename(os.path.normpath(os.getcwd())))
 
-    con = sqlite3.connect('file:%s?mode=ro' % Path(sb_config.claude_mem_db()).as_posix(), uri=True, timeout=2)
+    con = sqlite3.connect('file:%s?mode=ro' % Path(os.environ.get('SB_CLAUDE_MEM_DB') or sb_config.claude_mem_db()).as_posix(), uri=True, timeout=2)
     sql = 'SELECT id, project, type, title, created_at, metadata FROM observations'
     args = []
     if project:
