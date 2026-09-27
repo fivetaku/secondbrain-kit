@@ -110,12 +110,16 @@ def check_recall_smoke():
     payload = json.dumps({'prompt': '지난주에 한 작업 어떻게 됐지', 'session_id': 'sb-doctor-%d' % os.getpid(),
                           'cwd': str(HOME)}, ensure_ascii=False).encode('utf-8')
     try:
+        t0 = time.time()
         r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'hooks' / 'sb_recall.py')],
                            input=payload, capture_output=True, timeout=30, env=env)
         ctx = json.loads(r.stdout.decode('utf-8') or '{}').get('hookSpecificOutput', {}).get('additionalContext', '')
     except Exception as e:  # noqa: BLE001
         return rec('❌', '회수 훅 실동작', '실행 실패: %s' % e)
     ok = 'sb timeline' in ctx
+    took = time.time() - t0
+    if took > 10:   # 훅 제한 시간(15초)에 가까우면 결과가 버려질 수 있다 — 프로세스 기동이 느린 PC
+        rec('⚠', '회수 훅 소요 시간', '%.1f초 — 제한 15초에 근접(백신 검사·저전력 모드 확인)' % took)
     rec('✅' if ok else '❌', '회수 훅 실동작', '한국어 프롬프트 → 회수 주입 정상' if ok else '한국어 프롬프트에 주입 없음(인코딩 확인)')
 
 
@@ -123,7 +127,7 @@ def check_claude():
     if not shutil.which('claude'):
         return rec('⚠', 'Claude Code', '미설치 — 건너뜀')
     p = HOME / '.claude' / 'settings.json'
-    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'SubagentStart')
+    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStart')
     missing = [e for e in events if not _has_kit_hook(p, e)]
     rec('✅' if not missing else '❌', 'Claude 훅', '%d종 등록' % len(events) if not missing else '누락: ' + ', '.join(missing))
     check_recall_smoke()

@@ -52,7 +52,7 @@ def run_one(sc, cond, rep, args):
         lines, err = p.stdout.splitlines(), p.stderr[-800:]
     except subprocess.TimeoutExpired as exc:
         lines, err = (exc.stdout or '').splitlines() if isinstance(exc.stdout, str) else [], 'timeout'
-    tools, recall_calls, final, meta, hook_ctx = [], 0, '', {}, []
+    tools, recall_calls, final, meta, hook_ctx, texts = [], 0, '', {}, [], []
     for line in lines:
         try:
             ev = json.loads(line)
@@ -60,6 +60,8 @@ def run_one(sc, cond, rep, args):
             continue
         if ev.get('type') == 'assistant':
             for block in ev.get('message', {}).get('content', []):
+                if block.get('type') == 'text' and block.get('text'):
+                    texts.append(block['text'])   # 헤드리스 result 는 마지막 메시지만 담는다 — 채점은 전체로
                 if block.get('type') == 'tool_use':
                     name = block.get('name', '')
                     inp = json.dumps(block.get('input', {}), ensure_ascii=False)
@@ -72,6 +74,7 @@ def run_one(sc, cond, rep, args):
         elif ev.get('type') == 'system' and 'hook' in json.dumps(ev, ensure_ascii=False)[:200].lower():
             hook_ctx.append(json.dumps(ev, ensure_ascii=False)[:300])
     return {'sid': sc['sid'], 'cond': cond['cid'], 'rep': rep, 'prompt': sc['prompt'], 'final': final,
+            'all_text': '\n\n'.join(texts) or final,
             'tools': tools, 'n_tools': len(tools), 'recall_calls': recall_calls, 'wall_s': round(time.time() - t, 1),
             'meta': meta, 'stderr': err, 'hooks': hook_ctx[:5]}
 
@@ -108,7 +111,7 @@ def judge_pack(args):
     with open(d / 'judge.jsonl', 'w', encoding='utf-8') as f:
         for n, r in enumerate(rows):
             f.write(json.dumps({'rid': n, 'sid': r['sid'], 'prompt': r['prompt'], 'gold': gold[r['sid']]['gold'],
-                                'answer': r['final'][:3000]}, ensure_ascii=False) + '\n')
+                                'answer': (r.get('all_text') or r['final'])[:6000]}, ensure_ascii=False) + '\n')
     print('judge items', len(rows))
 
 

@@ -104,6 +104,21 @@ class RelabelTests(Fixture):
             sb_relabel.undo(str(journal))
         self.assertEqual(self.project(3), 'work')
 
+    def test_auto_env_moves_only_tool_live_observations(self):
+        import time
+        now = int(time.time() * 1000)
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            db.executemany('INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [
+                (20, 'work', 'sb_recall.py 훅 수정', '', '회수 훅 코드 변경', '', '[]', '[]', '', now, 'a', '{}'),
+                (21, 'work', '월 마감 손익 검토', '', '매출·원가 대사', '', '[]', '[]', '', now, 'b', '{}'),
+                (22, 'work', 'claude-mem 백필', '', '과거 세션', '', '[]', '[]', '', now, 'c', '{"kind":"import"}'),
+            ])
+            db.commit()
+        with contextlib.redirect_stdout(open(os.devnull, 'w', encoding='utf-8')):
+            n = sb_relabel.auto_env(['work'], 'kit', since_hours=1)
+        self.assertEqual(n, 1)
+        self.assertEqual((self.project(20), self.project(21), self.project(22)), ('kit', 'work', 'work'))
+
     def test_dry_run_changes_nothing(self):
         with contextlib.redirect_stdout(open(os.devnull, 'w', encoding='utf-8')):
             self.assertIsNone(sb_relabel.apply({3: 'kit'}, dry_run=True))

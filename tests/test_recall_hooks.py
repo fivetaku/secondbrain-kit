@@ -79,6 +79,45 @@ class RecallGateTest(unittest.TestCase):
         out = self.gate(hook_event_name='Stop', stop_hook_active=False)
         self.assertEqual(out['decision'], 'block')
 
+    def transcript(self, *events):
+        p = Path(self.tmp.name) / 'transcript.jsonl'
+        with open(p, 'w', encoding='utf-8') as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        return str(p)
+
+    @staticmethod
+    def user(text):
+        return {'type': 'user', 'message': {'role': 'user', 'content': text}}
+
+    @staticmethod
+    def tool(name, **inp):
+        return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': name, 'input': inp}]}}
+
+    def test_stop_reads_transcript_recall_after_last_prompt(self):
+        self.needs()
+        path = self.transcript(self.user('지난주 N 작업'), self.tool('Bash', command="sb recall '작업'"))
+        self.assertIsNone(self.gate(hook_event_name='Stop', transcript_path=path))
+
+    def test_stop_ignores_recall_before_last_prompt(self):
+        self.needs()
+        path = self.transcript(self.tool('Bash', command="sb recall 'x'"), self.user('새 질문'),
+                               self.tool('Bash', command='ls'))
+        self.assertEqual(self.gate(hook_event_name='Stop', transcript_path=path)['decision'], 'block')
+
+    def test_tool_results_are_not_treated_as_new_prompt(self):
+        self.needs()
+        result = {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}
+        path = self.transcript(self.user('질문'), self.tool('mcp__plugin_claude-mem_mcp-search__get_observations', ids=[1]),
+                               result)
+        self.assertIsNone(self.gate(hook_event_name='Stop', transcript_path=path))
+
+    def test_ask_passes_when_session_recalled_in_transcript(self):
+        path = self.transcript(self.user('a'), self.tool('PowerShell', command='sb search --mode current'),
+                               self.user('b'))
+        self.assertIsNone(self.gate(hook_event_name='PreToolUse', tool_name='AskUserQuestion',
+                                    tool_input={}, transcript_path=path))
+
     def test_korean_payload_is_read_as_utf8(self):
         out = self.gate(hook_event_name='PreToolUse', tool_name='AskUserQuestion',
                         tool_input={'questions': [{'question': '이번달 한 것 정리할까요?'}]})

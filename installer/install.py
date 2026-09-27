@@ -378,12 +378,11 @@ def claude_hooks(args) -> None:
     hooks = _strip_ours(cur.get('hooks', {}))
     _add(hooks, 'SessionStart', 'startup|resume|clear|compact',
          py_cmd('hooks/session_context.py', '--harness', 'claude'), 15)
-    _add(hooks, 'UserPromptSubmit', None, py_cmd('hooks/sb_recall.py'), 8)
+    # 15초: 저사양 윈도우에서 프로세스 기동만 2~9초 걸려 8초면 결과가 버려졌다(2026-09-27)
+    _add(hooks, 'UserPromptSubmit', None, py_cmd('hooks/sb_recall.py'), 15)
     gate = py_cmd('hooks/recall_gate.py')
     _add(hooks, 'PreToolUse', 'AskUserQuestion', gate, 5)
-    _add(hooks, 'PreToolUse', 'Edit|Write|NotebookEdit', gate, 5)
-    _add(hooks, 'PostToolUse', 'Bash|PowerShell', gate, 5)
-    _add(hooks, 'PostToolUse', 'mcp__plugin_claude-mem.*|mcp__.*mcp-search.*', gate, 5)
+    # 회상 여부는 대화기록(transcript)으로 판정 — 도구 호출마다 뜨던 PostToolUse·Edit 훅은 등록하지 않는다
     _add(hooks, 'Stop', None, gate, 5)            # 과거 맥락 질문에 회상 없이 끝내면 1회 되돌림
     _add(hooks, 'SubagentStart', None, gate, 5)   # 서브에이전트에 기록층 사용법 주입
     cur['hooks'] = hooks
@@ -434,7 +433,7 @@ def codex_setup(args, tools) -> None:
         _codex_add(hooks, event, matcher, 'hooks/codex_hook.py', [arg], timeout)
     _codex_add(hooks, 'SessionStart', 'startup|resume|clear|compact|fork', 'hooks/session_context.py',
                ['--harness', 'codex'], 15)
-    _codex_add(hooks, 'UserPromptSubmit', None, 'hooks/sb_recall.py', ['codex'], 8)
+    _codex_add(hooks, 'UserPromptSubmit', None, 'hooks/sb_recall.py', ['codex'], 15)
     cur['hooks'] = hooks
     write_json(path, cur)
     # 7-3 신뢰 등록(해시) + 플러그인 훅 끄기 — Codex 는 신뢰되지 않은 훅을 실행하지 않는다

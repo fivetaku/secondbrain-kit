@@ -39,11 +39,14 @@ DB = ''
 SYNC_EVERY = 20.0          # 색인 동기화 최소 간격(초)
 FRESH_MINUTES = 20         # 이보다 새 실시간 관찰은 회상 대상에서 뺀다(훅의 enrich 와 같은 기준)
 GATE_MATCHED, GATE_MATCHED_LOW, GATE_COVERAGE = 3, 2, 0.6
+RARE_DF = 0.10             # 이 비율 미만의 기록에만 나오는 단어를 '드문 단어'로 본다
 
 
-def gate_pass(matched: int, coverage: float) -> bool:
-    """주입할 만큼 관련 있는가 — 질의 명사가 1위 문서에 3개 이상, 또는 2개 이상이면서 커버리지 60% 이상."""
-    return matched >= GATE_MATCHED or (matched >= GATE_MATCHED_LOW and coverage >= GATE_COVERAGE)
+def gate_pass(matched: int, coverage: float, rare: int = 1) -> bool:
+    """주입할 만큼 관련 있는가 — 질의 명사가 1위 문서에 3개 이상, 또는 2개 이상이면서 커버리지 60% 이상.
+    그리고 겹친 단어 중 드문 단어(전체 기록의 10% 미만에 나옴)가 1개 이상 — '진행·상태·이슈·개선'처럼
+    흔한 단어만 겹친 진행 질문("남은 이슈 개선해줘")을 거른다(DOE: 관련 유지 98% 그대로, 진행 질문 주입 5→3/10)."""
+    return rare >= 1 and (matched >= GATE_MATCHED or (matched >= GATE_MATCHED_LOW and coverage >= GATE_COVERAGE))
 
 
 def base_url(port=None):
@@ -95,6 +98,7 @@ class Engine:
         self.ko._tokenizer()
         self.lock = threading.Lock()
         self.last_sync = 0.0
+        self.df, self.n_docs = {}, 1
         self.sync(force=True)
 
     def sync(self, force=False):
@@ -103,10 +107,23 @@ class Engine:
             with self.lock:
                 if force or now - self.last_sync >= SYNC_EVERY:
                     try:
-                        self.ko.ensure_current()
+                        r = self.ko.ensure_current()
+                        if force or not self.df or (isinstance(r, dict) and (r.get('indexed') or r.get('removed'))):
+                            self._load_df()
                     except Exception:  # noqa: BLE001
                         pass
                     self.last_sync = time.time()
+
+    def _load_df(self):
+        """단어별 문서 빈도 — 드문 단어 판정용(기록 수백~수천 건이라 적재 시 한 번 계산)."""
+        from collections import Counter
+        df = Counter()
+        n = 0
+        with closing(self.ko.open_index(create=False)) as conn:
+            for (body,) in conn.execute('SELECT body FROM ko_fts'):
+                n += 1
+                df.update(set((body or '').lower().split()))
+        self.df, self.n_docs = df, max(1, n)
 
     def nouns(self, text):
         ident = [w.lower() for w in re.findall(r'[A-Za-z0-9_]+(?:[._/-][A-Za-z0-9_]+)*', text)]
@@ -142,12 +159,15 @@ class Engine:
         cutoff = (time.time() - FRESH_MINUTES * 60) * 1000
         rows = [r for r in rows if not (meta.get(r[0], {}).get('live') and meta[r[0]].get('epoch', 0) > cutoff)]
         rows = rows[:limit]
-        matched, cov = 0, 0.0
+        matched, cov, rare = 0, 0.0, 0
         if rows:
             body = set((rows[0][3] or '').lower().split())
-            matched = sum(1 for t in toks if t in body)
+            hit = [t for t in toks if t in body]
+            matched = len(hit)
+            rare = (sum(1 for t in hit if self.df.get(t, 0) / self.n_docs < RARE_DF)
+                    if self.n_docs >= 50 else matched)   # 기록이 적으면 빈도 비율이 무의미
             cov = matched / len(toks)
-        gate = gate_pass(matched, cov)
+        gate = gate_pass(matched, cov, rare)
         items = []
         for oid, score, proj, _body in rows:
             m = meta.get(oid, {})
@@ -176,7 +196,7 @@ class Engine:
 def serve(port, idle_hours):
     global DB
     DB = db_path()
-    engine = Engine()
+    engine = None              # 포트를 먼저 잡고 나서 적재한다 — 이미 떠 있으면 Kiwi 적재 없이 바로 끝낸다
     state = {'last': time.time()}
 
     class Handler(BaseHTTPRequestHandler):
@@ -195,6 +215,10 @@ def serve(port, idle_hours):
             state['last'] = time.time()
             url = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(url.query)
+            if url.path == '/shutdown':   # 로컬 전용(127.0.0.1 바인드) — sb_recalld.py stop
+                self._send(200, {'ok': True, 'pid': os.getpid()})
+                threading.Thread(target=httpd.shutdown, daemon=True).start()
+                return
             if url.path == '/health':
                 return self._send(200, {'ok': True, 'pid': os.getpid(), 'db': DB})
             if url.path == '/recall':
@@ -211,16 +235,30 @@ def serve(port, idle_hours):
         httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     except OSError:
         return 0   # 이미 떠 있음(포트 사용 중)
+    engine = Engine()          # 요청은 적재가 끝난 뒤부터 처리된다(serve_forever 전)
     run = Path(sb_config.sb_path('run'))
     run.mkdir(parents=True, exist_ok=True)
     (run / 'recalld.json').write_text(json.dumps({'pid': os.getpid(), 'port': port, 'started': time.time()}), encoding='utf-8')
 
     def reaper():
+        last_relabel = 0.0
         while True:
             time.sleep(60)
             if time.time() - state['last'] > idle_hours * 3600:
                 httpd.shutdown()
                 return
+            if time.time() - last_relabel >= 3600:   # 한 시간마다: 업무 폴더에 섞인 도구 작업 기록 자동 분리(설정 있을 때만)
+                last_relabel = time.time()
+                try:
+                    import contextlib
+                    import io
+                    import sb_relabel
+                    cfg = sb_relabel.auto_config()
+                    if cfg and cfg.get('work_projects'):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            sb_relabel.auto_env(cfg['work_projects'], cfg.get('to') or 'secondbrain-kit', since_hours=24)
+                except Exception:  # noqa: BLE001
+                    pass
     threading.Thread(target=reaper, daemon=True).start()
     httpd.serve_forever()
     return 0
@@ -248,7 +286,7 @@ def query(text, project, limit, as_json, port=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=('serve', 'ensure', 'status', 'query'))
+    ap.add_argument('cmd', choices=('serve', 'ensure', 'status', 'query', 'stop'))
     ap.add_argument('text', nargs='?', default='')
     ap.add_argument('--project', help='기본: 현재 폴더 이름(claude-mem project)')
     ap.add_argument('--global', dest='glob', action='store_true')
@@ -260,6 +298,13 @@ def main():
     if a.cmd == 'query':
         project = '' if a.glob else (a.project or os.path.basename(os.path.normpath(os.getcwd())))
         return query(a.text, project, a.limit, a.json, a.port)
+    if a.cmd == 'stop':
+        try:
+            urllib.request.urlopen(base_url(a.port) + '/shutdown', timeout=3).read()
+            print('stopped')
+        except Exception:  # noqa: BLE001
+            print('not running')
+        return 0
     if a.cmd == 'serve':
         return serve(a.port, a.idle_hours)
     if a.cmd == 'ensure':

@@ -38,7 +38,7 @@
   - [ ] claude-mem 설정 (mode=code--ko)
   - [ ] 벡터 임베딩 = `openai` (기존 사용자면 `ollama`도 정상)
   - [ ] Ollama bge-m3, `~/.chroma_env`
-  - [ ] Claude 훅 6종(SessionStart·UserPromptSubmit·PreToolUse·PostToolUse·Stop·SubagentStart), Claude claude-mem 플러그인 (Claude 쓰는 경우)
+  - [ ] Claude 훅 5종(SessionStart·UserPromptSubmit·PreToolUse(AskUserQuestion)·Stop·SubagentStart — 도구 호출마다 뜨는 훅은 두지 않는다), Claude claude-mem 플러그인 (Claude 쓰는 경우)
   - [ ] **회수 훅 실동작** — 한국어 프롬프트를 실제로 넣어 주입이 나오는지(등록 여부만으론 부족: 윈도우 cp949에서 조용히 전부 빗나간 사례)
   - [ ] 윈도우: `sb 명령(Git Bash)` — Claude Code 의 Bash 도구는 `sb.cmd` 를 `sb` 로 못 부른다
   - [ ] Codex 훅, **Codex 훅 신뢰 N개**, Codex claude-mem 플러그인 훅 = 꺼짐 (Codex 쓰는 경우)
