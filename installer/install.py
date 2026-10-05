@@ -580,6 +580,15 @@ def _schtasks(name, argv, when) -> None:
     else:
         sched = ['/SC', 'DAILY', '/ST', '%02d:%02d' % (when['hour'], when['minute'])]
     run(['schtasks', '/Create', '/F', '/TN', task, '/TR', cmd] + sched)
+    # schtasks 기본값은 "예약 시각을 놓치면 건너뜀 + 배터리면 시작 안 함"이다. 노트북이 새벽 5시에 꺼져 있거나
+    # 잠들어 있으면 야간 배치가 며칠씩 안 돌고 아무도 모른다(실사용에서 3일 연속). 깨어나면 바로 따라잡게 한다.
+    ps = ("$t = Get-ScheduledTask -TaskPath '\\secondbrain-kit\\' -TaskName '%s'; "
+          "$t.Settings.StartWhenAvailable = $true; $t.Settings.DisallowStartIfOnBatteries = $false; "
+          "$t.Settings.StopIfGoingOnBatteries = $false; Set-ScheduledTask -InputObject $t | Out-Null") % name
+    try:
+        run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], check=False, capture=True)
+    except (OSError, subprocess.SubprocessError):
+        say('  (작업 스케줄러 "놓친 작업 따라잡기" 설정 실패 — 작업 속성에서 직접 켜 주세요: %s)' % task)
 
 
 def _cron_hint(name, argv, when) -> None:

@@ -2,7 +2,7 @@
 """Cross-platform memory-only nightly batch (replaces nightly_brain.sh for the kit).
 
 Stages, in order, each under an sb_run deadline:
-  pii         sb_pii_sweep.py --chroma (opt-in: SB_NIGHTLY_PII=1)  900s
+  pii         sb_pii_sweep.py --chroma (pii_mask.py 있을 때, 끄기 SB_NIGHTLY_PII=0)  900s
   preflight   sb_health.py ensure — claude-mem 워커·Ollama 기동      180s
   ko-index    sb_fts_ko.py build                                   900s  core
   automemory  sync_automemory.py --json                            600s  core
@@ -54,10 +54,11 @@ def build_stages(with_consolidate: bool = False) -> List[Stage]:
     ]
     # 동기화(automemory)가 워커에 저장하므로, 워커·Ollama 가 꺼져 있으면 먼저 띄운다.
     stages.insert(0, Stage('preflight', [py, str(BIN / 'sb_health.py'), 'ensure'], 180))
-    if (os.environ.get('SB_NIGHTLY_PII') == '1' and os.environ.get('SB_PII_MASK') != '0'
+    if (os.environ.get('SB_NIGHTLY_PII') != '0' and os.environ.get('SB_PII_MASK') != '0'
             and Path(os.environ.get('SB_PII_MASK') or sb_config.sb_path('local', 'pii_mask.py')).is_file()):
-        # 명시적으로 켠 PC만: 관찰기가 옮겨 적은 실명을 SQLite·벡터에서 가린다. 이 단계는 워커를 강제 종료하므로
-        # 반드시 preflight(워커 재기동) 앞에 둔다 — 2026-09-28~10-02 automemory 연속 실패의 원인.
+        # 마스킹 모듈이 있는 PC만(끄기: SB_NIGHTLY_PII=0 또는 SB_PII_MASK=0): 관찰기가 옮겨 적은 실명을 SQLite·벡터에서
+        # 가린다. 이 단계는 Chroma 를 쥔 워커를 강제 종료하므로 반드시 preflight(워커 재기동) 앞에 둔다 —
+        # 뒤에 두면 automemory 저장이 연결 거부로 실패한다(실사용에서 5일 연속 실패한 원인).
         stages.insert(0, Stage('pii', [py, str(BIN / 'sb_pii_sweep.py'), '--chroma', '--json'], 900))
     if with_consolidate:
         stages.append(Stage('consolidate', [py, str(BIN / 'consolidate.py'), 'run',

@@ -73,7 +73,12 @@ def health_line() -> str:
         return ''
     import sb_health
     import sb_config
-    result = sb_health.run_checks()   # 훅은 읽기만 한다(health.json 은 --fix·CLI·야간 배치가 쓴다)
+    # 훅은 읽기만 한다(health.json 은 --fix·CLI·야간 배치가 쓴다). 워커는 claude-mem 자체 훅이 지금 띄우는 중이라 빼고 본다.
+    # 회수 자가 시험도 세션 시작엔 서버가 막 뜨는 중이라 빼고, 직전 점검(야간 배치·CLI)의 결과가 실패면 그걸 알린다.
+    result = sb_health.run_checks(worker=False, recall=False)
+    last = sb_health.load_last().get('recall') or {}
+    if last.get('ok') is False and last.get('msg'):
+        result['recall'] = {'ok': False, 'msg': last['msg'] + ' (직전 점검)', 'fix': last.get('fix')}
     line = sb_health.warning_line(result)
     fixable = any(isinstance(v, dict) and v.get('fix') for v in result.values())
     installed = Path(sb_config.sb_path('logs', 'nightly.log')).exists()   # 임시·테스트 SB_HOME 에서는 복구를 띄우지 않는다

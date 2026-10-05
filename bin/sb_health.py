@@ -104,7 +104,7 @@ def ensure_worker(wait: float = 30.0) -> bool:
         subprocess.run(cmd, timeout=90, **{k: v for k, v in _detached().items() if k != 'close_fds'})
     except Exception:  # noqa: BLE001
         pass
-    if _wait_worker(min(wait, 10.0)):
+    if _wait_worker(min(wait, 25.0)):   # 느린 PC 는 정상 기동에도 10초 넘게 걸린다 — 대체 경로로 이중 기동하지 않게 충분히 기다린다
         return True
     # Windows 에서 claude-mem 은 PowerShell Start-Process 로 데몬을 띄우는데, 프로세스 기동이 느린 PC 에서는
     # 그 호출이 시간 제한(ETIMEDOUT)에 걸리고 2분간 재시도를 막는다(2026-10-05 확인). 같은 데몬 명령을 직접 띄운다.
@@ -255,7 +255,8 @@ def check_vector(max_obs_ids) -> Dict[str, Any]:
     missing = [i for i in max_obs_ids if i not in have]
     ok = len(missing) <= VECTOR_WARN
     return {'ok': ok, 'missing': len(missing), 'max_vector_id': max(have) if have else 0,
-            'msg': '' if ok else '벡터 미반영 {}건'.format(len(missing)), 'fix': None if ok else 'ollama'}
+            'msg': '' if ok else '벡터 미반영 {}건'.format(len(missing)),
+            'fix': None if ok else ('ollama' if uses_ollama() else 'worker')}
 
 
 def check_ko(max_obs: int) -> Dict[str, Any]:
@@ -302,19 +303,99 @@ def check_decisions(db) -> Dict[str, Any]:
             'msg': '' if ok else '상태층 미반영 [결정] {}건 (마지막 채택 {})'.format(n, last[:10])}
 
 
-def run_checks(services: bool = True) -> Dict[str, Any]:
+def check_recall(db) -> Dict[str, Any]:
+    """찾아다 쓰기 자가 시험: 회수 대상이 될 최근 기록 하나를 골라 그 제목으로 실제 회수(sb_recalld)를 돌리고,
+    그 기록이 결과에 나오는지 본다. 색인 누락·회수 서버 고장·필터 과잉 중 무엇이 생겨도 여기서 실패한다."""
+    try:
+        import sb_recalld
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'msg': '회수 모듈 적재 실패: {}'.format(e)[:120]}
+    if not sb_recalld.is_up():
+        return {'ok': False, 'msg': '회수 서버 꺼짐(프롬프트별 회수 주입 중단)', 'fix': 'recalld'}
+    dead = set()
+    try:
+        dead = sb_recalld.superseded_ids()
+    except Exception:  # noqa: BLE001
+        pass
+    cutoff = int((time.time() - (sb_recalld.FRESH_MINUTES + 5) * 60) * 1000)
+    rows = db.execute('SELECT id, project, title FROM observations WHERE created_at_epoch < ? AND length(title) >= 12 '
+                      'ORDER BY id DESC LIMIT 40', (cutoff,)).fetchall()
+    sample = next((r for r in rows if r[0] not in dead), None)
+    if not sample:
+        return {'ok': True, 'msg': '', 'skipped': 'no sample'}
+    oid, proj, title = sample
+    import urllib.parse
+    url = sb_recalld.base_url() + '/recall?' + urllib.parse.urlencode({'q': title, 'project': proj or '', 'limit': '8'})
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            got = [it.get('id') for it in json.loads(r.read().decode('utf-8')).get('items', [])]
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'msg': '회수 질의 실패: {}'.format(e)[:120], 'fix': 'recalld'}
+    ok = oid in got
+    return {'ok': ok, 'sample_id': oid, 'returned': got[:8],
+            'msg': '' if ok else '회수 자가 시험 실패 — 최근 기록 #{}이 제목으로도 안 나옴(색인·필터 점검)'.format(oid),
+            'fix': None if ok else 'ko'}
+
+
+def recall_usage(days: int = 7) -> Dict[str, Any]:
+    """활용 통계(정보용, 실패 판정 없음): 최근 N일 회수 주입·빈 결과·기간 질문 안내·확인 게이트 판정 수."""
+    since = time.time() - days * 86400
+    out = {'ok': True, 'days': days, 'injections': 0, 'empty': 0, 'history_hints': 0, 'gate_block': 0, 'gate_pass': 0}
+
+    def rows(name):
+        try:
+            with open(sb_config.sb_path('logs', name), encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        ev = json.loads(line)
+                        if time.mktime(time.strptime(ev.get('ts', '')[:19], '%Y-%m-%dT%H:%M:%S')) >= since:
+                            yield ev
+                    except (ValueError, OverflowError):
+                        continue
+        except OSError:
+            return
+
+    for ev in rows('recall.jsonl'):
+        out['injections'] += 1
+        out['empty'] += 0 if ev.get('ids') else 1
+        out['history_hints'] += 1 if ev.get('hint') else 0
+    for ev in rows('recall-gate.jsonl'):
+        if ev.get('decision') == 'block':
+            out['gate_block'] += 1
+        elif ev.get('decision') == 'pass':
+            out['gate_pass'] += 1
+    return out
+
+
+def uses_ollama() -> bool:
+    """설치기가 Ollama 임베딩(bge-m3)을 켠 PC 인가 — ~/.chroma_env 의 CHROMA_OPENAI_API_KEY=ollama 표시.
+    기본 임베딩을 쓰는 PC 에서 'Ollama 꺼짐' 경고가 늘 뜨지 않게 한다. SB_HEALTH_OLLAMA=1|0 으로 강제."""
+    forced = os.environ.get('SB_HEALTH_OLLAMA')
+    if forced in ('0', '1'):
+        return forced == '1'
+    try:
+        return 'CHROMA_OPENAI_API_KEY=ollama' in (Path.home() / '.chroma_env').read_text(encoding='utf-8')
+    except OSError:
+        return False
+
+
+def run_checks(services: bool = True, worker: bool = True, recall: bool = True) -> Dict[str, Any]:
+    """worker=False: 세션 시작 훅용 — 그 시점엔 claude-mem 이 워커를 막 띄우는 중이라 '꺼짐'이 오탐이 되고,
+    같은 순간 복구가 워커를 또 띄우면 충돌한다. 워커는 claude-mem 자체 훅에 맡긴다."""
     prev = load_last()
     out: Dict[str, Any] = {'checked_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
     if services:
-        w = worker_up()
-        out['worker'] = {'ok': w, 'msg': '' if w else 'claude-mem 워커 꺼짐', 'fix': None if w else 'worker'}
+        if worker:
+            w = worker_up()
+            out['worker'] = {'ok': w, 'msg': '' if w else 'claude-mem 워커 꺼짐', 'fix': None if w else 'worker'}
         px = observer_proxy()
         if px:
             up = proxy_up(px)
             out['observer-proxy'] = {'ok': up, 'url': px, 'msg': '' if up else '관찰기 프록시(teamclaude) 꺼짐 — 새 기록 생성 중단',
                                      'fix': None if up else 'proxy'}
-        o = ollama_up()
-        out['ollama'] = {'ok': o, 'msg': '' if o else 'Ollama 꺼짐(벡터 저장 중단)', 'fix': None if o else 'ollama'}
+        if uses_ollama():
+            o = ollama_up()
+            out['ollama'] = {'ok': o, 'msg': '' if o else 'Ollama 꺼짐(벡터 저장 중단)', 'fix': None if o else 'ollama'}
     out['nightly'] = check_nightly()
     out['automemory'] = check_automemory()
     try:
@@ -323,9 +404,12 @@ def run_checks(services: bool = True) -> Dict[str, Any]:
             out['vector'] = check_vector(ids)
             out['ko-index'] = check_ko(_max_obs(db))
             out['decisions'] = check_decisions(db)
+            if recall:
+                out['recall'] = check_recall(db)
     except sqlite3.Error as e:
         out['db'] = {'ok': False, 'msg': 'claude-mem DB 읽기 실패: {}'.format(e)[:120]}
     out['spool'] = check_spool(prev)
+    out['usage'] = recall_usage()
     problems = [k for k, v in out.items() if isinstance(v, dict) and v.get('ok') is False]
     out['ok'] = not problems
     out['problems'] = problems
@@ -358,6 +442,13 @@ def fix(result: Dict[str, Any]) -> List[str]:
             done.append('automemory:saved={} failed={}'.format(r['saved'], r['failed']))
         except Exception as e:  # noqa: BLE001
             done.append('automemory:error {}'.format(e)[:80])
+    if 'recalld' in wants:
+        try:
+            import sb_recalld
+            sb_recalld.ensure_running()
+            done.append('recalld:started')
+        except Exception:  # noqa: BLE001
+            done.append('recalld:fail')
     if 'ko' in wants:
         try:
             r = subprocess.run([sys.executable, str(BIN / 'sb_fts_ko.py'), 'build'], cwd=str(BIN), timeout=900,
@@ -400,7 +491,8 @@ def warning_line(result: Dict[str, Any]) -> str:
 
 def spawn_fix() -> None:
     try:
-        subprocess.Popen([sys.executable, str(BIN / 'sb_health.py'), '--fix', '--quiet'], cwd=str(BIN), **_detached())
+        subprocess.Popen([sys.executable, str(BIN / 'sb_health.py'), '--fix', '--quiet', '--startup'],
+                         cwd=str(BIN), **_detached())
     except Exception:  # noqa: BLE001
         pass
 
@@ -412,13 +504,17 @@ def main(argv=None) -> int:
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--fix', action='store_true')
     ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--startup', action='store_true',
+                    help='세션 시작 훅이 띄운 복구 — claude-mem 이 워커를 다 띄울 시간을 먼저 준다(동시 기동 충돌 방지)')
     a = ap.parse_args(argv)
     if a.action == 'ensure':
         px = observer_proxy()
         p = ensure_proxy(px) if px else None
-        w, o = ensure_worker(), ensure_ollama()
+        w, o = ensure_worker(), (ensure_ollama() if uses_ollama() else None)
         print(json.dumps({'worker': w, 'ollama': o, 'observer_proxy': p}))
         return 0
+    if a.startup:
+        time.sleep(float(os.environ.get('SB_HEALTH_STARTUP_WAIT', '20')))
     result = run_checks()
     if a.fix and not result['ok']:
         result['fixed'] = fix(result)
@@ -433,7 +529,11 @@ def main(argv=None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:
         line = warning_line(result)
-        print(line or '✓ 기록층 정상 (워커·Ollama·야간 배치·메모리 동기화·벡터·색인)')
+        print(line or '✓ 기록층 정상 (워커·임베딩·야간 배치·메모리 동기화·벡터·색인·회수 자가 시험)')
+        u = result.get('usage') or {}
+        if u.get('injections') or u.get('gate_block') or u.get('gate_pass'):
+            print('  회수 활용(최근 {}일): 주입 {}회 · 빈 결과 {}회 · 기간 질문 안내 {}회 · 확인 게이트 차단 {}회/통과 {}회'.format(
+                u['days'], u['injections'], u['empty'], u['history_hints'], u['gate_block'], u['gate_pass']))
         if result.get('fixed'):
             print('  조치: ' + ', '.join(result['fixed']))
     return 0 if result['ok'] else 1
