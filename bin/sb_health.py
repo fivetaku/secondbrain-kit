@@ -446,7 +446,10 @@ def fix(result: Dict[str, Any]) -> List[str]:
         try:
             import sb_recalld
             sb_recalld.ensure_running()
-            done.append('recalld:started')
+            deadline = time.time() + 30   # 색인 적재까지 기다려야 재점검이 '꺼짐'으로 다시 나오지 않는다
+            while time.time() < deadline and not sb_recalld.is_up():
+                time.sleep(1)
+            done.append('recalld:' + ('ok' if sb_recalld.is_up() else 'starting'))
         except Exception:  # noqa: BLE001
             done.append('recalld:fail')
     if 'ko' in wants:
