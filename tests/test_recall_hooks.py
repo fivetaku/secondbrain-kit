@@ -128,10 +128,11 @@ class RecallPromptTest(unittest.TestCase):
     def test_time_pattern(self):
         sys.path.insert(0, str(KIT / 'hooks'))
         import sb_recall
-        for q in ('이번달에 한것들 정리해줘봐', '지난주에 뭐 했었지', '그거 어떻게 됐지?', '9/10 브리핑 다시'):
-            self.assertTrue(sb_recall.TIME_PAT.search(q), q)
-        for q in ('시트 서식 바꿔줘', '이 함수 리팩터링해줘'):
-            self.assertFalse(sb_recall.TIME_PAT.search(q), q)
+        for q in ('이번달에 한것들 정리해줘봐', '지난주에 뭐 했었지', '그거 어떻게 됐지?', '9/10 브리핑 어떻게 했었지?'):
+            self.assertTrue(sb_recall.is_history_question(q), q)
+        # 2026-10-05: 날짜만 있는 요청('9/10 브리핑 다시')은 기간·이력 질문이 아니다(오탐 9/10건의 주원인)
+        for q in ('시트 서식 바꿔줘', '이 함수 리팩터링해줘', '9/10 브리핑 다시'):
+            self.assertFalse(sb_recall.is_history_question(q), q)
 
 
 class TimelineTest(unittest.TestCase):

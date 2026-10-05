@@ -10,6 +10,7 @@
   sb loops add|list|close|snooze|drop|reopen|set-action ...   미결
   sb scope [경로]                                             이 폴더의 scope 확인
   sb prompt-id '<발화 일부>'                                  상태층 검증용 user_prompts.id 찾기
+  sb health [--fix] [--json]                                  기록층 건강 점검(워커·Ollama·야간 배치·동기화·벡터)
   sb index                                                    한국어 색인 증분 갱신
   sb nightly [--with-consolidate]                             야간 배치 수동 실행
   sb consolidate ...                                          주간 통합 수동 실행
@@ -26,7 +27,22 @@ ROUTES = {
     'search': 'sb_search.py', 'state': 'sb_state.py', 'loops': 'loops.py',
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
     'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py', 'pii-sweep': 'sb_pii_sweep.py',
+    'health': 'sb_health.py',
 }
+
+
+def _default_project(cwd):
+    """claude-mem 규칙(cwd 폴더 이름). 단 ~/.claude/projects/<slug>/memory 에서 실행하면 'memory' 가 되던 문제를
+    슬러그→프로젝트 매핑(automemory_project_map.json)으로 바로잡는다."""
+    path = os.path.normpath(cwd)
+    if os.path.basename(path) == 'memory' and os.path.basename(os.path.dirname(os.path.dirname(path))) == 'projects':
+        try:
+            import sync_automemory
+            name = sync_automemory.project_from_slug(os.path.basename(os.path.dirname(path)))
+            return sync_automemory.project_map().get(name, name)
+        except Exception:  # noqa: BLE001
+            pass
+    return os.path.basename(path)
 
 
 def _save(argv):
@@ -40,12 +56,17 @@ def _save(argv):
     ap.add_argument('--project', help='claude-mem project (기본: 현재 폴더 이름)')
     ap.add_argument('--kind', default='manual')
     a = ap.parse_args(argv)
-    project = a.project or os.path.basename(os.path.normpath(os.getcwd()))
+    project = a.project or _default_project(os.getcwd())
     prov = sb_memory.build_provenance(source='sb-cli', kind=a.kind, origin='sb save',
                                       created_by='agent', content_hash=sb_memory.content_hash(a.text, a.title))
     obs_id = sb_memory.save_memory(a.text, a.title, project, prov)
-    print(json.dumps({'status': 'ok' if obs_id and obs_id > 0 else 'duplicate', 'id': obs_id,
-                      'project': project, 'scope': resolve_scope_id(os.getcwd())[0]}, ensure_ascii=False))
+    out = {'status': 'ok' if obs_id and obs_id > 0 else 'duplicate', 'id': obs_id,
+           'project': project, 'scope': resolve_scope_id(os.getcwd())[0]}
+    if '·결정]' in a.title or '결정]' in a.title[:16]:
+        # 결정 기록은 상태층에도 올려야 다음 세션 브리핑·--mode current 에 뜬다(실사용에서 sb save 만 하고 상태층을 빠뜨리는 일이 반복됨)
+        out['next'] = ('상태층 등록: sb prompt-id "<발화 일부>" → sb state propose --file <json> → '
+                       'sb state verify --method user_utterance_check --target prompt:<id> [--cross-scope] → sb state accept')
+    print(json.dumps(out, ensure_ascii=False))
 
 
 def main() -> int:

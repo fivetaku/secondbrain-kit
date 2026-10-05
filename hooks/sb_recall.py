@@ -102,8 +102,27 @@ def search(q: str, project: str):
 
 
 # 기간·이력·상태 질문 — 제목 몇 줄로는 부족하니 기간 조회를 안내한다(2026-09-26).
-TIME_PAT = re.compile(r"이번\s*(달|주|분기)|지난\s*(달|주|번|분기)|저번|요즘|최근|그동안|어제|그저께|오늘\s*한|월간|주간|회고|"
-                      r"\d{1,2}\s*월\s*(에|달|중|한)|\d{1,2}/\d{1,2}|어떻게\s*됐|히스토리|이력|경위|했었|했던")
+# 정밀화(실사용 10일 로그): 판정 10회 중 약 9회가 오탐(붙여넣은 일정 속 날짜, '9~12월' 같은 시트·탭 이름,
+# '최근 추세'·'요청했던 안으로' 같은 서술)이고, '왜 그렇게 가정했었지?' 같은 진짜 과거 질문은 놓쳤다.
+#  - 붙여넣은 블록·URL·코드는 판정에서 뺀다
+#  - 강한 신호(그 자체로 과거를 묻는 말)는 바로 인정, 약한 신호(날짜·최근·했던)는 의문형일 때만 인정
+TIME_STRONG = re.compile(r"이번\s*(달|주|분기)\s*(에|동안)?\s*(한|했|진행)|지난\s*(달|주|번|분기)|저번|그동안|회고|"
+                         r"어떻게\s*(됐|되었|진행)|히스토리|이력|경위|어디까지\s*(했|됐|진행)|했었|였었|"
+                         r"(이었|였|했|했었|하기로\s*했)(지|더라|던가)\s*[?？!]|하기로\s*(했|한)\s*(거|것)")
+TIME_WEAK = re.compile(r"요즘|최근|어제|그저께|오늘\s*한|월간|주간|\d{1,2}\s*월\s*(에|중)\s*(한|했)|\d{1,2}/\d{1,2}|했던|됐던")
+QUESTION = re.compile(r"[?？]|(지|나|까|니|냐|더라|던가|됐어|했어)\s*[.!~]*\s*$")
+PAST = re.compile(r"했|됐|되었|였|었|보냈|왔|받았|정했")
+# 닫는 태그가 없는(잘린) 붙여넣기 블록은 끝까지 뺀다
+_PASTED = re.compile(r"<pasted_content[^>]*>.*?(</pasted_content>|\Z)|```.*?(```|\Z)|https?://\S+", re.S)
+TIME_PAT = TIME_STRONG   # 하위 호환(외부 참조용)
+
+
+def is_history_question(prompt: str) -> bool:
+    text = _PASTED.sub(" ", prompt)
+    if TIME_STRONG.search(text):
+        return True
+    # 약한 신호는 '의문형 + 과거형'이 함께 있을 때만 — "9/22 이후 수정된 것만 걸어줄 수 있어?" 같은 요청은 제외
+    return bool(TIME_WEAK.search(text) and QUESTION.search(text) and PAST.search(text))
 TIME_HINT = ("[세컨브레인 회수·기간/이력 질문] 답하기 전에 `sb timeline --since YYYY-MM-DD [--until D]`(세션 날짜 기준 목록)와 "
              "`sb search '<주제>' --global --limit 5`로 기록층을 먼저 훑고, git·파일 실측과 교차 확인한다. 답 끝에 근거(#ID·파일·커밋)를 적는다.")
 
@@ -197,9 +216,69 @@ def enrich(items, content_session_id: str):
         sd = re.search(r'"session_date":"(\d{4}-\d{2}-\d{2})"', md)
         if sd:
             d = sd.group(1)
-        it["date"] = d[5:] if d else ""; it["project"] = proj or ""
+        it["date"] = d[5:] if d else ""; it["project"] = proj or ""; it["_d"] = d or ""
         out.append(it)
     return out
+
+
+# ── 주입 잡음 줄이기(2026-10-05 감사: 주입의 약 78%가 안 쓰임) ──────────────────────────
+# 정기 자동 실행(예: 아침 브리핑) 관측은 그 주제를 물을 때만 내보낸다. PC 마다 이름이 달라 환경변수로 바꾼다.
+BRIEF_TITLE = re.compile(os.environ.get("SB_RECALL_AUTO_TITLE") or r"daily\s*brief|데일리\s*브리핑|daily\s*브리핑", re.I)
+BRIEF_PROMPT = re.compile(os.environ.get("SB_RECALL_AUTO_PROMPT") or r"브리핑|brief|데일리|daily", re.I)
+CROSS_MIN_SHARED = 2
+
+
+def superseded_ids():
+    """자동 메모리 동기화가 새 판으로 대체한 옛 관측 + 삭제된 메모리 파일의 관측 — 회수에서 뺀다."""
+    try:
+        st = json.load(open(sb_config.sb_path("index", "automemory_state.json"), encoding="utf-8"))
+    except Exception:
+        return set()
+    out = set()
+    for entry in st.values():
+        if isinstance(entry, dict):
+            out.update(i for i in entry.get("supersedes", []) if isinstance(i, int))
+            if entry.get("deleted_at") and isinstance(entry.get("obs_id"), int):
+                out.add(entry["obs_id"])
+    return out
+
+
+def _tokens(s: str):
+    return {t.lower() for t in re.findall(r"[A-Za-z0-9]{2,}|[가-힣]{2,}", s or "")}
+
+
+def refine(items, prompt: str, project: str):
+    drop = superseded_ids()
+    want_brief = bool(BRIEF_PROMPT.search(prompt))
+    ptoks = _tokens(prompt)
+    out = []
+    for it in items:
+        if it["id"] in drop:
+            continue
+        if not want_brief and BRIEF_TITLE.search(it.get("title", "")):
+            continue
+        proj = it.get("project") or ""
+        if project and proj and proj != project and len(ptoks & _tokens(it.get("title", ""))) < CROSS_MIN_SHARED:
+            continue
+        out.append(it)
+    # 같은 주제면 최신판이 먼저 — 상위 N건만 요지가 붙으므로 낡은 판이 요지를 차지하지 않게(2026-10-05)
+    out.sort(key=lambda it: (bool(project) and it.get("project") == project, it.get("_d", "")), reverse=True)
+    return out
+
+
+def recall_log(event: dict) -> None:
+    try:
+        path = Path(sb_config.sb_path("logs", "recall.jsonl"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as sink:
+            sink.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **event}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def hashlib_sid(sid: str) -> str:
+    import hashlib
+    return hashlib.sha256(sid.encode()).hexdigest()[:12]
 
 
 def main():
@@ -250,9 +329,11 @@ def main():
             items = search(prompt, project)
         except Exception:
             items = []
-    items = enrich(items, sid)
+    items = refine(enrich(items, sid), prompt, project)
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
-    hint = TIME_HINT if TIME_PAT.search(prompt) else ""
+    hint = TIME_HINT if is_history_question(prompt) else ""
+    recall_log({"sid": hashlib_sid(sid), "project": project, "ids": [it["id"] for it in fresh],
+                "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000)})
     if not fresh and not hint:
         return
     lines = [f"- #{it['id']} {it['date']} {it.get('project','')[:18]} · {it['title'][:70]}" for it in fresh]

@@ -88,6 +88,13 @@ def _http_post(url: str, payload: Dict[str, Any], timeout: int) -> Tuple[int, st
 _post = _http_post
 
 
+def _worker_unreachable(exc: BaseException) -> bool:
+    reason = getattr(exc, 'reason', exc)
+    if isinstance(reason, (ConnectionRefusedError, ConnectionResetError, TimeoutError)):
+        return True
+    return getattr(reason, 'errno', None) in (111, 10061, 10060) or getattr(reason, 'winerror', None) in (10061, 10060)
+
+
 _MASKER = []
 
 
@@ -111,6 +118,30 @@ def _pii_masker():
     return fn
 
 
+def is_excluded_project(project: str) -> bool:
+    """claude-mem 설정 CLAUDE_MEM_EXCLUDED_PROJECTS 의 이름 항목 + automemory_exclude.txt. 경로·glob 항목은 마지막 이름으로 비교."""
+    if os.environ.get('SB_SAVE_ALLOW_EXCLUDED') == '1' or not project:
+        return False
+    names = set()
+    raw = str(sb_config.claude_mem_settings().get('CLAUDE_MEM_EXCLUDED_PROJECTS') or '')
+    for item in raw.split(','):
+        item = item.strip().replace('\\', '/').rstrip('*').rstrip('/')
+        if item:
+            names.add(item.rsplit('/', 1)[-1].lower())
+    try:
+        with open(sb_config.sb_path('config', 'automemory_exclude.txt'), encoding='utf-8') as f:
+            for line in f.read().splitlines():
+                line = line.strip().lower()
+                if line and not line.startswith('#'):
+                    names.add(line)
+                    if line.startswith('workspace-'):
+                        names.add(line[len('workspace-'):])
+    except OSError:
+        pass
+    names.discard('memories')   # ~/.codex/memories 경로 항목의 꼬리 — 프로젝트 이름이 아니다
+    return project.lower() in names
+
+
 def save_memory(text: str, title: str, project: str, prov: Dict[str, Any],
                 base_url: str = None, db_path: str = None, retries: int = 2) -> int:
     if not text.strip() or not title.strip():
@@ -119,6 +150,11 @@ def save_memory(text: str, title: str, project: str, prov: Dict[str, Any],
         raise ValueError('retries must be a nonnegative integer')
     # M2 격리 규약: scope_id(project) 또는 명시적 'global' 없는 쓰기는 거부 — 생략은 에러다.
     project = require_scope(project)
+    if is_excluded_project(project):
+        # claude-mem 수집 제외 프로젝트(개인 폴더 등)를 sb save·동기화가 우회해 저장하던 구멍
+        journal({'dedup_key': '', 'project': project, 'event': 'excluded'})
+        raise RuntimeError('project %r is excluded from memory capture (CLAUDE_MEM_EXCLUDED_PROJECTS / '
+                           'automemory_exclude.txt); set SB_SAVE_ALLOW_EXCLUDED=1 to override' % project)
     key = dedup_key(prov, text, title)
     event = {'dedup_key': key, 'project': project}
     if already_saved(key, db_path):
@@ -139,6 +175,13 @@ def save_memory(text: str, title: str, project: str, prov: Dict[str, Any],
                     result.get('success') is not True or type(result.get('id')) is not int):
                 raise ValueError('invalid memory-save response (HTTP {})'.format(status))
         except (OSError, HTTPException, ValueError) as exc:
+            if attempt == 0 and base_url is None and _worker_unreachable(exc):
+                # 워커가 꺼져 있으면(연결 거부) 띄우고 다시 시도한다 — 9/28~10/2 동기화 실패 재발 방지
+                try:
+                    import sb_health
+                    journal({**event, 'event': 'worker_autostart', 'ok': sb_health.ensure_worker()})
+                except Exception:  # noqa: BLE001
+                    pass
             if attempt == retries:
                 journal({**event, 'event': 'failed', 'attempts': attempt + 1,
                          'error': str(exc)})

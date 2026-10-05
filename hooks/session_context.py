@@ -67,6 +67,22 @@ def build(cwd: str):
     return '\n'.join(out).strip(), scope_id, method, shown, omitted, used_briefing
 
 
+def health_line() -> str:
+    """기록층 건강 점검 — 문제가 있으면 경고 한 줄, 고칠 수 있으면 백그라운드 자동 복구(sb_health --fix)."""
+    if os.environ.get('SB_HEALTH', '1') == '0':
+        return ''
+    import sb_health
+    import sb_config
+    result = sb_health.run_checks()   # 훅은 읽기만 한다(health.json 은 --fix·CLI·야간 배치가 쓴다)
+    line = sb_health.warning_line(result)
+    fixable = any(isinstance(v, dict) and v.get('fix') for v in result.values())
+    installed = Path(sb_config.sb_path('logs', 'nightly.log')).exists()   # 임시·테스트 SB_HOME 에서는 복구를 띄우지 않는다
+    if line and fixable and installed and os.environ.get('SB_HEALTH_AUTOFIX', '1') != '0':
+        sb_health.spawn_fix()
+        line += ' (자동 복구 시작)'
+    return line
+
+
 def emit(harness: str, text: str) -> str:
     payload = {'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}}
     if harness == 'claude':
@@ -106,6 +122,12 @@ def main() -> None:
             import traceback
             traceback.print_exc()
         return
+    try:
+        warn = health_line()
+    except Exception:  # noqa: BLE001 — 점검 실패가 세션 시작을 막으면 안 된다
+        warn = ''
+    if warn:
+        text = (text + '\n' + warn).strip()
     if not text:
         return
     payload = emit(args.harness, text)

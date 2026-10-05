@@ -162,6 +162,8 @@ class Engine:
         # 판정 뒤에 거르면 판정은 그 기록으로 통과하고 주입은 무관한 기록이 되는 불일치가 생긴다(DOE S9).
         cutoff = (time.time() - FRESH_MINUTES * 60) * 1000
         rows = [r for r in rows if not (meta.get(r[0], {}).get('live') and meta[r[0]].get('epoch', 0) > cutoff)]
+        dead = superseded_ids()   # 새 판으로 대체된 자동 메모리 옛 관측은 회수하지 않는다(2026-10-05)
+        rows = [r for r in rows if r[0] not in dead]
         rows = rows[:limit]
         matched, cov, rare = 0, 0.0, 0
         counted = [t for t in toks if t not in TASK_WORDS]   # 판정은 주제 단어로만(검색에는 모두 씀)
@@ -196,6 +198,22 @@ class Engine:
                 out[oid] = {'project': proj, 'title': title or '', 'epoch': epoch or 0, 'live': not imported,
                             'date': (sd or td).group(1) if (sd or td) else (created or '')[:10]}
         return out
+
+
+def superseded_ids():
+    """automemory_state.json 의 supersedes(옛 판) + 삭제된 메모리 파일의 관측 id."""
+    try:
+        with open(sb_config.sb_path('index', 'automemory_state.json'), encoding='utf-8') as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    out = set()
+    for entry in st.values():
+        if isinstance(entry, dict):
+            out.update(i for i in entry.get('supersedes', []) if isinstance(i, int))
+            if entry.get('deleted_at') and isinstance(entry.get('obs_id'), int):
+                out.add(entry['obs_id'])
+    return out
 
 
 def serve(port, idle_hours):
@@ -261,7 +279,8 @@ def serve(port, idle_hours):
                     cfg = sb_relabel.auto_config()
                     if cfg and cfg.get('work_projects'):
                         with contextlib.redirect_stdout(io.StringIO()):
-                            sb_relabel.auto_env(cfg['work_projects'], cfg.get('to') or 'secondbrain-kit', since_hours=24)
+                            sb_relabel.auto_env(cfg['work_projects'], cfg.get('to') or 'secondbrain-kit', since_hours=24,
+                                                extra_pattern=cfg.get('extra_env_pattern'))
                 except Exception:  # noqa: BLE001
                     pass
                 try:   # 실시간 관찰기가 옮겨 적은 실명 가리기(SQLite만 — 벡터는 야간 pii 단계)
@@ -292,7 +311,11 @@ def query(text, project, limit, as_json, port=None):
     g = d['gate']
     print('[recall] project=%s 일치 명사 %d개·커버리지 %.0f%% → %s  (본문: get_observations([ID]) / 기간: sb timeline)'
           % (project or 'ALL', g['matched'], g['coverage'] * 100, '관련 있음' if g['pass'] else '약함(표현을 바꿔 다시)'))
-    for it in d['items']:
+    # 보여주는 순서: 현재 프로젝트 먼저, 그 안에서 최신판 먼저 — 낡은 판이 맨 위에 오던 문제(2026-10-05).
+    # 관련도 판정은 서버가 점수 1위로 이미 끝냈다.
+    items = sorted(d['items'], key=lambda it: (bool(project) and it.get('project') == project, it.get('date') or ''),
+                   reverse=True)
+    for it in items:
         print('- #%d %s %s · %s' % (it['id'], it['date'], it['project'], it['title'][:110]))
     return 0
 

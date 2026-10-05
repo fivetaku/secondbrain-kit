@@ -60,6 +60,7 @@ def apply(mapping, dry_run=False, note=''):
         with con:
             con.executemany('UPDATE observations SET project=? WHERE id=?', [(b, i) for i, (a, b) in changes.items()])
     _sync_ko({i: b for i, (a, b) in changes.items()})
+    prune_backups(db)
     print('완료. 백업 %s · journal %s' % (backup, journal))
     return journal
 
@@ -87,7 +88,33 @@ def _sync_ko(new_projects):
 ENV_PATTERN = (r'\bsb (search|recall|timeline|save|relabel|state|loops)|sb_recall|sb_recalld|recall_gate|session_context|'
                r'secondbrain|세컨브레인|claude-mem|teamclaude|회수 훅|회상 게이트|recalld|DoE|관련도 판정|qrels|'
                r'test_\w+\.py|unittest|pytest|키트|kit\b|doctor|settings\.json 훅|훅 (타임아웃|등록)|chroma|임베딩|ko_fts|'
-               r'Kiwi|PR #\d|이슈 #\d|\bsb\.py|sb_\w+\.py|\bsb command|insane-router|[Rr]ecall gate|Search API|SessionStart 훅')
+               r'Kiwi|PR #\d|이슈 #\d|\bsb\.py|sb_\w+\.py|\bsb command|insane-router|[Rr]ecall gate|Search API|SessionStart 훅|'
+               # 보강: 실사용에서 업무 프로젝트에 남아 있던 도구·PC 환경 기록의 제목 어휘
+               r'플러그인|plugin|PC 성능|성능 저하|시작 프로그램|Ollama|'
+               r'훅 (경량화|이식|실행|구조)|[Hh]ook (파일|구조)|회수 서버|기록층 (점검|감사|복구)|automemory 동기화|야간 배치|'
+               r'벡터 (동기화|백필)|behavior_eval|sbeval|평가 하네스|PII 마스킹|이름 마스킹|relabel|관찰기|팀클로드|[Tt]eam[Cc]laude|'
+               r'sb health')
+# 주의: 'PII'·'메모리 시스템'·'기록층' 단독은 업무 쪽 기록(데이터 동기화·회고)까지 잡아 빼서 넣지 않았다.
+# PC 마다 다른 어휘(설치된 보안 프로그램 이름 등)는 relabel_auto.json 의 "extra_env_pattern" 에 둔다.
+
+RELABEL_KEEP = int(os.environ.get('SB_RELABEL_KEEP', '5'))   # 재분류 DB 백업 보존 개수
+
+
+def prune_backups(db: Path, keep: int = None) -> int:
+    """재분류 백업(<db>.bak-*-relabel.db)을 최신 keep 개만 남긴다. 자동 분리가 매시간 돌면 DB 전체 사본이
+    시간당 하나씩 쌓인다(실사용 10일에 31개·약 290MB). 반환: 지운 수."""
+    keep = RELABEL_KEEP if keep is None else keep
+    if keep <= 0:
+        return 0
+    olds = sorted(db.parent.glob('%s.bak-*-relabel%s' % (db.stem, db.suffix)), key=lambda p: p.stat().st_mtime, reverse=True)
+    removed = 0
+    for p in olds[keep:]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def auto_config():
@@ -98,10 +125,10 @@ def auto_config():
     return json.loads(p.read_text(encoding='utf-8'))
 
 
-def auto_env(work_projects, to, since_hours=72, dry_run=False):
+def auto_env(work_projects, to, since_hours=72, dry_run=False, extra_pattern=None):
     """업무 프로젝트의 실시간 관찰 중 도구·환경 작업으로 판별된 것을 to 로 옮긴다. 반환: 옮긴 수."""
     import re
-    pat = re.compile(ENV_PATTERN, re.I)
+    pat = re.compile(ENV_PATTERN + ('|' + extra_pattern if extra_pattern else ''), re.I)
     db = Path(os.environ.get('SB_CLAUDE_MEM_DB') or sb_config.claude_mem_db())
     cutoff = int((time.time() - since_hours * 3600) * 1000)
     with closing(sqlite3.connect('file:%s?mode=ro' % db.as_posix(), uri=True, timeout=10)) as con:
@@ -148,7 +175,7 @@ def main(argv=None):
         to = a.to or cfg.get('to') or 'secondbrain-kit'
         if not src:
             ap.error('--from 또는 relabel_auto.json 의 work_projects 필요')
-        print('자동 분리 %d건' % auto_env(src, to, a.since_hours, a.dry_run))
+        print('자동 분리 %d건' % auto_env(src, to, a.since_hours, a.dry_run, cfg.get('extra_env_pattern')))
         return 0
     if not a.to:
         ap.error('--to 필요')
