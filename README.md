@@ -73,9 +73,38 @@ sb save --title "무엇을 했나" --text "결론·근거·남은 일"
 sb loops add|list|close <id>
 sb prompt-id '<내가 한 말 일부>'      # 결정 검증용 프롬프트 ID
 sb scope                            # 이 폴더가 어떤 scope로 인식되는지
+sb health [--fix]                   # 기록층이 막힌 곳이 없는지 점검(고칠 수 있으면 고침)
 ```
 
 에이전트는 규칙 블록을 보고 이 명령들을 스스로 쓴다. 사람이 직접 칠 일은 드물다.
+
+## 기록층 감시 (`sb health`)
+
+기록이 들어가는 길이나 꺼내 쓰는 길이 막혀도 겉으로는 아무 일 없어 보인다(회수는 계속 되지만 새 기록이 안 쌓이거나, 낡은 판만 나온다). 그래서 막힌 곳을 알려 주고 스스로 고친다.
+
+| 점검 | 실패하면 |
+|---|---|
+| claude-mem 워커, 관찰기 프록시(`~/.claude-mem/.env`의 `ANTHROPIC_BASE_URL`이 있을 때) | 새 기록이 생기지 않는다 |
+| Ollama(설치기가 bge-m3 임베딩을 켠 PC만) | 의미 검색에 새 기록이 안 잡힌다 |
+| 야간 배치 결과·신선도 | 메모리 동기화·색인이 밀린다 |
+| 메모리 동기화 대기 · 벡터 미반영 · 한국어 색인 지연 | 회수 결과가 낡은 판에 머문다 |
+| 훅 대기열 정체·만료 | 세션 기록이 유실된다 |
+| 회수 자가 시험(최근 기록을 제목으로 회수해 되돌아오는지) | 프롬프트별 회수 주입이 빈손이 된다 |
+| 상태층에 안 올라간 `[…·결정]` 저장 수 | 다음 세션이 같은 질문을 반복한다 |
+
+- 세션 시작 브리핑에 `⚠ 기록층 점검: …` 한 줄이 붙고, 고칠 수 있으면 백그라운드로 `sb health --fix`가 돈다. 야간 배치 마지막 단계도 결과를 `~/.secondbrain/logs/health.json`에 남긴다.
+- `sb health`는 최근 7일 회수 활용(주입 수·빈 결과·확인 게이트 판정)도 보여 준다. 원자료는 `logs/recall.jsonl`, `logs/recall-gate.jsonl`.
+- 끄기: `SB_HEALTH=0`(전부) · `SB_HEALTH_AUTOFIX=0`(자동 복구만) · `SB_WORKER_AUTOSTART` / `SB_OLLAMA_AUTOSTART` / `SB_PROXY_AUTOSTART=0`(개별 기동)
+
+**기타 설정**
+
+| 환경변수 / 파일 | 뜻 |
+|---|---|
+| `SB_RECALL_AUTO_TITLE`, `SB_RECALL_AUTO_PROMPT` | 정기 자동 실행(아침 브리핑 등) 관측의 제목 패턴 / 그 주제를 묻는 프롬프트 패턴. 그 주제를 물을 때만 회수 목록에 넣는다 |
+| `SB_RELABEL_KEEP` (기본 5) | 재분류할 때 만드는 DB 백업의 보존 개수 |
+| `SB_NIGHTLY_PII=0` | 마스킹 모듈이 있어도 야간 실명 정리 단계를 끈다 |
+| `SB_SAVE_ALLOW_EXCLUDED=1` | 수집 제외 프로젝트에도 `sb save`를 허용한다(기본은 차단) |
+| `relabel_auto.json`의 `"extra_env_pattern"` | 이 PC에서만 쓰는 도구·프로그램 이름(업무 기록에서 자동 분리할 어휘) |
 
 **scope 이름 바꾸기**: 기본 scope는 폴더 경로(또는 git remote)다. 짧은 이름을 쓰려면 `~/.secondbrain/config/project_aliases.json`에 `{"myapp": ["/Users/me/code/myapp"]}` 형태로 등록한다.
 

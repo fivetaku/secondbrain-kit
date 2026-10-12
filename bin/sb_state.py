@@ -337,7 +337,14 @@ def _read_region(path: Path, lines: Optional[Tuple[int, int]], limit: int = 200_
     return data
 
 
+# 업무 폴더 세션에서 말한 도구 결정(예: "임베딩 서버 자동 시작 켜줘")을 도구 scope 에 남길 때만 켠다.
+# 발화 포함 여부 검증은 그대로 하고, 세션 project ≠ scope 불일치만 허용한다(검증 detail 에 cross-scope 표기).
+_CROSS_SCOPE = {'on': False}
+
+
 def _scope_matches_project(project: Optional[str], scope_id: str) -> bool:
+    if _CROSS_SCOPE['on'] and project:
+        return True
     if not project:
         return False
     if _norm_name(project) == _norm_name(scope_id):
@@ -452,7 +459,16 @@ CHECKERS = {'file_contains': check_file_contains, 'json_file_value': check_json_
 
 
 def verify(candidate_id: int, method: str, target: str, evidence_ref: Optional[str] = None,
-           db_path: Optional[str] = None) -> Dict[str, Any]:
+           db_path: Optional[str] = None, cross_scope: bool = False) -> Dict[str, Any]:
+    _CROSS_SCOPE['on'] = bool(cross_scope)
+    try:
+        return _verify(candidate_id, method, target, evidence_ref, db_path, cross_scope)
+    finally:
+        _CROSS_SCOPE['on'] = False
+
+
+def _verify(candidate_id: int, method: str, target: str, evidence_ref: Optional[str],
+            db_path: Optional[str], cross_scope: bool) -> Dict[str, Any]:
     if method not in CHECKERS:
         raise StateError('invalid', 'unregistered verification method %r (allowed: %s)' % (
             method, sorted(CHECKERS)))
@@ -471,6 +487,8 @@ def verify(candidate_id: int, method: str, target: str, evidence_ref: Optional[s
             result, h, detail = 'rejected', '', 'measured_fact requires a measurement checker'
         else:
             result, h, detail = CHECKERS[method](cand, target.strip())
+            if cross_scope:
+                detail = (detail or '') + ' (cross-scope: 발화 세션 project 와 scope 불일치 허용)'
         try:
             db.execute('BEGIN IMMEDIATE')
             cur = db.execute(
@@ -666,6 +684,8 @@ def main(argv: List[str]) -> int:
     p = sub.add_parser('propose'); p.add_argument('--file', required=True)
     v = sub.add_parser('verify'); v.add_argument('--candidate', type=int, required=True)
     v.add_argument('--method', required=True); v.add_argument('--target', required=True); v.add_argument('--evidence-ref')
+    v.add_argument('--cross-scope', action='store_true',
+                   help='발화·관측이 다른 project 세션에서 나왔어도 허용(업무 세션에서 말한 도구 결정 등)')
     a = sub.add_parser('accept'); a.add_argument('--candidate', type=int, required=True)
     a.add_argument('--expected-version', type=int, required=True); a.add_argument('--memory-kind', default='fact')
     a.add_argument('--allow-older', action='store_true', help='explicitly allow an older observed_at to replace the head')
@@ -679,7 +699,7 @@ def main(argv: List[str]) -> int:
             with open(ns.file, encoding='utf-8') as f:
                 out = propose(json.load(f), ns.db)
         elif ns.cmd == 'verify':
-            out = verify(ns.candidate, ns.method, ns.target, ns.evidence_ref, ns.db)
+            out = verify(ns.candidate, ns.method, ns.target, ns.evidence_ref, ns.db, ns.cross_scope)
         elif ns.cmd == 'accept':
             out = accept(ns.candidate, ns.expected_version, ns.db, ns.memory_kind, ns.allow_older)
         elif ns.cmd in ('head', 'history'):

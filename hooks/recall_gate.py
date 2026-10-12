@@ -9,7 +9,8 @@
   Stop                        → sb_recall 이 남긴 .needs(과거 맥락 질문) 이후 회상이 없으면 1회 block
   SubagentStart               → 서브에이전트에 기록층 사용법 주입(회수 주입을 못 받으므로)
   PreToolUse(AskUserQuestion) → 마커 없으면 1차 deny(재시도는 통과). 질문은 나가는 순간이 사고다
-  PreToolUse(Edit|Write)      → 마커 없으면 세션 1회 넛지만(차단 아님)
+  PreToolUse(Edit|Write)      → 마커 없으면 세션 1회 넛지만(차단 아님) — 2026-09-27 등록 해제(호출마다 기동 비용)
+  회상 여부는 이제 대화기록(transcript_path)에서 판정한다. PostToolUse 마커는 폴백으로만 남김.
 
 한계: 세션 단위로만 본다. 세션 초반의 무관한 회상 1회로 이후가 조용해진다.
       대상 단위 판정은 CLAUDE.md 회상 게이트(규범)가 맡는다.
@@ -73,6 +74,77 @@ SUBAGENT_MSG = (
     "과제에 과거 결정·상태·수치가 걸리면 추측 말고 먼저 조회하고, 결과에 근거(#ID·파일)를 적는다. "
     "과거 기록은 기록 당시 스냅샷이라 현재 상태 주장은 실측을 우선한다."
 )
+
+
+AGENT_TOOLS = ("Agent", "Task")
+AGENT_RECALL_PAT = ("sb timeline", "sb search", "sb recall", "get_observations", "sb state", "기록층")
+
+
+def _is_recall_tool(name: str, inp) -> bool:
+    low = (name or "").lower()
+    if "recall" in low or "mcp-search" in low or "mcp__plugin_claude-mem" in (name or ""):
+        return True
+    if name in SHELL_TOOLS:
+        command = str((inp or {}).get("command") or "")
+        return any(pat in command for pat in RECALL_PAT)
+    if name in AGENT_TOOLS:   # 기록층 조회를 맡긴 서브에이전트 — 2026-10-05 오탐(에이전트 결과 전달 답을 되돌림) 보정
+        prompt = str((inp or {}).get("prompt") or "")
+        return any(pat in prompt for pat in AGENT_RECALL_PAT)
+    return False
+
+
+def _is_notification(content) -> bool:
+    """사용자 발화가 아니라 백그라운드 작업 알림·시스템 메시지인 턴."""
+    texts = [content] if isinstance(content, str) else [
+        b.get("text", "") for b in (content or []) if isinstance(b, dict) and b.get("type") == "text"]
+    head = " ".join(t.lstrip()[:200] for t in texts)
+    return "<task-notification>" in head or "[SYSTEM NOTIFICATION" in head
+
+
+def gate_log(event: dict) -> None:
+    """게이트 판정 기록 — 효과 측정용(차단 뒤 답이 실제로 바뀌었는지는 다음 턴 회상 여부로 본다)."""
+    try:
+        import time
+        path = pathlib.Path(sb_config.sb_path("logs", "recall-gate.jsonl"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as sink:
+            sink.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **event}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def transcript_recall(path, since_last_prompt=True, max_bytes=4_000_000):
+    """대화기록(JSONL)에 회상 도구 호출이 있었나. since_last_prompt=True 면 마지막 사용자 프롬프트 이후만.
+    반환 True/False, 읽을 수 없으면 None(마커 방식 폴백).
+    도구 호출마다 훅을 띄워 마커를 찍던 방식을 대체한다 — 이 PC는 프로세스 기동만 1.6~9초라 호출당 비용이 컸다."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, TypeError, ValueError):
+        return None
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        msg = ev.get("message") or {}
+        content = msg.get("content")
+        if ev.get("type") == "assistant" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and \
+                        _is_recall_tool(block.get("name", ""), block.get("input")):
+                    return True
+        elif ev.get("type") == "user" and since_last_prompt and not ev.get("isMeta"):
+            if isinstance(content, str) or (isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "text" for b in content)):
+                if _is_notification(content):
+                    return "notification"   # 사용자 질문이 아니라 알림 턴 — 게이트 대상 아님
+                return False   # 마지막 사용자 프롬프트까지 거슬러 올라갔는데 회상 없음
+    return False
 
 
 def main() -> None:
@@ -156,14 +228,23 @@ def main() -> None:
 
     # ── Stop: 과거 맥락 질문인데 이번 프롬프트 이후 회상이 없으면 1회 되돌림 ──
     if event == "Stop":
-        if job.get("stop_hook_active"):
+        if job.get("stop_hook_active") or os.environ.get("SB_STOP_GATE", "1") == "0":
             return
         needs = mtime(".needs")
-        if needs and mtime(".recalled_at") < needs:
-            try:
-                (gate / (key + ".needs")).unlink()   # 프롬프트당 1회만
-            except OSError:
-                pass
+        if not needs:
+            return
+        seen = transcript_recall(job.get("transcript_path"), since_last_prompt=True)
+        if seen == "notification":
+            gate_log({"event": "stop", "decision": "skip_notification", "sid": key[:12]})
+            return
+        if seen is None:   # 대화기록을 못 읽으면 예전 마커 방식
+            seen = mtime(".recalled_at") >= needs
+        try:
+            (gate / (key + ".needs")).unlink()   # 프롬프트당 1회만 판정
+        except OSError:
+            pass
+        gate_log({"event": "stop", "decision": "pass" if seen else "block", "sid": key[:12]})
+        if not seen:
             sys.stdout.write(json.dumps({"decision": "block", "reason": STOP_MSG}, ensure_ascii=False))
         return
 
@@ -179,6 +260,8 @@ def main() -> None:
         return
 
     if has(".recalled"):
+        return
+    if tool == "AskUserQuestion" and transcript_recall(job.get("transcript_path"), since_last_prompt=False):
         return
 
     # ── 되묻기 차단 (세션 1회) ───────────────────────────────────────

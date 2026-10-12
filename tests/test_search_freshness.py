@@ -407,7 +407,7 @@ class FreshnessTests(unittest.TestCase):
         completed = subprocess.run(
             [sys.executable, str(script), '우주망원경', '--global', '--json'],
             env={**os.environ, 'PYTHONPATH': os.pathsep.join([str(shim), str(script.parent)])},
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
         self.assert_both(payload, 2)

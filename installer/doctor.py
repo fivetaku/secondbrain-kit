@@ -110,12 +110,16 @@ def check_recall_smoke():
     payload = json.dumps({'prompt': '지난주에 한 작업 어떻게 됐지', 'session_id': 'sb-doctor-%d' % os.getpid(),
                           'cwd': str(HOME)}, ensure_ascii=False).encode('utf-8')
     try:
+        t0 = time.time()
         r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'hooks' / 'sb_recall.py')],
                            input=payload, capture_output=True, timeout=30, env=env)
         ctx = json.loads(r.stdout.decode('utf-8') or '{}').get('hookSpecificOutput', {}).get('additionalContext', '')
     except Exception as e:  # noqa: BLE001
         return rec('❌', '회수 훅 실동작', '실행 실패: %s' % e)
     ok = 'sb timeline' in ctx
+    took = time.time() - t0
+    if took > 10:   # 훅 제한 시간(15초)에 가까우면 결과가 버려질 수 있다 — 프로세스 기동이 느린 PC
+        rec('⚠', '회수 훅 소요 시간', '%.1f초 — 제한 15초에 근접(백신 검사·저전력 모드 확인)' % took)
     rec('✅' if ok else '❌', '회수 훅 실동작', '한국어 프롬프트 → 회수 주입 정상' if ok else '한국어 프롬프트에 주입 없음(인코딩 확인)')
 
 
@@ -123,7 +127,7 @@ def check_claude():
     if not shutil.which('claude'):
         return rec('⚠', 'Claude Code', '미설치 — 건너뜀')
     p = HOME / '.claude' / 'settings.json'
-    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'SubagentStart')
+    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStart')
     missing = [e for e in events if not _has_kit_hook(p, e)]
     rec('✅' if not missing else '❌', 'Claude 훅', '%d종 등록' % len(events) if not missing else '누락: ' + ', '.join(missing))
     check_recall_smoke()
@@ -184,6 +188,12 @@ def check_state_and_capture():
 def check_sb():
     found = shutil.which('sb')
     rec('✅' if found else '⚠', 'sb 명령', found or 'PATH 에 없음(새 터미널에서 다시 확인)')
+    try:   # 회수 상주 서버 — 세션 시작 훅이 띄운다(꺼져 있어도 다음 세션에서 자동 기동)
+        import sb_recalld
+        up = sb_recalld.is_up()
+        rec('✅' if up else '⚠', '회수 상주 서버(sb_recalld)', sb_recalld.base_url() if up else '꺼짐 — 새 세션을 열거나 `sb recall` 한 번이면 뜸')
+    except Exception as exc:  # noqa: BLE001
+        rec('⚠', '회수 상주 서버(sb_recalld)', str(exc)[:80])
     if IS_WIN:   # Claude Code 의 Bash 도구(Git Bash)는 sb.cmd 를 `sb` 로 못 부른다
         sh = sb_config.home() / 'bin' / 'sb'
         rec('✅' if sh.is_file() else '❌', 'sb 명령(Git Bash)', str(sh) if sh.is_file() else '없음 — install 재실행')

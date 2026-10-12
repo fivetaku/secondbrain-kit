@@ -67,6 +67,27 @@ def build(cwd: str):
     return '\n'.join(out).strip(), scope_id, method, shown, omitted, used_briefing
 
 
+def health_line() -> str:
+    """기록층 건강 점검 — 문제가 있으면 경고 한 줄, 고칠 수 있으면 백그라운드 자동 복구(sb_health --fix)."""
+    if os.environ.get('SB_HEALTH', '1') == '0':
+        return ''
+    import sb_health
+    import sb_config
+    # 훅은 읽기만 한다(health.json 은 --fix·CLI·야간 배치가 쓴다). 워커는 claude-mem 자체 훅이 지금 띄우는 중이라 빼고 본다.
+    # 회수 자가 시험도 세션 시작엔 서버가 막 뜨는 중이라 빼고, 직전 점검(야간 배치·CLI)의 결과가 실패면 그걸 알린다.
+    result = sb_health.run_checks(worker=False, recall=False)
+    last = sb_health.load_last().get('recall') or {}
+    if last.get('ok') is False and last.get('msg'):
+        result['recall'] = {'ok': False, 'msg': last['msg'] + ' (직전 점검)', 'fix': last.get('fix')}
+    line = sb_health.warning_line(result)
+    fixable = any(isinstance(v, dict) and v.get('fix') for v in result.values())
+    installed = Path(sb_config.sb_path('logs', 'nightly.log')).exists()   # 임시·테스트 SB_HOME 에서는 복구를 띄우지 않는다
+    if line and fixable and installed and os.environ.get('SB_HEALTH_AUTOFIX', '1') != '0':
+        sb_health.spawn_fix()
+        line += ' (자동 복구 시작)'
+    return line
+
+
 def emit(harness: str, text: str) -> str:
     payload = {'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}}
     if harness == 'claude':
@@ -93,6 +114,12 @@ def main() -> None:
         except Exception:
             pass
     cwd = str(raw.get('cwd') or os.getcwd())
+    try:   # 회수 상주 서버를 미리 띄운다 — 첫 프롬프트부터 형태소 회수가 바로 되게(떠 있으면 확인만)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'bin'))
+        import sb_recalld
+        sb_recalld.ensure_running()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         text, scope_id, method, shown, omitted, used = build(cwd)
     except Exception:
@@ -100,6 +127,12 @@ def main() -> None:
             import traceback
             traceback.print_exc()
         return
+    try:
+        warn = health_line()
+    except Exception:  # noqa: BLE001 — 점검 실패가 세션 시작을 막으면 안 된다
+        warn = ''
+    if warn:
+        text = (text + '\n' + warn).strip()
     if not text:
         return
     payload = emit(args.harness, text)

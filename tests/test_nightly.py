@@ -148,10 +148,12 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(self.run_main('--dry-run', '--with-consolidate'), 0)
         lines = self.stdout.splitlines()
         self.assertEqual([line.split()[0] for line in lines],
-                         ['stage=ko-index', 'stage=automemory', 'stage=snapshot', 'stage=consolidate'])
-        self.assertIn('timeout=900 core=True', lines[0])
-        self.assertIn('timeout=600 core=False', lines[2])
-        self.assertIn('timeout=7200 core=False', lines[3])
+                         ['stage=preflight', 'stage=ko-index', 'stage=automemory', 'stage=snapshot',
+                          'stage=consolidate', 'stage=health'])
+        self.assertIn('timeout=180 core=False', lines[0])
+        self.assertIn('timeout=900 core=True', lines[1])
+        self.assertIn('timeout=600 core=False', lines[3])
+        self.assertIn('timeout=7200 core=False', lines[4])
         self.assertFalse(self.home.exists())
 
     def test_default_stage_commands(self) -> None:
