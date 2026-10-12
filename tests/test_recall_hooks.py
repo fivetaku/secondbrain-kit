@@ -79,6 +79,45 @@ class RecallGateTest(unittest.TestCase):
         out = self.gate(hook_event_name='Stop', stop_hook_active=False)
         self.assertEqual(out['decision'], 'block')
 
+    def transcript(self, *events):
+        p = Path(self.tmp.name) / 'transcript.jsonl'
+        with open(p, 'w', encoding='utf-8') as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        return str(p)
+
+    @staticmethod
+    def user(text):
+        return {'type': 'user', 'message': {'role': 'user', 'content': text}}
+
+    @staticmethod
+    def tool(name, **inp):
+        return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': name, 'input': inp}]}}
+
+    def test_stop_reads_transcript_recall_after_last_prompt(self):
+        self.needs()
+        path = self.transcript(self.user('지난주 N 작업'), self.tool('Bash', command="sb recall '작업'"))
+        self.assertIsNone(self.gate(hook_event_name='Stop', transcript_path=path))
+
+    def test_stop_ignores_recall_before_last_prompt(self):
+        self.needs()
+        path = self.transcript(self.tool('Bash', command="sb recall 'x'"), self.user('새 질문'),
+                               self.tool('Bash', command='ls'))
+        self.assertEqual(self.gate(hook_event_name='Stop', transcript_path=path)['decision'], 'block')
+
+    def test_tool_results_are_not_treated_as_new_prompt(self):
+        self.needs()
+        result = {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'ok'}]}}
+        path = self.transcript(self.user('질문'), self.tool('mcp__plugin_claude-mem_mcp-search__get_observations', ids=[1]),
+                               result)
+        self.assertIsNone(self.gate(hook_event_name='Stop', transcript_path=path))
+
+    def test_ask_passes_when_session_recalled_in_transcript(self):
+        path = self.transcript(self.user('a'), self.tool('PowerShell', command='sb search --mode current'),
+                               self.user('b'))
+        self.assertIsNone(self.gate(hook_event_name='PreToolUse', tool_name='AskUserQuestion',
+                                    tool_input={}, transcript_path=path))
+
     def test_korean_payload_is_read_as_utf8(self):
         out = self.gate(hook_event_name='PreToolUse', tool_name='AskUserQuestion',
                         tool_input={'questions': [{'question': '이번달 한 것 정리할까요?'}]})
@@ -89,10 +128,11 @@ class RecallPromptTest(unittest.TestCase):
     def test_time_pattern(self):
         sys.path.insert(0, str(KIT / 'hooks'))
         import sb_recall
-        for q in ('이번달에 한것들 정리해줘봐', '지난주에 뭐 했었지', '그거 어떻게 됐지?', '9/10 브리핑 다시'):
-            self.assertTrue(sb_recall.TIME_PAT.search(q), q)
-        for q in ('시트 서식 바꿔줘', '이 함수 리팩터링해줘'):
-            self.assertFalse(sb_recall.TIME_PAT.search(q), q)
+        for q in ('이번달에 한것들 정리해줘봐', '지난주에 뭐 했었지', '그거 어떻게 됐지?', '9/10 브리핑 어떻게 했었지?'):
+            self.assertTrue(sb_recall.is_history_question(q), q)
+        # 2026-10-05: 날짜만 있는 요청('9/10 브리핑 다시')은 기간·이력 질문이 아니다(오탐 9/10건의 주원인)
+        for q in ('시트 서식 바꿔줘', '이 함수 리팩터링해줘', '9/10 브리핑 다시'):
+            self.assertFalse(sb_recall.is_history_question(q), q)
 
 
 class TimelineTest(unittest.TestCase):

@@ -63,7 +63,7 @@ class SearchModeBase(unittest.TestCase):
         sb_state.accept(r['candidate_id'], row[0] if row else 0, str(self.state))
 
     def cli(self, *args, cwd=None):
-        p = subprocess.run([PY, str(BIN / 'sb_search.py'), *args], capture_output=True, text=True, env=self.env,
+        p = subprocess.run([PY, str(BIN / 'sb_search.py'), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env,
                            cwd=str(cwd or self.home / 'work' / 'alpha'))
         try:
             j = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else None

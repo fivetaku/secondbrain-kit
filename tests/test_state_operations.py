@@ -101,6 +101,24 @@ class CandidateGateTests(StateOpsBase):
         head = sb_state.query('head', 'proj-a', 'deploy.target')['items'][0]
         self.assertEqual((head['verification_status'], head['label']), ('verified', 'user-confirmed'))
 
+    def test_cross_scope_allows_other_project_evidence_only_when_asked(self):
+        import sqlite3
+        con = sqlite3.connect(str(self.tmp / 'claude-mem.db'))
+        con.execute('CREATE TABLE observations (id INTEGER PRIMARY KEY, project TEXT, title TEXT, '
+                    'narrative TEXT, text TEXT, facts TEXT)')
+        con.execute("INSERT INTO observations VALUES (7, 'other-proj', '배포 대상은 staging-2', '', '', '')")
+        con.commit()
+        con.close()
+        r = self.propose(write_id='x1')
+        plain = sb_state.verify(r['candidate_id'], 'observation_ref', 'observation:7')
+        self.assertEqual(plain['result'], 'rejected')
+        r2 = self.propose(write_id='x2')
+        crossed = sb_state.verify(r2['candidate_id'], 'observation_ref', 'observation:7', cross_scope=True)
+        self.assertEqual(crossed['result'], 'confirmed')
+        self.assertFalse(sb_state._CROSS_SCOPE['on'])   # 호출이 끝나면 꺼진다
+        r3 = self.propose(write_id='x3')
+        self.assertEqual(sb_state.verify(r3['candidate_id'], 'observation_ref', 'observation:7')['result'], 'rejected')
+
     def test_measured_fact_contradicted_evidence_blocks_accept(self):
         r = self.propose(body='prod-9', value_json='prod-9')
         v = self.confirm(r['candidate_id'])
