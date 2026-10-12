@@ -103,6 +103,7 @@ sb health [--fix]                   # 기록층이 막힌 곳이 없는지 점�
 | `SB_RECALL_AUTO_TITLE`, `SB_RECALL_AUTO_PROMPT` | 정기 자동 실행(아침 브리핑 등) 관측의 제목 패턴 / 그 주제를 묻는 프롬프트 패턴. 그 주제를 물을 때만 회수 목록에 넣는다 |
 | `SB_RELABEL_KEEP` (기본 5) | 재분류할 때 만드는 DB 백업의 보존 개수 |
 | `SB_NIGHTLY_PII=0` | 마스킹 모듈이 있어도 야간 실명 정리 단계를 끈다 |
+| `SB_PII_BACKUP_KEEP` (기본 3) | 야간 실명 정리가 벡터를 고치기 전에 만드는 Chroma 사본의 보존 개수 |
 | `SB_SAVE_ALLOW_EXCLUDED=1` | 수집 제외 프로젝트에도 `sb save`를 허용한다(기본은 차단) |
 | `relabel_auto.json`의 `"extra_env_pattern"` | 이 PC에서만 쓰는 도구·프로그램 이름(업무 기록에서 자동 분리할 어휘) |
 

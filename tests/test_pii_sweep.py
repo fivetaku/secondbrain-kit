@@ -79,5 +79,20 @@ class SweepTests(unittest.TestCase):
             self.assertIsNone(sb_memory._pii_masker())
 
 
+class ChromaBackupRetentionTests(unittest.TestCase):
+    def test_keeps_newest_backups_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            stamps = ['20261001-030000', '20261002-030000', '20261003-030000', '20261004-030000', '20261005-030000']
+            for s in stamps:
+                (root / ('chroma-before-piisweep-' + s)).mkdir()
+                (root / ('chroma-before-piisweep-' + s) / 'chroma.sqlite3').write_text('x')
+            (root / 'unrelated').mkdir()
+            self.assertEqual(sb_pii_sweep.prune_chroma_backups(root, keep=3), 2)
+            left = sorted(p.name for p in root.iterdir())
+            self.assertEqual(left, ['chroma-before-piisweep-' + s for s in stamps[2:]] + ['unrelated'])
+            self.assertEqual(sb_pii_sweep.prune_chroma_backups(root, keep=0), 0)   # 0 이면 정리 안 함
+
+
 if __name__ == '__main__':
     unittest.main()

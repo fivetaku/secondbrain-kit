@@ -33,6 +33,21 @@ TABLES = {
     'prompts': ('user_prompts', ['prompt_text']),
 }
 DOC_TYPE = {'observations': 'observation', 'summaries': 'session_summary', 'prompts': 'user_prompt'}
+CHROMA_BACKUP_KEEP = int(os.environ.get('SB_PII_BACKUP_KEEP', '3'))   # 벡터 정리 전 Chroma 사본 보존 개수
+
+
+def prune_chroma_backups(backups: Path, keep: int = None) -> int:
+    """chroma-before-piisweep-* 사본을 최신 keep 개만 남긴다. 야간 pii 단계가 매일 Chroma 전체를 복사하므로
+    제한이 없으면 디스크가 계속 찬다. 반환: 지운 수."""
+    keep = CHROMA_BACKUP_KEEP if keep is None else keep
+    if keep <= 0:
+        return 0
+    olds = sorted(backups.glob('chroma-before-piisweep-*'), key=lambda p: p.name, reverse=True)
+    removed = 0
+    for p in olds[keep:]:
+        shutil.rmtree(p, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _db():
@@ -79,6 +94,7 @@ def sweep_chroma(mask, dry_run=False):
         stamp = time.strftime('%Y%m%d-%H%M%S')
         (cm / 'backups').mkdir(exist_ok=True)
         shutil.copytree(chroma, cm / 'backups' / ('chroma-before-piisweep-' + stamp))
+        prune_chroma_backups(cm / 'backups')
         try:   # 워커가 Chroma 를 쥐고 있으므로 멈춘다 — 다음 세션 훅이 다시 띄우고 보류분을 재임베딩한다
             wp = json.loads((cm / 'worker.pid').read_text(encoding='utf-8'))
             pid = wp.get('pid') if isinstance(wp, dict) else int(wp)
