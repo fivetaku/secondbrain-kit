@@ -36,7 +36,8 @@ import sb_config  # noqa: E402
 
 PORT = int(os.environ.get('SB_RECALLD_PORT', '37791'))
 DB = ''
-SYNC_EVERY = 20.0          # 색인 동기화 최소 간격(초)
+# 색인 동기화 최소 간격(초). 동기화는 원장 전수 대조라 기록 수에 비례해 느려지므로 요청 경로 밖(백그라운드)에서 돈다.
+SYNC_EVERY = float(os.environ.get('SB_RECALLD_SYNC_EVERY', '20'))
 FRESH_MINUTES = 20         # 이보다 새 실시간 관찰은 회상 대상에서 뺀다(훅의 enrich 와 같은 기준)
 GATE_MATCHED, GATE_MATCHED_LOW, GATE_COVERAGE = 3, 2, 0.6
 RARE_DF = 0.10             # 이 비율 미만의 기록에만 나오는 단어를 '드문 단어'로 본다
@@ -106,17 +107,27 @@ class Engine:
         self.sync(force=True)
 
     def sync(self, force=False):
-        now = time.time()
-        if force or now - self.last_sync >= SYNC_EVERY:
-            with self.lock:
-                if force or now - self.last_sync >= SYNC_EVERY:
-                    try:
-                        r = self.ko.ensure_current()
-                        if force or not self.df or (isinstance(r, dict) and (r.get('indexed') or r.get('removed'))):
-                            self._load_df()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.last_sync = time.time()
+        """force=True(기동 시)만 요청 전에 끝낸다. 평소에는 백그라운드 스레드 하나로 돌리고 즉시 돌아간다."""
+        if force:
+            return self._sync_now(force=True)
+        if time.time() - self.last_sync < SYNC_EVERY or self.lock.locked():
+            return
+        threading.Thread(target=self._sync_now, daemon=True).start()
+
+    def _sync_now(self, force=False):
+        if not self.lock.acquire(blocking=force):
+            return
+        try:
+            if force or time.time() - self.last_sync >= SYNC_EVERY:
+                try:
+                    r = self.ko.ensure_current()
+                    if force or not self.df or (isinstance(r, dict) and (r.get('indexed') or r.get('removed'))):
+                        self._load_df()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.last_sync = time.time()
+        finally:
+            self.lock.release()
 
     def _load_df(self):
         """단어별 문서 빈도 — 드문 단어 판정용(기록 수백~수천 건이라 적재 시 한 번 계산)."""
