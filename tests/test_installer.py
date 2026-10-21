@@ -47,6 +47,29 @@ class StripOursTest(unittest.TestCase):
         self.assertEqual(len(hooks['Stop']), 1)
 
 
+class ClaudeHooksTest(unittest.TestCase):
+    def _install(self, version, existing=None):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / '.claude').mkdir()
+            (home / '.claude' / 'settings.json').write_text(json.dumps(existing or {}), encoding='utf-8')
+            with mock.patch.object(inst, 'HOME', home), mock.patch.object(inst, 'DRY', False), \
+                    mock.patch.object(inst, 'claude_version', return_value=version):
+                inst.claude_hooks(None)
+            return json.loads((home / '.claude' / 'settings.json').read_text(encoding='utf-8'))['hooks']
+
+    def test_failure_hook_only_on_supported_claude(self):
+        # 2.1.101 이전은 모르는 훅 이벤트 하나로 settings.json 전체를 무시한다
+        self.assertNotIn('PostToolUseFailure', self._install((2, 1, 90)))
+        self.assertNotIn('PostToolUseFailure', self._install((0,)))
+        self.assertIn('PostToolUseFailure', self._install((2, 1, 306)))
+
+    def test_user_hook_with_same_role_is_not_duplicated(self):
+        user = {'hooks': {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': 'python3 /x/hooks/sb-recall.py'}]}]}}
+        cmds = [h['command'] for g in self._install((2, 1, 306), user)['UserPromptSubmit'] for h in g['hooks']]
+        self.assertEqual(cmds, ['python3 /x/hooks/sb-recall.py'])
+
+
 class SafetyTest(unittest.TestCase):
     def test_sibling_folder_is_not_ours(self):
         other = inst.posix(inst.KIT) + '-archive/hooks/sb_recall.py'
