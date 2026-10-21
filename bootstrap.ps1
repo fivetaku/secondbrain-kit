@@ -12,6 +12,14 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 if (Test-Path (Join-Path $Dir '.git')) {
     Write-Host "==> Updating kit: $Dir"
     git -C $Dir pull --ff-only
+    if ($LASTEXITCODE -ne 0) {
+        # Remote history was rewritten (2026-10-22 author email cleanup): keep local changes in a stash, then match origin/main
+        Write-Host '==> Remote history changed; resetting to latest (local changes kept in git stash)'
+        git -C $Dir stash push -u -m "sbkit-update-$(Get-Date -Format yyyyMMddHHmmss)" 2>$null | Out-Null
+        git -C $Dir fetch origin main
+        git -C $Dir reset --hard origin/main
+        if ($LASTEXITCODE -ne 0) { throw 'kit update failed' }
+    }
 } else {
     Write-Host "==> Cloning kit: $Repo -> $Dir"
     git clone --depth 1 $Repo $Dir

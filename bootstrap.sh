@@ -14,7 +14,13 @@ main() {
   fi
   if [ -d "$DIR/.git" ]; then
     echo "==> 키트 갱신: $DIR"
-    git -C "$DIR" pull --ff-only
+    if ! git -C "$DIR" pull --ff-only; then
+      # 원격 이력이 다시 쓰였을 때(2026-10-22 작성자 이메일 정리) — 로컬 변경은 stash 에 보관하고 원격 main 에 맞춘다
+      echo "==> 원격 이력이 바뀌어 최신본으로 맞춥니다 (로컬 변경은 git stash 에 보관)"
+      git -C "$DIR" stash push -u -m "sbkit-update-$(date +%Y%m%d%H%M%S)" >/dev/null 2>&1 || true
+      git -C "$DIR" fetch origin main
+      git -C "$DIR" reset --hard origin/main
+    fi
   else
     echo "==> 키트 받기: $REPO -> $DIR"
     git clone --depth 1 "$REPO" "$DIR"
