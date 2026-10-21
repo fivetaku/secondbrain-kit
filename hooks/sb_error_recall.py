@@ -3,8 +3,9 @@
 
 Evidence: 44% of actionable tool errors repeat a signature already seen in another session, and for ~32% of sampled
 repeated signatures a related cause/workaround note already existed before the repeat.
-Randomized by session (hash of session_id) into 'on' and 'control' arms so the effect on repeats can be measured later;
-both arms are logged to <SB_HOME>/logs/error_recall.jsonl (signature hash, ids, no error text).
+Always on by default. SB_ERROR_RECALL_AB=1 splits sessions (hash of session_id) into 'on' and 'control' arms so the
+effect on repeats can be measured; every call is logged to <SB_HOME>/logs/error_recall.jsonl (signature hash, ids,
+no error text).
 Fail-open: any error -> no output, exit 0.
 """
 import hashlib, json, re, time, urllib.parse, urllib.request
@@ -39,14 +40,10 @@ def signature(text: str) -> str:
 
 def arm(sid: str) -> str:
     forced = os.environ.get("SB_ERROR_RECALL_ARM")
-    try:   # OmO 는 훅에 환경변수를 넘기지 않는다 — QA 동안만 파일로 강제(10분 지나면 무시)
-        ov = os.path.join(STATE_DIR, "error_recall_arm.override")
-        if not forced and time.time() - os.path.getmtime(ov) < 600:
-            forced = open(ov).read().strip()
-    except OSError:
-        pass
     if forced in ("on", "control"):
         return forced
+    if os.environ.get("SB_ERROR_RECALL_AB") != "1":   # 실험을 켜지 않았으면 항상 회수한다
+        return "on"
     return "on" if int(hashlib.sha256(sid.encode()).hexdigest(), 16) % 2 == 0 else "control"
 
 
