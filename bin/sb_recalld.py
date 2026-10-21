@@ -96,6 +96,139 @@ def ensure_running(port=None):
     return False
 
 
+# 하이브리드(2026-10-20): 키워드 후보 + 벡터 후보를 점수 결합한 뒤 한국어 재순위기로 섞어 고친다.
+# 실사용 프롬프트 200개(정답=그 프롬프트에서 기록된 관측) 평가 근거는 secondbrain RESEARCH/hybrid-search-quality_20261020_1600.
+# 주입 여부 판정(gate)은 그대로 키워드 1위 문서로 한다 — DOE로 맞춘 주입률을 바꾸지 않기 위해서다.
+HYBRID = os.environ.get('SB_RECALLD_HYBRID', '1') == '1'
+CANDIDATES = 30            # 결합·재순위 후보 수
+FUSE_NORM = os.environ.get('SB_RECALLD_FUSE_NORM', 'minmax')   # minmax | zero
+LEX_WEIGHT = 0.3           # 점수 결합에서 키워드 몫(나머지는 벡터). 실사용 질의에서 0.2~0.3이 최고였다
+VEC_REFRESH = float(os.environ.get('SB_RECALLD_VEC_REFRESH', '1800'))   # 벡터 스냅샷 갱신 간격(초)
+RERANK_MODEL = os.environ.get('SB_RERANK_MODEL', 'nlpai-lab/KURE-Reranker-nano')
+
+
+class Vectors:
+    """상주 벡터 검색. 전용 스냅샷(index/chroma-recalld)을 열어 둔 채 질의마다 0.1초대로 묻는다.
+    원본은 claude-mem 워커가 쓰는 중이라 직접 열지 않는다. 갱신 중(수 초)에는 None 을 돌려 키워드만 쓰게 한다.
+    doc_type 은 where 로 걸지 않고 사후에 거른다 — Chroma 1.5.9 로컬은 where 일치 ID 를 전부 꺼내
+    필터를 만들어(chroma #4089) 전체의 88%에 걸리는 이 필터가 질의당 2~12초였다."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.col = self.client = self.stack = None
+        self.opened = 0.0
+        self.error = None
+        threading.Thread(target=self._open, daemon=True).start()
+
+    def _open(self):
+        import contextlib
+        with self.lock:
+            self._close()
+            try:
+                os.environ['SB_CHROMA_SNAPSHOT'] = sb_config.sb_path('index', 'chroma-recalld')
+                os.environ['SB_CHROMA_SNAPSHOT_TTL'] = '0'   # 열 때마다 원본 기준으로 새로 뜬다
+                os.environ.setdefault('CHROMA_OPENAI_API_KEY', 'ollama')
+                import importlib
+                import chromadb
+                from chromadb.config import Settings
+                import sb_search
+                importlib.import_module('sb_embedding').register()
+                stack = contextlib.ExitStack()
+                source = Path(os.environ.get('SB_CHROMA_PATH') or (sb_config.claude_mem_dir() / 'chroma'))
+                snap = stack.enter_context(sb_search._vector_snapshot(source))
+                client = chromadb.PersistentClient(path=snap, settings=Settings(anonymized_telemetry=False))
+                col = client.get_collection('cm__claude-mem')
+                col.query(query_texts=['warmup'], n_results=1)   # 모델·HNSW 적재
+                self.stack, self.client, self.col = stack, client, col
+                self.opened, self.error = time.time(), None
+            except Exception as exc:  # noqa: BLE001 — 벡터는 선택 기능: 실패하면 키워드만 쓴다
+                self.error = str(exc)[:300]
+                self._close()
+                self.opened = time.time()
+
+    def _close(self):
+        for close in (getattr(self.client, 'close', None), getattr(self.stack, 'close', None)):
+            try:
+                if close:
+                    close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.col = self.client = self.stack = None
+
+    def search(self, query, n):
+        if time.time() - self.opened > VEC_REFRESH and not self.lock.locked():
+            threading.Thread(target=self._open, daemon=True).start()
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            if self.col is None:
+                return None
+            r = self.col.query(query_texts=[query], n_results=n * 9, include=['metadatas', 'distances'])
+        except Exception as exc:  # noqa: BLE001
+            self.error = str(exc)[:300]
+            return None
+        finally:
+            self.lock.release()
+        best = {}
+        for md, d in zip((r.get('metadatas') or [[]])[0], (r.get('distances') or [[]])[0]):
+            oid = (md or {}).get('sqlite_id')
+            # bool 은 int 의 하위형이라 True 가 1번 관측으로 섞인다 — sb_search.vector_search 와 같은 이유로 뺀다.
+            if ((md or {}).get('doc_type') == 'observation' and isinstance(oid, int) and not isinstance(oid, bool)
+                    and d is not None):
+                best[oid] = max(best.get(oid, -9.0), 1.0 - float(d))
+        return sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+class Reranker:
+    # 2026-10-21: ThreadingHTTPServer 가 요청마다 스레드를 띄워 mps 위에서 predict 가 동시에 돌면
+    # Metal 'failed assertion _status < MTLCommandBufferStatusCommitted' 로 프로세스가 죽었다(동시 16요청 재현).
+    predict_lock = threading.Lock()
+    """한국어 재순위기(KURE-Reranker-nano, 149M). 후보 30개 질의당 약 0.25초(mps).
+    재순위 순위와 들어온 결합 순위를 RRF k=10 으로 섞는다 — 재순위 점수만 쓰면 정확한 복합명사 질의에서
+    결합 순위보다 떨어졌다(MRR .576→.520). 적재 전·실패 시 None(결합 순위 그대로)."""
+
+    def __init__(self):
+        self.model = None
+        self.error = None
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        try:
+            os.environ.setdefault('HF_HUB_OFFLINE', '1')
+            from sentence_transformers import CrossEncoder
+            import torch
+            device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+            self.model = CrossEncoder(RERANK_MODEL, device=device, max_length=512, local_files_only=True)
+        except Exception as exc:  # noqa: BLE001
+            self.error = str(exc)[:300]
+
+    def order(self, query, ids, texts):
+        if self.model is None or len(ids) < 2:
+            return None
+        with self.predict_lock:
+            scores = self.model.predict([(query, t) for t in texts], batch_size=16)
+        rank = {i: r for r, i in enumerate(sorted(range(len(ids)), key=lambda i: -float(scores[i])), 1)}
+        blended = [1 / (11 + i) + 1 / (10 + rank[i]) for i in range(len(ids))]   # ids 는 결합 순위대로 들어온다
+        return [ids[i] for i in sorted(range(len(ids)), key=lambda i: -blended[i])]
+
+
+def fuse(lexical, vector, lex_weight=LEX_WEIGHT):
+    """점수 결합(이론 최소 0 정규화). lexical·vector: [(id, 점수)] 높을수록 관련."""
+    def norm(pairs):
+        # 2026-10-21: 최소 0 정규화는 벡터 후보 30개가 모두 0.9 안팎이 돼 키워드에서만 잡힌 1~3위 기록이 30위 밖으로 밀렸다.
+        # 후보 안 최소~최대로 펴면 A/B 30과제 원본 top-5 16→22, 실사용 60턴 정답 재현율 .329→.305(-2건). SB_RECALLD_FUSE_NORM=zero 로 되돌린다.
+        if FUSE_NORM == 'zero':
+            top = max((s for _, s in pairs), default=0)
+            return {i: (s / top if top > 0 else 0.0) for i, s in pairs}
+        if not pairs:
+            return {}
+        lo, hi = min(s for _, s in pairs), max(s for _, s in pairs)
+        return {i: ((s - lo) / (hi - lo) if hi > lo else 1.0) for i, s in pairs}
+    ln, vn = norm(lexical), norm(vector)
+    score = {i: lex_weight * ln.get(i, 0.0) + (1 - lex_weight) * vn.get(i, 0.0) for i in set(ln) | set(vn)}
+    return sorted(score, key=lambda i: (-score[i], i))
+
+
 class Engine:
     def __init__(self):
         import sb_fts_ko
@@ -105,6 +238,8 @@ class Engine:
         self.last_sync = 0.0
         self.df, self.n_docs = {}, 1
         self.sync(force=True)
+        self.vectors = Vectors() if HYBRID else None
+        self.reranker = Reranker() if HYBRID and os.environ.get('SB_RECALLD_RERANK', '1') == '1' else None
 
     def sync(self, force=False):
         """force=True(기동 시)만 요청 전에 끝낸다. 평소에는 백그라운드 스레드 하나로 돌리고 즉시 돌아간다."""
@@ -164,22 +299,31 @@ class Engine:
         if not toks:
             return {'items': [], 'gate': {'matched': 0, 'coverage': 0.0, 'pass': False}, 'tokens': []}
         match = ' OR '.join('"' + t.replace('"', '""') + '"' for t in toks)
+        width = max(limit * 2, CANDIDATES) if HYBRID else limit * 2
         with closing(self.ko.open_index(create=False)) as conn:
-            rows = self._search(conn, match, project, limit * 2) if project else []
+            rows = self._search(conn, match, project, width) if project else []
             seen = {r[0] for r in rows}
-            rows += [r for r in self._search(conn, match, None, limit * 2) if r[0] not in seen]
-        meta = self._meta([r[0] for r in rows])
+            rows += [r for r in self._search(conn, match, None, width) if r[0] not in seen]
+        lexical = rows
+        ranked = self._hybrid(query, lexical) if HYBRID else None
+        if ranked:   # 보여줄 순서만 하이브리드 순서로 바꾸고, 판정은 아래에서 키워드 순서로 한다
+            by_id = {r[0]: r for r in lexical}
+            rows = [by_id.get(i, (i, 0.0, '', '')) for i in ranked]
+        meta = self._meta(list(dict.fromkeys([r[0] for r in rows] + [r[0] for r in lexical])))
         # 판정 전에 거른다: 방금(20분 내) 생긴 실시간 관찰은 '회상'이 아니라 진행 중인 작업이다.
         # 판정 뒤에 거르면 판정은 그 기록으로 통과하고 주입은 무관한 기록이 되는 불일치가 생긴다(DOE S9).
         cutoff = (time.time() - FRESH_MINUTES * 60) * 1000
-        rows = [r for r in rows if not (meta.get(r[0], {}).get('live') and meta[r[0]].get('epoch', 0) > cutoff)]
         dead = superseded_ids()   # 새 판으로 대체된 자동 메모리 옛 관측은 회수하지 않는다(2026-10-05)
-        rows = [r for r in rows if r[0] not in dead]
-        rows = rows[:limit]
+
+        def keep(r):
+            m = meta.get(r[0], {})
+            return not (m.get('live') and m.get('epoch', 0) > cutoff) and r[0] not in dead
+        rows = [r for r in rows if keep(r)][:limit]
+        judge = next((r for r in lexical if keep(r)), None)
         matched, cov, rare = 0, 0.0, 0
         counted = [t for t in toks if t not in TASK_WORDS]   # 판정은 주제 단어로만(검색에는 모두 씀)
-        if rows and counted:
-            body = set((rows[0][3] or '').lower().split())
+        if judge and counted:
+            body = set((judge[3] or '').lower().split())
             hit = [t for t in counted if t in body]
             matched = len(hit)
             rare = (sum(1 for t in hit if self.df.get(t, 0) / self.n_docs < RARE_DF)
@@ -192,6 +336,29 @@ class Engine:
             items.append({'id': oid, 'score': round(-score, 3), 'project': proj or m.get('project', ''),
                           'title': m.get('title', ''), 'date': m.get('date', '')})
         return {'items': items, 'gate': {'matched': matched, 'coverage': round(cov, 2), 'pass': gate}, 'tokens': toks}
+
+    def _hybrid(self, query, lexical):
+        """키워드 후보 + 벡터 후보 → 점수 결합 → 재순위 섞기. 벡터가 아직 없거나 실패하면 None(키워드 순서 유지)."""
+        vec = self.vectors.search(query, CANDIDATES) if self.vectors else None
+        if not vec:
+            return None
+        order = fuse([(r[0], -r[1]) for r in lexical[:CANDIDATES]], vec)[:CANDIDATES]
+        texts = self._texts(order)
+        ids = [i for i in order if i in texts]
+        try:
+            reordered = self.reranker.order(query, ids, [texts[i] for i in ids]) if self.reranker else None
+        except Exception:  # noqa: BLE001
+            reordered = None
+        return reordered or ids
+
+    @staticmethod
+    def _texts(ids):
+        if not ids:
+            return {}
+        con = sqlite3.connect('file:%s?mode=ro' % Path(os.environ.get('SB_CLAUDE_MEM_DB') or sb_config.claude_mem_db()).as_posix(), uri=True, timeout=2)
+        with closing(con):
+            q = 'SELECT id, title, subtitle, narrative FROM observations WHERE id IN (%s)' % ','.join('?' * len(ids))
+            return {r[0]: '\n'.join(x or '' for x in r[1:]) for r in con.execute(q, ids)}
 
     @staticmethod
     def _meta(ids):
@@ -254,7 +421,10 @@ def serve(port, idle_hours):
                 threading.Thread(target=httpd.shutdown, daemon=True).start()
                 return
             if url.path == '/health':
-                return self._send(200, {'ok': True, 'pid': os.getpid(), 'db': DB})
+                v, rr = getattr(engine, 'vectors', None), getattr(engine, 'reranker', None)
+                return self._send(200, {'ok': True, 'pid': os.getpid(), 'db': DB, 'hybrid': HYBRID,
+                                        'vectors': bool(v and v.col is not None), 'vectors_error': v and v.error,
+                                        'reranker': bool(rr and rr.model is not None), 'reranker_error': rr and rr.error})
             if url.path == '/recall':
                 try:
                     q = (qs.get('q') or [''])[0][:500]
