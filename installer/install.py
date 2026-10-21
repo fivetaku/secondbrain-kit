@@ -365,6 +365,24 @@ def _strip_ours(hooks: dict) -> dict:
     return out
 
 
+def claude_version() -> tuple:
+    """설치된 Claude Code 버전. 읽지 못하면 (0,) — 버전에 따라 걸러야 하는 훅은 등록하지 않는 쪽으로."""
+    exe = which('claude') or next((str(p) for p in (HOME / '.local/bin/claude', HOME / '.claude/local/claude') if p.exists()), None)
+    if not exe:
+        return (0,)
+    try:
+        out = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return (0,)
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', out or '')
+    return tuple(int(x) for x in m.groups()) if m else (0,)
+
+
+# PostToolUseFailure 는 2.1.119 에서 처음 문서에 나온다. 2.1.101 이전 Claude Code 는 모르는 훅 이벤트가 하나라도 있으면
+# settings.json 전체를 무시하므로(공식 CHANGELOG 2.1.101), 지원이 확인된 버전에서만 등록한다.
+MIN_CLAUDE_FOR_FAILURE_HOOK = (2, 1, 119)
+
+
 def _has_equivalent(hooks: dict, event: str, command: str) -> bool:
     """사용자가 키트 밖에 둔 같은 역할의 훅(예: 개인 폴더의 sb-recall.py)이 이미 있는가 — 있으면 중복 등록하지 않는다."""
     stem = Path(command.split()[-1].strip('"\'')).stem.replace('-', '_')
@@ -396,7 +414,11 @@ def claude_hooks(args) -> None:
     # 15초: 저사양 윈도우에서 프로세스 기동만 2~9초 걸려 8초면 결과가 버려졌다(2026-09-27)
     _add(hooks, 'UserPromptSubmit', None, py_cmd('hooks/sb_recall.py'), 15)
     # 도구 실패 시 같은 오류를 다룬 과거 기록 회수(세션 해시로 on/control 무작위 대조, 2026-10-21)
-    _add(hooks, 'PostToolUseFailure', None, py_cmd('hooks/sb_error_recall.py'), 8)
+    if claude_version() >= MIN_CLAUDE_FOR_FAILURE_HOOK:
+        _add(hooks, 'PostToolUseFailure', None, py_cmd('hooks/sb_error_recall.py'), 8)
+    else:
+        say('  건너뜀: 오류 회수 훅(PostToolUseFailure)은 Claude Code %s 이상에서만 등록'
+            % '.'.join(map(str, MIN_CLAUDE_FOR_FAILURE_HOOK)))
     gate = py_cmd('hooks/recall_gate.py')
     _add(hooks, 'PreToolUse', 'AskUserQuestion', gate, 5)
     # 회상 여부는 대화기록(transcript)으로 판정 — 도구 호출마다 뜨던 PostToolUse·Edit 훅은 등록하지 않는다

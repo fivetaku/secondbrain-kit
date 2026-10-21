@@ -54,7 +54,10 @@ def main():
         return
     os.makedirs(os.path.dirname(QUEUE), exist_ok=True)
     if os.path.exists(QUEUE) and os.path.getsize(QUEUE) > MAX_QUEUE_BYTES:
-        os.replace(QUEUE, QUEUE + ".1")
+        try:
+            os.replace(QUEUE, QUEUE + ".1")
+        except OSError:   # 윈도우: 다른 훅이 읽는 중이면 교체가 안 된다 — 다음에 다시 회전하고 이번 기록은 그대로 남긴다
+            pass
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "sid": ev.get("sid"), "cwd": ev.get("cwd"),
            "prompt_sha": hashlib.sha256(ev.get("prompt", "").strip().encode()).hexdigest()[:16],
            "rule": v["rule"].strip()[:300], "model": conf["model"]}
