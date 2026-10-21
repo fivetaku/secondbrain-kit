@@ -27,7 +27,15 @@ WORKER = os.environ.get("SB_RECALL_WORKER") or sb_config.worker_base_url()
 MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "5"))
 MAX_CHARS = 700
 MIN_PROMPT = 12
-STATE_DIR = os.path.join(tempfile.gettempdir(), "sb-recall")
+# 세션별 주입 원장. 2026-10-21: 임시 폴더는 재부팅마다 지워져 같은 세션에 같은 기록이 다시 주입됐다 → SB_HOME 아래 영속 경로.
+STATE_DIR = os.environ.get("SB_RECALL_STATE_DIR") or sb_config.sb_path("index", "sb-recall-state")
+STATE_TTL_DAYS = 30
+# 세션 중 교정 감지(선택): 교정처럼 보이는 발화만 hooks/sb_correction.py 가 LLM 으로 판정해 후보 대기열에 쌓고,
+# 같은 세션의 다음 프롬프트에 한 번 알린다. LLM 설정(SB_CORRECTION_LLM_URL 또는 index/correction_llm.json)이 없으면 꺼진 것과 같다.
+CORRECTION = re.compile(r"(아니[ 야라고]|그게 아니|틀렸|잘못|하지 ?마|하지말|말고|다시 해|왜 이렇게|그렇게 하지|내가 말한|말했잖|몇 번|또 이러|이러지 마|금지|앞으로는|항상 |절대 )")
+CORRECTION_QUEUE = os.environ.get("SB_CORRECTION_QUEUE") or sb_config.sb_path("index", "correction_candidates.jsonl")
+FAIL_NOTICE = ("[세컨브레인 회수 실패] 회수 서버(recalld·worker)가 응답하지 않거나 제때 답하지 못해 관련 기록을 확인하지 못했다. "
+               "'관련 기록 없음'이 아니다. 과거 맥락이 필요하면 `sb search`로 직접 검색한다.")
 # 추가로 건너뛸 프롬프트 접두어(자동화 루프 등). 예: SB_RECALL_SKIP_PREFIXES="[fablize,/loop"
 SKIP_PREFIXES = tuple(x for x in os.environ.get("SB_RECALL_SKIP_PREFIXES", "").split(",") if x)
 SHORT_CMDS = re.compile(r"^(ㄱ+|ㄴ+|ㅇ+|ok|okay|yes|no|응|네|아니|계속|진행|진행해|진행시켜라?|해줘|해|고고|다시|취소|중단|멈춰|스톱|stop|continue|go)[.!~ ]*$", re.I)
@@ -281,17 +289,108 @@ def hashlib_sid(sid: str) -> str:
     return hashlib.sha256(sid.encode()).hexdigest()[:12]
 
 
+def prompt_hash(p: str) -> str:
+    import hashlib
+    return hashlib.sha256(p.strip().encode("utf-8")).hexdigest()[:16]
+
+
+class _Locked:
+    """세션 원장 파일 하나에 대한 잠금 — 동시 훅 실행이 원장을 덮어쓰지 않게."""
+
+    def __init__(self, path: str):
+        self.path = path + ".lock"
+        self.f = None
+
+    def __enter__(self):
+        import sb_lock
+        self.f = open(self.path, "a")
+        sb_lock.lock_with_timeout(self.f, sb_lock.LOCK_EX, 3)
+        return self
+
+    def __exit__(self, *exc):
+        import sb_lock
+        if self.f:
+            sb_lock.lock(self.f, sb_lock.LOCK_UN)
+            self.f.close()
+        return False
+
+
+def spawn_correction_check(sid: str, prompt: str, cwd: str) -> None:
+    if os.environ.get("SB_CORRECTION", "1") == "0" or not CORRECTION.search(prompt):
+        return
+    import subprocess
+    script = str(Path(__file__).resolve().parent / "sb_correction.py")
+    try:
+        flags = {"start_new_session": True} if os.name != "nt" else {"creationflags": 0x00000008 | 0x00000200}
+        p = subprocess.Popen([sys.executable, script], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, **flags)
+        if p.stdin:
+            p.stdin.write(json.dumps({"sid": sid, "prompt": prompt[:800], "cwd": cwd}, ensure_ascii=False).encode("utf-8"))
+            p.stdin.close()
+    except Exception:
+        pass
+
+
+def pending_corrections(sid: str, notified: set):
+    out = []
+    try:
+        with open(CORRECTION_QUEUE, "rb") as fb:
+            fb.seek(0, os.SEEK_END)
+            fb.seek(max(0, fb.tell() - 262144))
+            tail = fb.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in tail:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        key = r.get("ts", "") + "|" + r.get("rule", "")[:40]
+        if r.get("sid") == sid and key not in notified:
+            out.append((key, r.get("rule", "")))
+    return out
+
+
+def correction_note(sid: str, prompt: str, cwd: str) -> str:
+    """교정 판정 작업을 프롬프트당 한 번 띄우고, 이 세션에 쌓인 미통지 후보를 최대 3건 알린다(보여 준 것만 통지 완료)."""
+    path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".corr.json")
+    note = ""
+    try:
+        with _Locked(path):
+            try:
+                cst = json.load(open(path, encoding="utf-8"))
+            except Exception:
+                cst = {"notified": [], "checked": []}
+            ph = prompt_hash(prompt)
+            p = prompt.strip()
+            if p and not p.startswith(("/", "<")) and ph not in cst["checked"]:
+                cst["checked"] = (cst["checked"] + [ph])[-200:]
+                spawn_correction_check(sid, p, cwd)
+            shown = pending_corrections(sid, set(cst["notified"]))[:3]
+            if shown:
+                note = ("[교정 감지] 이 세션의 사용자 교정이 지속 규칙으로 보인다. 맞으면 지금 규칙·메모리에 저장하고, 아니면 무시한다.\n"
+                        + "\n".join("- " + rule for _, rule in shown))
+                cst["notified"] = cst["notified"] + [k for k, _ in shown]
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(cst, fh)
+    except Exception:
+        pass
+    return note
+
+
+def emit(ctx: str) -> None:
+    if ctx:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))  # ASCII 이스케이프(윈도우 인코딩)
+
+
 def main():
     try:
         raw = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return
     prompt = str(raw.get("prompt") or "")
-    if not gate(prompt):
-        return
-    if "codex" in sys.argv[1:]:   # Codex: exec 자동화 세션에는 주입하지 않는다
+    if "codex" in sys.argv[1:]:   # Codex: exec 자동화 세션에는 주입·교정 판정을 하지 않는다
         try:
-            from pathlib import Path
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from codex_hook import is_automation
             if is_automation(raw):
@@ -299,12 +398,17 @@ def main():
         except Exception:
             pass
     sid = str(raw.get("session_id") or "nosession")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    internal = os.environ.get("CLAUDE_MEM_INTERNAL") == "1" or os.environ.get("SB_RECALL", "1") == "0"
+    corr = "" if internal else correction_note(sid, prompt, str(raw.get("cwd") or ""))
+    if not gate(prompt):
+        emit(corr)
+        return
     # claude-mem 의 project 는 cwd 폴더 이름이다(sb_scope id 와 다른 이름공간 — 의도된 분리).
     project = os.path.basename(os.path.normpath(str(raw.get("cwd") or ""))) if raw.get("cwd") else ""
-    os.makedirs(STATE_DIR, exist_ok=True)
     state_path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".json")
-    if not os.path.exists(state_path):   # 새 세션일 때만: 7일 지난 세션 상태 파일 정리
-        cutoff = time.time() - 7 * 86400
+    if not os.path.exists(state_path):   # 새 세션일 때만: 오래된 세션 상태 파일 정리
+        cutoff = time.time() - STATE_TTL_DAYS * 86400
         for name in os.listdir(STATE_DIR):
             fp = os.path.join(STATE_DIR, name)
             try:
@@ -312,11 +416,27 @@ def main():
                     os.remove(fp)
             except OSError:
                 pass
+    lk = _Locked(state_path)
     try:
-        st = json.load(open(state_path, encoding="utf-8")); seen = set(st.get("ids", [])); last = st.get("last_prompt", "")
+        lk.__enter__()
+    except Exception:
+        lk = None
+    try:
+        _main_locked(raw, prompt, sid, project, state_path, corr)
+    finally:
+        if lk:
+            lk.__exit__()
+
+
+def _main_locked(raw, prompt, sid, project, state_path, corr):
+    ph = prompt_hash(prompt)
+    try:
+        st = json.load(open(state_path, encoding="utf-8")); seen = set(st.get("ids", []))
+        last = st.get("last_prompt_sha") or (prompt_hash(st["last_prompt"]) if st.get("last_prompt") else "")
     except Exception:
         seen, last = set(), ""
-    if prompt.strip() == last:      # identical re-submission → nothing new to add
+    if ph == last:      # identical re-submission → nothing new to add
+        emit(corr)
         return
     t0 = time.time()
     items = None
@@ -327,14 +447,20 @@ def main():
     if items is None:          # 서버가 아직 안 떴으면 이번만 워커로(서버는 백그라운드로 띄워 둔다)
         try:
             items = search(prompt, project)
-        except Exception:
-            items = []
+        except Exception as exc:
+            # 두 백엔드 모두 실패 — '관련 기록 없음'과 구분되게 알리고 기록한다(프롬프트는 남기지 않음).
+            recall_log({"sid": hashlib_sid(sid), "project": project, "failed": type(exc).__name__,
+                        "ms": int((time.time() - t0) * 1000)})
+            sys.stderr.write(f"sb-recall: recall unavailable ({type(exc).__name__})\n")
+            emit("\n\n".join(x for x in (corr, FAIL_NOTICE) if x))
+            return
     items = refine(enrich(items, sid), prompt, project)
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
     hint = TIME_HINT if is_history_question(prompt) else ""
     recall_log({"sid": hashlib_sid(sid), "project": project, "ids": [it["id"] for it in fresh],
                 "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000)})
     if not fresh and not hint:
+        emit(corr)
         return
     lines = [f"- #{it['id']} {it['date']} {it.get('project','')[:18]} · {it['title'][:70]}" for it in fresh]
     bodies = _bodies([it["id"] for it in fresh[:BODIES]]) if BODIES > 0 else {}
@@ -348,8 +474,11 @@ def main():
            + ". 실제로 관련 있으면 get_observations([ID])로 본문을 가져오고, 아니면 무시한다.\n" + body) if fresh else ""
     if hint:
         ctx = (ctx + "\n" + hint).strip()
+    if corr:
+        ctx = corr + "\n\n" + ctx
     try:
-        json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt": prompt.strip(), "updated": time.time()}, open(state_path, "w", encoding="utf-8"))
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt_sha": ph, "updated": time.time()}, fh)
     except Exception:
         pass
     # recall_gate 의 Stop 게이트 기준 시각 — 기간·이력 질문에만 건다(회수 목록만 붙은 프롬프트는 제외: 매 답변 되돌림 방지)
@@ -363,7 +492,7 @@ def main():
             pass
     if os.environ.get("SB_RECALL_DEBUG") == "1":
         sys.stderr.write(f"sb-recall: {len(fresh)} items in {time.time()-t0:.2f}s\n")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))  # ASCII 이스케이프(윈도우 인코딩)
+    emit(ctx)
 
 
 if __name__ == "__main__":

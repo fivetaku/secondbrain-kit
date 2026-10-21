@@ -341,7 +341,8 @@ def merge_claude_mem_settings(args) -> None:
 
 
 # ── 6·7 훅 ──────────────────────────────────────────────────────────
-OUR_HOOK_SCRIPTS = ('hooks/session_context.py', 'hooks/sb_recall.py', 'hooks/recall_gate.py', 'hooks/codex_hook.py')
+OUR_HOOK_SCRIPTS = ('hooks/session_context.py', 'hooks/sb_recall.py', 'hooks/recall_gate.py', 'hooks/codex_hook.py',
+                    'hooks/sb_error_recall.py')
 
 
 def _is_ours(command: str) -> bool:
@@ -364,7 +365,21 @@ def _strip_ours(hooks: dict) -> dict:
     return out
 
 
+def _has_equivalent(hooks: dict, event: str, command: str) -> bool:
+    """사용자가 키트 밖에 둔 같은 역할의 훅(예: 개인 폴더의 sb-recall.py)이 이미 있는가 — 있으면 중복 등록하지 않는다."""
+    stem = Path(command.split()[-1].strip('"\'')).stem.replace('-', '_')
+    for g in hooks.get(event, []):
+        for h in g.get('hooks', []):
+            c = posix(h.get('command', ''))
+            if not _is_ours(c) and re.search(r'[\\/]' + re.escape(stem).replace('_', '[-_]') + r'\.py\b', c):
+                return True
+    return False
+
+
 def _add(hooks: dict, event: str, matcher, command: str, timeout: int) -> None:
+    if _has_equivalent(hooks, event, command):
+        say(f'  건너뜀: {event} 에 같은 역할의 사용자 훅이 이미 있음')
+        return
     group = {'hooks': [{'type': 'command', 'command': command, 'timeout': timeout}]}
     if matcher is not None:
         group['matcher'] = matcher
@@ -380,6 +395,8 @@ def claude_hooks(args) -> None:
          py_cmd('hooks/session_context.py', '--harness', 'claude'), 15)
     # 15초: 저사양 윈도우에서 프로세스 기동만 2~9초 걸려 8초면 결과가 버려졌다(2026-09-27)
     _add(hooks, 'UserPromptSubmit', None, py_cmd('hooks/sb_recall.py'), 15)
+    # 도구 실패 시 같은 오류를 다룬 과거 기록 회수(세션 해시로 on/control 무작위 대조, 2026-10-21)
+    _add(hooks, 'PostToolUseFailure', None, py_cmd('hooks/sb_error_recall.py'), 8)
     gate = py_cmd('hooks/recall_gate.py')
     _add(hooks, 'PreToolUse', 'AskUserQuestion', gate, 5)
     # 회상 여부는 대화기록(transcript)으로 판정 — 도구 호출마다 뜨던 PostToolUse·Edit 훅은 등록하지 않는다
