@@ -24,7 +24,9 @@ for _s in (sys.stdin, sys.stdout):
         pass
 
 WORKER = os.environ.get("SB_RECALL_WORKER") or sb_config.worker_base_url()
-MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "5"))
+MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "3"))   # 2026-10-31: 5→3. 실제 프롬프트 40개 블라인드 평가에서 잡음 -39, 쓸모 있는 기록을 받은 프롬프트 수는 그대로
+FETCH = int(os.environ.get("SB_RECALL_FETCH", "10"))    # 자기 세션·20분 내 기록을 거른 뒤에도 MAX_ITEMS 를 채우려고 넉넉히 받는다
+LAST = {}   # 마지막 recalld 응답의 후보 순서·게이트 — 회수 방식 비교의 운영 기준선으로 남긴다
 MAX_CHARS = 700
 MIN_PROMPT = 12
 # 세션별 주입 원장. 2026-10-21: 임시 폴더는 재부팅마다 지워져 같은 세션에 같은 기록이 다시 주입됐다 → SB_HOME 아래 영속 경로.
@@ -184,7 +186,7 @@ def recalld_search(prompt: str, project: str):
     try:
         import sb_recalld
         url = sb_recalld.base_url() + "/recall?" + urllib.parse.urlencode(
-            {"q": prompt[:500], "project": project, "limit": str(MAX_ITEMS)})
+            {"q": prompt[:500], "project": project, "limit": str(FETCH)})
         with urllib.request.urlopen(url, timeout=recalld_timeout()) as r:
             d = json.loads(r.read().decode("utf-8"))
     except Exception:
@@ -196,6 +198,7 @@ def recalld_search(prompt: str, project: str):
         return None
     if d.get("db") and d["db"] != sb_recalld.db_path():   # 다른 DB 를 보는 서버(테스트 등) — 쓰지 않는다
         return None
+    LAST.update(gate=d.get("gate"), cand=[it["id"] for it in d.get("items", [])])
     if not (d.get("gate") or {}).get("pass"):
         return []
     return [{"id": it["id"], "date": it.get("date", ""), "kind": "", "title": it.get("title", ""),
@@ -480,7 +483,9 @@ def _main_locked(raw, prompt, sid, project, state_path, corr):
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
     hint = TIME_HINT if is_history_question(prompt) else ""
     recall_log({"sid": hashlib_sid(sid), "project": project, "ids": [it["id"] for it in fresh],
-                "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000)})
+                "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000),
+                "prompt_sha": hashlib_sid(prompt.strip()), "cand": LAST.get("cand", []), "gate": LAST.get("gate"),
+                "kept": [it["id"] for it in items], "max": MAX_ITEMS})
     if not fresh and not hint:
         emit(corr)
         return
