@@ -11,17 +11,87 @@
 import argparse
 import json
 import os
+import re
+import sqlite3
 import sys
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sb_config  # noqa: E402
 import sb_search  # noqa: E402  (_next_items / _mode_envelope 재사용)
 import sb_state  # noqa: E402
 
 DEFAULT_CHARS, DEFAULT_BYTES = 2000, 8192
 MAX_TRACKS, MAX_STATES = 3, 4
 PRIORITY = {'high': 0, 'medium': 1, 'low': 2}
+# 2026-10-31 재확인 주기(일). 데이터로 정한 값이 아니라 초기 기본값이다(_drafts/2026-10-30-optimal-methods.md 4절).
+REVIEW_DAYS = (('deal.', 21), ('lead.', 21), ('ledger.', 21), ('bug.', 21), ('deadline.', 21), ('refund.', 21),
+               ('tooling.', 45), ('kit.', 45))
+DEFAULT_REVIEW_DAYS = 90
+REVIEW_PER_BRIEFING = 2
+LOOP_ID = re.compile(r'\bL[0-9a-f]{7,8}\b')
+
+
+def _review_days(fact_key: str) -> int:
+    return next((d for p, d in REVIEW_DAYS if fact_key.startswith(p)), DEFAULT_REVIEW_DAYS)
+
+
+def _age_days(ts: Optional[str], today: date) -> Optional[int]:
+    try:
+        return (today - datetime.fromisoformat(str(ts).replace('Z', '+00:00')).date()).days
+    except (TypeError, ValueError):
+        return None
+
+
+def _provenance(items: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """사용자 확인 사실의 값(value)과 근거 발화가 사람 입력인지. 읽기 전용, 실패하면 빈 결과.
+    근거 프롬프트가 '<'로 시작하면(agent-message·cross-session·paseo-system) 사람이 친 말이 아니라 전달문이다."""
+    out: Dict[int, Dict[str, Any]] = {}
+    ids = [it['item_id'] for it in items if it.get('label') == 'user-confirmed' and it.get('item_id')]
+    if not ids:
+        return out
+    try:
+        st = sqlite3.connect('file:%s?mode=ro' % sb_state.state_db_path(None), uri=True, timeout=1)
+        rows = st.execute('SELECT a.state_id, c.value_json, v.target FROM state_acceptance a '
+                          'JOIN state_candidate c ON c.id = a.candidate_id JOIN state_verification v ON v.id = a.verification_id '
+                          'WHERE a.state_id IN (%s)' % ','.join('?' * len(ids)), ids).fetchall()
+        st.close()
+        cm_path = os.path.expanduser(os.environ.get('SB_CLAUDE_MEM_DB') or sb_config.claude_mem_db())
+        cm = sqlite3.connect('file:%s?mode=ro' % cm_path, uri=True, timeout=1) if os.path.exists(cm_path) else None
+        for sid, value_json, target in rows:
+            try:
+                value = json.loads(value_json) if value_json else None
+            except ValueError:
+                value = value_json
+            relay = False
+            if cm is not None and str(target).startswith('prompt:') and str(target)[7:].isdigit():
+                r = cm.execute('SELECT prompt_text FROM user_prompts WHERE id=?', (int(str(target)[7:]),)).fetchone()
+                head = (r[0] or '').lstrip()[:300] if r else ''
+                relay = head.startswith('<') or 'agent-message' in head or 'cross-session-message' in head
+            out[sid] = {'value': value if isinstance(value, str) else None, 'relay': relay}
+        if cm is not None:
+            cm.close()
+    except Exception:  # noqa: BLE001 — 표시 보강일 뿐, 실패해도 브리핑은 그대로 낸다
+        return {}
+    return out
+
+
+def _closed_loops() -> Dict[str, str]:
+    path = os.path.expanduser(os.environ.get('SB_LOOPS_PATH') or sb_config.sb_path('loops', 'loops.jsonl'))
+    out: Dict[str, str] = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get('id') and r.get('status') and r['status'] != 'open':
+                    out[r['id']] = r['status']
+    except OSError:
+        pass
+    return out
 
 
 def _today() -> date:
@@ -41,9 +111,31 @@ def collect(scope_id: str) -> Dict[str, Any]:
     tracks = nxt['items']
     today = _today()
     cautions: List[Dict[str, str]] = []
+    prov = _provenance(state['items'])
+    closed = _closed_loops()
+    review: List[Any] = []
     for it in state['items']:
         if it['verification_status'] != 'verified':
             cautions.append({'code': 'unverified_state', 'ref': it['fact_key'], 'text': '미검증 상태: %s' % it['fact_key']})
+        p = prov.get(it.get('item_id'))
+        if p:
+            it['user_value'], it['relay'] = p['value'], p['relay']
+        age = _age_days(it.get('checked_at'), today)
+        it['age_days'] = age
+        # 낡은 사실은 지우지 않는다 — 재확인 후보로만 올리고, 사용자에게 아직 맞는지 묻게 한다(2026-10-31)
+        gone = [l for l in LOOP_ID.findall(str(it.get('body') or '')) if l in closed]
+        if gone:
+            review.append((0, 0, {'code': 'state_loop_closed', 'ref': it['fact_key'],
+                                  'text': '재확인 후보: %s (연결된 미결 %s 닫힘) — 사용자에게 아직 맞는지 확인' % (it['fact_key'], gone[0])}))
+        elif age is not None and age > _review_days(it['fact_key']):
+            review.append((1, -age, {'code': 'state_review_due', 'ref': it['fact_key'],
+                                     'text': '재확인 후보: %s (%d일 전 확인) — 사용자에게 아직 맞는지 확인' % (it['fact_key'], age)}))
+    # 질문이 많으면 무시하게 된다 — 한 번에 두 건만 묻고 나머지는 수만 알린다
+    review.sort(key=lambda r: (r[0], r[1]))
+    cautions += [r[2] for r in review[:REVIEW_PER_BRIEFING]]
+    if len(review) > REVIEW_PER_BRIEFING:
+        cautions.append({'code': 'state_review_more', 'ref': 'state',
+                         'text': '재확인 후보 %d건 더(한 번에 %d건씩)' % (len(review) - REVIEW_PER_BRIEFING, REVIEW_PER_BRIEFING)})
     for t in tracks:
         if not t.get('next_action'):
             cautions.append({'code': 'missing_next_action', 'ref': t['loop_id'], 'text': '다음 행동 없음: %s' % t['loop_id']})
@@ -74,9 +166,17 @@ def render(b: Dict[str, Any], max_tracks: int = MAX_TRACKS, max_states: int = MA
         lines.append('상태(채택) %d건:' % len(st['items']))
         for it in shown:
             mark = '' if it['verification_status'] == 'verified' else ' ⚠ 미검증'
-            label = ' · %s' % it['label'] if it.get('label') else ''
-            when = ' · 확인 %s' % it['checked_at'][:10] if it.get('checked_at') else ''
-            lines.append('  · %s = %s%s%s%s' % (it['fact_key'], str(it['body']).replace('\n', ' ')[:80], label, when, mark))
+            age = it.get('age_days')
+            when = (' · 확인 %d일 전' % age if age is not None else ' · 확인 %s' % it['checked_at'][:10]) if it.get('checked_at') else ''
+            body = str(it['body']).replace('\n', ' ')
+            if it.get('label') == 'user-confirmed' and it.get('user_value'):
+                # '사용자 확인'은 사용자가 말한 값에만 붙인다. 본문은 에이전트가 정리한 맥락이라 따로 표시한다(2026-10-31).
+                who = '전달문 근거·사람 발화 미확인' if it.get('relay') else '사용자 확인'
+                lines.append('  · %s = 「%s」 (%s%s)%s' % (it['fact_key'], str(it['user_value']).replace('\n', ' ')[:50], who, when, mark))
+                lines.append('    에이전트 정리: %s' % body[:60])
+            else:
+                label = ' · %s' % it['label'] if it.get('label') else ''
+                lines.append('  · %s = %s%s%s%s' % (it['fact_key'], body[:80], label, when, mark))
     elif st['status'] == 'empty':
         lines.append('상태(채택): 없음')
     else:
