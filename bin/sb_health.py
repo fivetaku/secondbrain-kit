@@ -3,7 +3,8 @@
 
   sb health                 점검 결과(사람용). 문제 없으면 한 줄
   sb health --json          JSON
-  sb health --fix           고칠 수 있는 것은 고친다(워커·Ollama 기동, 밀린 메모리 동기화, 놓친 야간 배치)
+  sb health --fix           고칠 수 있는 것은 고친다(워커·Ollama 기동, 밀린 메모리 동기화, 놓친 야간 배치,
+                            벡터 미반영 백필용 워커 재시작 — 하루 1회)
   sb health ensure          워커·Ollama만 띄운다(야간 배치 첫 단계)
 
 점검 항목
@@ -14,6 +15,8 @@
   vector      벡터 색인에 빠진 관측 수 (SQLite 대비)
   ko-index    한국어 형태소 색인 지연
   spool       claude-mem 훅 대기열 정체·만료(만료 = 세션 기록 유실)
+  chroma-pending  워커가 Chroma 에 아직 못 넣은 대기분(chroma-sync-state.json pending 합계)
+  chroma-log      워커 로그의 최근 6시간 Chroma 장애 줄(차단기 열림·prewarm 실패·조회 실패·추가 실패·Ollama 연결 실패)
   decisions   상태층 마지막 채택 이후 쌓인 [결정] 저장 수
 
 결과는 SB_HOME/logs/health.json 에 남는다. 세션 시작 훅(session_context.py)이 경고 줄을 브리핑에 붙이고,
@@ -22,6 +25,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -29,19 +33,31 @@ import sys
 import time
 import urllib.request
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 BIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN))
 import sb_config  # noqa: E402
+import sb_lock  # noqa: E402
 
 OLLAMA_URL = os.environ.get('SB_OLLAMA_URL', 'http://127.0.0.1:11434')
 VECTOR_WARN = int(os.environ.get('SB_HEALTH_VECTOR_WARN', '30'))     # 이 수를 넘게 빠지면 경고
 KO_WARN = int(os.environ.get('SB_HEALTH_KO_WARN', '50'))
 NIGHTLY_MAX_AGE_DAYS = int(os.environ.get('SB_HEALTH_NIGHTLY_DAYS', '1'))
 DECISION_WARN = int(os.environ.get('SB_HEALTH_DECISION_WARN', '3'))
+PENDING_WARN = int(os.environ.get('SB_HEALTH_PENDING_WARN', '200'))
+CHROMA_LOG_WARN = int(os.environ.get('SB_HEALTH_CHROMA_LOG_WARN', '20'))
+CHROMA_LOG_HOURS = 6
+# 워커 로그 줄 형식: [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [TAG   ] … — chroma·워커 태그의 경고·오류 줄만 센다.
+# 훅 줄([HOOK  ])에는 실행한 명령 문자열이 그대로 찍혀, 명령에 아래 문구가 들어 있으면 오탐이 난다.
+CHROMA_LOG_TAG = re.compile(r'^\[[^\]]+\] \[(?:WARN |ERROR)\] \[(?:CHROMA_MCP|CHROMA_SYNC|WORKER)\s*\]')
+# 'Batch add failed'·'Failed to connect to Ollama': 임베딩 서버(Ollama)가 꺼지면 워커가 저장할 때마다 이 줄을 남긴다
+# (claude-mem 13.34 실측: '[ERROR] [CHROMA_SYNC] Batch add failed — … Failed to connect to Ollama. …'). 2026-10 운영 PC 에서
+# Ollama 가 사흘 꺼져 하루 수백 줄 쌓였는데 위 네 문구로는 0건이었다.
+CHROMA_LOG_PATTERNS = ('circuit breaker open', 'prewarm failed', 'Chroma search failed',
+                       'Chroma unavailable before write', 'Batch add failed', 'Failed to connect to Ollama')
 
 
 def _get(url: str, timeout: float = 2.0) -> Optional[int]:
@@ -116,6 +132,71 @@ def ensure_worker(wait: float = 30.0) -> bool:
         except Exception:  # noqa: BLE001
             return False
     return _wait_worker(wait)
+
+
+def worker_pid() -> Optional[int]:
+    """워커 /api/health 응답의 pid. 응답이 없거나 pid 를 못 읽으면 None."""
+    try:
+        with urllib.request.urlopen(sb_config.worker_base_url() + '/api/health', timeout=2.0) as r:
+            pid = json.loads(r.read().decode('utf-8')).get('pid')
+    except Exception:  # noqa: BLE001
+        return None
+    return pid if isinstance(pid, int) else None
+
+
+# claude-mem 재시작 경로 확인(2026-10-30, worker-service.cjs grep): 설치기 기본 고정판 13.24.23(npm 패키지
+# claude-mem@13.24.23 의 plugin/scripts — 로컬 플러그인 캐시의 13.24.23 은 고아 표시에 scripts 가 없어 패키지로 확인)과
+# 13.34.2 모두 ① 'restart' 명령(case"restart")이 있고 ② 워커 기동 직후 backfillAllProjects(getSessionStore()) 를
+# 부르며 ③ /api/health 가 pid:process.pid 를 돌려준다. 두 버전 모두 restart 명령이 포트가 안 풀리면
+# 'nothing spawned' 로 끝날 수 있다 — 그래서 성공은 pid 가 바뀌었는지로만 판정한다.
+def restart_worker(wait: float = 60.0) -> str:
+    """떠 있는 워커를 claude-mem 자체 restart 명령으로 다시 띄운다. 자동 기동 끔·테스트 환경(SB_MEM_BASE_URL)이면 안 한다.
+    결과: 'ok'(재시작 전후 pid 가 다름 — 새 워커라 기동 백필이 돈다), 'noop'(응답은 하지만 pid 그대로 —
+    restart 가 아무것도 안 했다), 'fail'(안 했거나 워커가 안 뜸)."""
+    if os.environ.get('SB_WORKER_AUTOSTART', '1') == '0' or os.environ.get('SB_MEM_BASE_URL'):
+        return 'fail'
+    root, node = plugin_root(), shutil.which('node')
+    if not root or not node:
+        return 'fail'
+    before = worker_pid()
+    runner = root / 'scripts' / 'bun-runner.js'
+    cmd = [node] + ([str(runner)] if runner.is_file() else []) + [str(root / 'scripts' / 'worker-service.cjs'), 'restart']
+    try:
+        subprocess.run(cmd, timeout=120, **{k: v for k, v in _detached().items() if k != 'close_fds'})
+    except Exception:  # noqa: BLE001
+        pass
+    # restart 가 새 워커를 못 띄웠으면(Windows 의 느린 기동 등) 기동 경로(대체 데몬 포함)로 마저 띄운다.
+    if not (_wait_worker(min(wait, 25.0)) or ensure_worker(wait)):
+        return 'fail'
+    after = worker_pid()
+    return 'ok' if after is not None and after != before else 'noop'
+
+
+def restart_for_backfill() -> str:
+    """벡터 백필용 워커 재시작, 하루 1회. 재시작 전에 오늘 날짜를 먼저 적어 두어 재시작이 실패하거나
+    세션 여러 개가 동시에 --fix 를 띄워도 같은 날 다시 재시작하지 않는다(잠금으로 확인·기록을 한 번에)."""
+    state = Path(sb_config.sb_path('logs', 'worker-restart.json'))
+    today = date.today().isoformat()
+    state.parent.mkdir(parents=True, exist_ok=True)
+    with state.with_name(state.name + '.lock').open('a') as lock:
+        try:
+            sb_lock.lock_with_timeout(lock, sb_lock.LOCK_EX, 5)
+        except TimeoutError:
+            return 'busy'
+        try:
+            last = json.loads(state.read_text(encoding='utf-8')).get('date')
+        except (OSError, ValueError, AttributeError):
+            last = None
+        if last == today:
+            return 'cooldown'
+        record = {'date': today, 'at': datetime.now().isoformat(timespec='seconds')}
+        state.write_text(json.dumps(record), encoding='utf-8')
+    result = restart_worker()
+    try:   # 같은 날 다른 실행은 위에서 cooldown 으로 끝나므로 결과만 덧붙인다
+        state.write_text(json.dumps({**record, 'result': result}), encoding='utf-8')
+    except OSError:
+        pass
+    return result
 
 
 def _wait_worker(wait: float) -> bool:
@@ -255,7 +336,7 @@ def check_vector(max_obs_ids) -> Dict[str, Any]:
     missing = [i for i in max_obs_ids if i not in have]
     ok = len(missing) <= VECTOR_WARN
     return {'ok': ok, 'missing': len(missing), 'max_vector_id': max(have) if have else 0,
-            'msg': '' if ok else '벡터 미반영 {}건'.format(len(missing)),
+            'msg': '' if ok else '벡터 미반영 {}건(워커 재시작 때 백필)'.format(len(missing)),
             'fix': None if ok else ('ollama' if uses_ollama() else 'worker')}
 
 
@@ -286,6 +367,55 @@ def check_spool(prev: Dict[str, Any]) -> Dict[str, Any]:
         msg.append('세션 기록 만료(유실) {}건'.format(new_exp))
     return {'ok': not msg, 'stuck': len(stuck), 'expired': expired, 'new_expired': new_exp,
             'msg': ' · '.join(msg), 'fix': 'worker' if stuck else None}
+
+
+def check_chroma_pending() -> Dict[str, Any]:
+    """워커가 Chroma 에 아직 못 넣은 대기분 합계(chroma-sync-state.json 의 프로젝트별 pending).
+    2026-10-12 chroma-mcp 기동 실패로 벡터 동기화가 4시간 넘게 아무 알림 없이 멈췄다(워커 차단기가 조용히 재시도를 미룸).
+    대기분은 원인을 없앤 뒤 워커를 재시작할 때만 백필된다 — 떠 있는 워커를 띄우는 복구로는 안 풀려 fix 는 None."""
+    path = sb_config.claude_mem_dir() / 'chroma-sync-state.json'
+    if not path.is_file():
+        return {'ok': True, 'msg': '', 'skipped': 'no sync state'}
+    try:
+        state = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        return {'ok': False, 'msg': 'Chroma 동기화 상태 판독 실패: {}'.format(e)[:120], 'fix': None}
+    kinds: Dict[str, int] = {}
+    for value in state.values() if isinstance(state, dict) else []:
+        pending = value.get('pending') if isinstance(value, dict) else None
+        for kind, rows in pending.items() if isinstance(pending, dict) else []:
+            kinds[kind] = kinds.get(kind, 0) + (len(rows) if isinstance(rows, list) else 0)
+    n = sum(kinds.values())
+    ok = n < PENDING_WARN
+    return {'ok': ok, 'pending': n, 'kinds': kinds,
+            'msg': '' if ok else 'Chroma 대기 {}건 — 원인 해소 후 워커 재시작으로 백필'.format(n), 'fix': None}
+
+
+def check_chroma_log(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """claude-mem 워커 로그(어제·오늘)의 Chroma 장애 줄 수. 등급은 최근 CHROMA_LOG_HOURS 시간 안의 줄로만 매긴다 —
+    이미 끝난 장애가 세션 시작마다 이틀 내내 경고로 뜨지 않게 하고, 이틀 총계는 참고값(total_2d)으로 남긴다.
+    워커·Chroma 쪽 원인(의존성·디스크 등)은 여기서 고칠 수 없어 fix 는 None."""
+    logs = sb_config.claude_mem_dir() / 'logs'
+    if not logs.is_dir():
+        return {'ok': True, 'msg': '', 'skipped': 'no logs'}
+    now = now or datetime.now()   # 로그 시각은 워커가 찍은 현지 시각이다
+    cutoff = (now - timedelta(hours=CHROMA_LOG_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
+    total, recent, last = 0, 0, ''
+    for day in (now.date() - timedelta(days=1), now.date()):
+        try:
+            with (logs / 'claude-mem-{}.log'.format(day.isoformat())).open(encoding='utf-8', errors='replace') as f:
+                for raw in f:
+                    if CHROMA_LOG_TAG.match(raw) and any(p in raw for p in CHROMA_LOG_PATTERNS):
+                        total += 1
+                        last = raw[1:20]
+                        recent += last >= cutoff
+        except OSError:
+            continue
+    ok = recent < CHROMA_LOG_WARN
+    return {'ok': ok, 'recent': recent, 'hours': CHROMA_LOG_HOURS, 'total_2d': total, 'last': last or None,
+            'msg': '' if ok else 'claude-mem 워커 Chroma 장애 줄 최근 {}시간 {}건(마지막 {}) — 벡터 저장·검색 멈춤 의심'.format(
+                CHROMA_LOG_HOURS, recent, last),
+            'fix': None}
 
 
 def check_decisions(db) -> Dict[str, Any]:
@@ -409,6 +539,8 @@ def run_checks(services: bool = True, worker: bool = True, recall: bool = True) 
     except sqlite3.Error as e:
         out['db'] = {'ok': False, 'msg': 'claude-mem DB 읽기 실패: {}'.format(e)[:120]}
     out['spool'] = check_spool(prev)
+    out['chroma-pending'] = check_chroma_pending()
+    out['chroma-log'] = check_chroma_log()
     out['usage'] = recall_usage()
     problems = [k for k, v in out.items() if isinstance(v, dict) and v.get('ok') is False]
     out['ok'] = not problems
@@ -429,6 +561,8 @@ def fix(result: Dict[str, Any]) -> List[str]:
     if not installed_home():
         return ['skipped: not an installed SB_HOME']
     wants = {v.get('fix') for v in result.values() if isinstance(v, dict) and v.get('fix')}
+    # 아래 기동 복구 전의 워커 상태. 꺼져 있던 워커는 방금 기동이 백필을 하므로 재시작이 필요 없다.
+    worker_was_up = result['worker'].get('ok') if isinstance(result.get('worker'), dict) else worker_up()
     if 'proxy' in wants:
         done.append('proxy:' + ('ok' if ensure_proxy(observer_proxy() or '') else 'fail'))
     if wants & {'worker', 'automemory'}:
@@ -442,6 +576,14 @@ def fix(result: Dict[str, Any]) -> List[str]:
             done.append('automemory:saved={} failed={}'.format(r['saved'], r['failed']))
         except Exception as e:  # noqa: BLE001
             done.append('automemory:error {}'.format(e)[:80])
+    # 벡터 미반영(Chroma 에 없는 관측)은 워커가 '시작할 때만' 백필한다 — claude-mem 13.34 worker-service 의
+    # backfillAllProjects(pending 재시도 포함) 호출 지점이 기동 직후·손상 컬렉션 재생성뿐이다(13.24.23 도 같다 — restart_worker 위 주석). 그래서 Ollama·워커가
+    # 이미 떠 있으면 위 기동 복구는 아무것도 안 하고 미반영이 그대로 남는다.
+    # 임베딩 서버가 아직 꺼져 있으면 재시작해도 같은 실패라 하루 1회 기회를 쓰지 않는다.
+    vector = result.get('vector') or {}
+    if vector.get('ok') is False and vector.get('missing') and worker_was_up \
+            and (not uses_ollama() or ollama_up()):
+        done.append('vector-backfill:' + restart_for_backfill())
     if 'recalld' in wants:
         try:
             import sb_recalld

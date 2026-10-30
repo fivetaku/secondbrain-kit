@@ -17,7 +17,9 @@ from pathlib import Path
 
 KIT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(KIT / 'bin'))
+sys.path.insert(0, str(KIT / 'installer'))
 import sb_config  # noqa: E402
+import install  # noqa: E402  설치기와 같은 조건(Claude 버전 게이트·같은 역할 훅 판별)으로 점검한다
 
 HOME = Path.home()
 IS_WIN = os.name == 'nt'
@@ -94,6 +96,40 @@ def check_embedding():
             rec('✅' if ok else '❌', '~/.chroma_env', '있음' if ok else 'CHROMA_OPENAI_API_KEY=ollama 줄 필요')
 
 
+# claude-mem 13.24.23 워커가 chroma-mcp 를 띄우는 인자(worker-service.cjs buildLauncherPrefix, --python 은 앞에 붙는다).
+# 설치기의 CHROMA_UVX 와 달리 pydantic 고정이 없다 — 설치기가 깔아 둔 고정 도구를 uvx 가 재사용하는지가 관건.
+WORKER_CHROMA_ARGS = ['--with', 'onnxruntime>=1.20', '--with', 'protobuf<7', '--from', 'chroma-mcp==0.2.6', 'chroma-mcp']
+
+
+def check_chroma_mcp():
+    """워커와 같은 인자로 chroma-mcp 를 --help 까지 띄워 본다(워커 prewarm 과 같은 확인).
+    2026-10-12 pydantic 2.14 로 시작 즉시 ImportError 가 났는데, 워커는 재시도 차단기 뒤로 실패를 삼켜
+    벡터 동기화가 4시간 넘게 조용히 멈췄다 — 로그를 보지 않으면 알 수 없어 여기서 직접 띄운다."""
+    s = sb_config.claude_mem_settings() or {}
+    if str(s.get('CLAUDE_MEM_CHROMA_ENABLED', 'true')).lower() == 'false':
+        return rec('⚠', 'chroma-mcp 기동', 'CLAUDE_MEM_CHROMA_ENABLED=false — 벡터 동기화 꺼짐')
+    uvx = shutil.which('uvx')
+    if not uvx:
+        return rec('❌', 'chroma-mcp 기동', 'uvx 없음 — 워커가 chroma-mcp 를 띄울 수 없어 벡터 동기화가 멈춤')
+    py = os.environ.get('CLAUDE_MEM_PYTHON_VERSION') or s.get('CLAUDE_MEM_PYTHON_VERSION') or '3.13'
+    # 워커처럼 가상환경 변수는 빼고 띄운다(uv run 으로 doctor 를 돌리면 VIRTUAL_ENV 가 잡혀 있다)
+    env = {k: v for k, v in UTF8['env'].items()
+           if k not in ('VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV')}
+    try:
+        r = subprocess.run([uvx, '--python', py] + WORKER_CHROMA_ARGS + ['--help'], cwd=str(HOME), timeout=300,
+                           **dict(UTF8, env=env))
+    except subprocess.TimeoutExpired:
+        return rec('⚠', 'chroma-mcp 기동', '5분 안에 안 뜸(첫 실행은 패키지 내려받기로 오래 걸림) — 다시 확인')
+    out = (r.stderr or '') + (r.stdout or '')
+    if r.returncode == 0:
+        return rec('✅', 'chroma-mcp 기동', '워커와 같은 인자로 정상 기동')
+    if 'eval_type_backport' in out:
+        return rec('❌', 'chroma-mcp 기동', 'pydantic 2.14+ 와 mcp 1.6.0 비호환으로 시작 즉시 ImportError — 벡터 동기화 멈춤. '
+                   'install.py 를 다시 실행해 고정 도구(uv tool install … pydantic<2.14 chroma-mcp==0.2.6)를 까세요')
+    tail = [x for x in out.strip().splitlines() if x.strip()]
+    rec('❌', 'chroma-mcp 기동', 'rc=%d %s' % (r.returncode, (tail[-1] if tail else '')[:120]))
+
+
 def _has_kit_hook(path: Path, event: str) -> bool:
     try:
         hooks = json.loads(path.read_text(encoding='utf-8')).get('hooks', {})
@@ -101,6 +137,35 @@ def _has_kit_hook(path: Path, event: str) -> bool:
         return False
     kit = str(KIT).replace('\\', '/')
     return any(kit in str(h.get('command', '')).replace('\\', '/') for g in hooks.get(event, []) for h in g.get('hooks', []))
+
+
+# 이벤트별 키트 훅 스크립트 — 설치기 claude_hooks() 와 같은 구성
+CLAUDE_HOOK_SCRIPTS = {'SessionStart': 'hooks/session_context.py', 'UserPromptSubmit': 'hooks/sb_recall.py',
+                       'PreToolUse': 'hooks/recall_gate.py', 'Stop': 'hooks/recall_gate.py',
+                       'SubagentStart': 'hooks/recall_gate.py', 'PostToolUseFailure': 'hooks/sb_error_recall.py'}
+
+
+def claude_events() -> list:
+    """점검할 Claude 훅 이벤트. PostToolUseFailure 는 설치기처럼 지원 버전(2.1.119+)에서만 본다."""
+    events = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStart']
+    if install.claude_version() >= install.MIN_CLAUDE_FOR_FAILURE_HOOK:
+        events.append('PostToolUseFailure')
+    return events
+
+
+def _claude_hook_status(path: Path, event: str) -> tuple:
+    """(수준, 대신 충족한 사용자 훅 명령). ✅ 키트 훅이거나 같은 .py 스크립트(키트의 예전 형식 — 설치기가 조용히 건너뜀),
+    ⚠ 이름만 겹치는 키트 밖 훅(.sh 래퍼 등)으로만 충족 — 다른 도구의 훅이면 키트 기능이 실제로는 안 돈다, ❌ 없음."""
+    if _has_kit_hook(path, event):
+        return '✅', ''
+    try:
+        hooks = json.loads(path.read_text(encoding='utf-8')).get('hooks', {})
+    except (OSError, ValueError):
+        return '❌', ''
+    found = install._find_equivalent(hooks, event, install.py_cmd(CLAUDE_HOOK_SCRIPTS[event]))
+    if not found:
+        return '❌', ''
+    return ('✅' if found[1] else '⚠'), found[0]
 
 
 def check_recall_smoke():
@@ -127,9 +192,16 @@ def check_claude():
     if not shutil.which('claude'):
         return rec('⚠', 'Claude Code', '미설치 — 건너뜀')
     p = HOME / '.claude' / 'settings.json'
-    events = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStart')
-    missing = [e for e in events if not _has_kit_hook(p, e)]
-    rec('✅' if not missing else '❌', 'Claude 훅', '%d종 등록' % len(events) if not missing else '누락: ' + ', '.join(missing))
+    events = claude_events()
+    status = {e: _claude_hook_status(p, e) for e in events}
+    missing = [e for e in events if status[e][0] == '❌']
+    borrowed = ['%s(%s)' % (e, status[e][1]) for e in events if status[e][0] == '⚠']
+    detail = []
+    if missing:
+        detail.append('누락: ' + ', '.join(missing))
+    if borrowed:   # 키트 훅 대신 이름만 같은 사용자 훅이 걸려 있다 — 다른 도구의 것이면 지우고 install 재실행
+        detail.append('키트 훅 대신 같은 이름의 사용자 훅: ' + '; '.join(borrowed))
+    rec('❌' if missing else '⚠' if borrowed else '✅', 'Claude 훅', ' / '.join(detail) or '%d종 등록' % len(events))
     check_recall_smoke()
     cache = HOME / '.claude/plugins/cache/thedotmack/claude-mem'
     rec('✅' if cache.exists() else '❌', 'Claude claude-mem 플러그인', str(cache) if cache.exists() else '미설치')
@@ -204,7 +276,7 @@ def main() -> int:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:  # noqa: BLE001
         pass
-    for fn in (check_venv, check_worker, check_settings, check_embedding, check_claude, check_codex,
+    for fn in (check_venv, check_worker, check_settings, check_embedding, check_chroma_mcp, check_claude, check_codex,
                check_rules, check_state_and_capture, check_sb):
         try:
             fn()

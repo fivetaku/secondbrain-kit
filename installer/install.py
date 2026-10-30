@@ -9,7 +9,7 @@
 하는 일 (각 단계는 멱등 — 여러 번 돌려도 같은 결과):
   1  사전 요구사항 확인 (node, git, uv, claude, codex, ollama)
   2  venv (~/.secondbrain/.venv) + requirements
-  3  claude-mem 설치 (npx claude-mem install — bun/uv 자동 설치, 플러그인 등록까지)
+  3  claude-mem 설치 (npx claude-mem install — bun/uv 자동 설치, 플러그인 등록까지) + chroma-mcp 고정 도구
   4  한국어 임베딩: ollama bge-m3 + Chroma 컬렉션 선생성(OpenAI 호환 EF → Ollama /v1)
   5  claude-mem settings.json 병합 (한국어 모드, 주입량)
   6  Claude Code 훅 (~/.claude/settings.json)
@@ -41,8 +41,11 @@ VENV = SB_HOME / '.venv'
 VPY = VENV / ('Scripts/python.exe' if IS_WIN else 'bin/python')
 CM_DIR = HOME / '.claude-mem'
 CLAUDE_MEM_VERSION = os.environ.get('SBKIT_CLAUDE_MEM_VERSION', '13.24.23')
+# pydantic<2.14: 2026-10-12 uvx 가 chroma-mcp 환경을 새로 풀며 pydantic 2.14.1 을 받았고, chroma-mcp 0.2.6 이 고정한
+# mcp 1.6.0 이 2.14 에서 사라진 pydantic._internal._typing_extra.eval_type_backport 를 import 해 시작 즉시 죽었다
+# (벡터 동기화 4시간+ 정지). 2026-10-30 고정 없이 다시 띄워도 같은 ImportError 재현.
 CHROMA_UVX = ['--python', '3.13', '--with', 'onnxruntime>=1.20', '--with', 'protobuf<7',
-              '--from', 'chroma-mcp==0.2.6']
+              '--with', 'pydantic<2.14', '--from', 'chroma-mcp==0.2.6']
 MARK_BEGIN = '<!-- secondbrain-kit:begin -->'
 MARK_END = '<!-- secondbrain-kit:end -->'
 HOOK_TAG = 'secondbrain-kit'
@@ -224,6 +227,18 @@ def install_claude_mem(args, tools) -> None:
     run(cmd if not IS_WIN else ['cmd', '/c'] + cmd)
 
 
+def pin_chroma_mcp(tools) -> None:
+    """claude-mem 워커가 띄우는 chroma-mcp 에도 pydantic 고정이 걸리게 한다.
+    워커는 자기 인자(uvx --python 3.13 --with onnxruntime>=1.20 --with protobuf<7 --from chroma-mcp==0.2.6 chroma-mcp)로
+    직접 띄워 CHROMA_UVX 가 닿지 않는다. uvx 는 요구를 만족하는 설치된 도구(uv tool install)가 있으면 새로 풀지 않고
+    그 환경을 쓰므로(uv 0.10 실측 'Using existing tool'), 고정을 담아 도구로 설치해 둔다. 이미 같으면 uv 가 건너뛴다."""
+    say('  chroma-mcp 고정 (pydantic<2.14)')
+    uv = tools.get('uv') or 'uv'
+    r = run([uv, 'tool', 'install'] + CHROMA_UVX[:-2] + [CHROMA_UVX[-1]], check=False)
+    if r.returncode != 0:
+        WARNINGS.append('chroma-mcp 고정 설치 실패 — 벡터 동기화가 pydantic 2.14 로 멈출 수 있음(--doctor 의 chroma-mcp 기동 확인)')
+
+
 # ── 4 임베딩 ────────────────────────────────────────────────────────
 PRECREATE = textwrap.dedent('''
     import os, sys, chromadb
@@ -383,20 +398,43 @@ def claude_version() -> tuple:
 MIN_CLAUDE_FOR_FAILURE_HOOK = (2, 1, 119)
 
 
-def _has_equivalent(hooks: dict, event: str, command: str) -> bool:
-    """사용자가 키트 밖에 둔 같은 역할의 훅(예: 개인 폴더의 sb-recall.py)이 이미 있는가 — 있으면 중복 등록하지 않는다."""
-    stem = Path(command.split()[-1].strip('"\'')).stem.replace('-', '_')
+def _script_stems(command: str, exts: str = 'py|sh') -> set:
+    """명령 안의 스크립트 경로(…/이름.py, …/이름.sh)에서 이름만 뽑아 하이픈·밑줄을 맞춘다.
+    마지막 토큰만 보면 'session_context.py claude' 처럼 인자가 붙은 명령이나 .sh 래퍼를 같은 훅으로 못 알아봤다."""
+    return {m.group(1).replace('-', '_').lower()
+            for m in re.finditer(r'([^\s"\'/]+)\.(?:%s)(?=$|[\s"\';&|)])' % exts, posix(command))}
+
+
+def _find_equivalent(hooks: dict, event: str, command: str):
+    """사용자가 키트 밖에 둔 같은 역할의 훅(예: 개인 폴더의 sb-recall.py, session_context.sh)을 찾는다
+    — 있으면 중복 등록하지 않는다. (그 명령, 같은 .py 스크립트인가) 또는 None.
+    같은 .py 이름(경로·인자만 다름)은 키트의 예전 형식으로 보고 조용히 넘기지만, .sh 래퍼 등 이름만 겹치는 훅은
+    다른 도구의 것일 수 있어(키트 훅이 아예 안 걸린다) 호출 쪽이 ⚠ 로 드러낸다. 둘 다 있으면 같은 .py 를 먼저 고른다."""
+    stems, py = _script_stems(command), _script_stems(command, 'py')
+    loose = None
     for g in hooks.get(event, []):
         for h in g.get('hooks', []):
-            c = posix(h.get('command', ''))
-            if not _is_ours(c) and re.search(r'[\\/]' + re.escape(stem).replace('_', '[-_]') + r'\.py\b', c):
-                return True
-    return False
+            c = h.get('command', '')
+            if _is_ours(c) or not stems & _script_stems(c):
+                continue
+            if py & _script_stems(c, 'py'):
+                return c, True
+            loose = loose or (c, False)
+    return loose
+
+
+def _has_equivalent(hooks: dict, event: str, command: str) -> bool:
+    return _find_equivalent(hooks, event, command) is not None
 
 
 def _add(hooks: dict, event: str, matcher, command: str, timeout: int) -> None:
-    if _has_equivalent(hooks, event, command):
-        say(f'  건너뜀: {event} 에 같은 역할의 사용자 훅이 이미 있음')
+    found = _find_equivalent(hooks, event, command)
+    if found:
+        user_cmd, same_script = found
+        if same_script:
+            say(f'  건너뜀: {event} 에 같은 역할의 사용자 훅이 이미 있음')
+        else:   # 이름만 겹치는 다른 도구의 훅일 수 있다 — 어떤 명령 때문에 키트 훅을 안 걸었는지 보여 준다
+            say(f'  ⚠ 사용자 훅 {user_cmd} 을 같은 역할로 보고 건너뜀({event}) — 키트 훅을 쓰려면 그 훅을 지우고 다시 설치')
         return
     group = {'hooks': [{'type': 'command', 'command': command, 'timeout': timeout}]}
     if matcher is not None:
@@ -669,6 +707,8 @@ def uninstall() -> None:
         run([str(VPY), str(KIT / 'installer' / 'codex_trust.py'), 'enable', '--plugin', 'claude-mem',
              '--codex', codex], check=False)
     say('claude-mem 플러그인 자체 제거: claude plugin uninstall claude-mem@thedotmack / codex plugin remove claude-mem@claude-mem-local')
+    # 고정 도구는 claude-mem 워커가 쓰므로 남긴다 — claude-mem 까지 지울 때만 함께 지운다
+    say('chroma-mcp 고정 도구 제거(claude-mem 을 지운 뒤): uv tool uninstall chroma-mcp')
 
 
 def main() -> None:
@@ -698,6 +738,7 @@ def main() -> None:
     tools = check_prereqs(args)
     setup_venv(tools)
     install_claude_mem(args, tools)
+    pin_chroma_mcp(tools)
     setup_embedding(args, tools)
     merge_claude_mem_settings(args)
     if tools.get('claude'):

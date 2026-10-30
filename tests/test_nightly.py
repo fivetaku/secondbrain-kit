@@ -54,6 +54,7 @@ class NightlyTests(unittest.TestCase):
     def all_ok(self, **changes) -> None:
         stages = {'ko_index': ok(str(self.markers / 'ko')),
                   'automemory': ok(str(self.markers / 'auto')),
+                  'rules': ok(str(self.markers / 'rules')),
                   'snapshot': ok(str(self.markers / 'snap')),
                   'consolidate': ok(str(self.markers / 'cons'))}
         stages.update(changes)
@@ -80,12 +81,12 @@ class NightlyTests(unittest.TestCase):
                                        'failed_stages', 'exit_code'})
         self.assertEqual((status['status'], status['core_failed'], status['failed_stages'],
                           status['exit_code']), ('ok', False, [], 0))
-        for name in ('ko', 'auto', 'snap'):
+        for name in ('ko', 'auto', 'rules', 'snap'):
             self.assertTrue((self.markers / name).exists(), name)
         self.assertFalse((self.markers / 'cons').exists(), 'consolidate is opt-in')
         log = self.log()
         self.assertRegex(log, r'== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} start')
-        for name in ('ko-index', 'automemory', 'snapshot'):
+        for name in ('ko-index', 'automemory', 'rules', 'snapshot'):
             self.assertIn('stage={} exit=0 action=continue'.format(name), log)
         self.assertIn('done status=ok core_failed=0 failed_stages=[] exit=0', log)
         # Stage output is appended to the log; snapshot stdout is discarded like the bash job.
@@ -110,6 +111,17 @@ class NightlyTests(unittest.TestCase):
         self.assertTrue((self.markers / 'auto').exists())
         self.assertTrue((self.markers / 'snap').exists())
         self.assertIn('failed_stages=[ko-index] exit=1', self.log())
+
+    def test_rules_failure_is_partial_and_snapshot_still_runs(self) -> None:
+        self.all_ok(rules=fail())
+        self.assertEqual(self.run_main(), 0)
+        status = self.status()
+        self.assertEqual((status['status'], status['core_failed'], status['failed_stages'],
+                          status['exit_code']), ('partial', False, ['rules'], 0))
+        self.assertTrue((self.markers / 'snap').exists())
+        log = self.log()
+        self.assertLess(log.index('stage=automemory'), log.index('stage=rules'))
+        self.assertLess(log.index('stage=rules'), log.index('stage=snapshot'))
 
     def test_automemory_and_snapshot_failure(self) -> None:
         self.all_ok(automemory=fail(), snapshot=fail())
@@ -148,18 +160,22 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(self.run_main('--dry-run', '--with-consolidate'), 0)
         lines = self.stdout.splitlines()
         self.assertEqual([line.split()[0] for line in lines],
-                         ['stage=preflight', 'stage=ko-index', 'stage=automemory', 'stage=snapshot',
-                          'stage=consolidate', 'stage=health'])
+                         ['stage=preflight', 'stage=ko-index', 'stage=automemory', 'stage=rules',
+                          'stage=snapshot', 'stage=consolidate', 'stage=health'])
         self.assertIn('timeout=180 core=False', lines[0])
         self.assertIn('timeout=900 core=True', lines[1])
-        self.assertIn('timeout=600 core=False', lines[3])
-        self.assertIn('timeout=7200 core=False', lines[4])
+        self.assertIn('timeout=300 core=False', lines[3])
+        self.assertIn('timeout=600 core=False', lines[4])
+        self.assertIn('timeout=7200 core=False', lines[5])
         self.assertFalse(self.home.exists())
 
     def test_default_stage_commands(self) -> None:
         stages = {stage.name: stage for stage in nightly.build_stages(with_consolidate=True)}
         self.assertEqual(stages['ko-index'].argv, [PY, str(BIN / 'sb_fts_ko.py'), 'build'])
         self.assertEqual(stages['automemory'].argv, [PY, str(BIN / 'sync_automemory.py'), '--json'])
+        self.assertEqual(stages['rules'].argv, [PY, str(BIN / 'sb_rules.py'), '--json'])
+        self.assertEqual(stages['rules'].timeout, 300)
+        self.assertNotIn('rules', nightly.CORE_STAGES)
         self.assertEqual(stages['snapshot'].argv[:3], [PY, str(BIN / 'sb_search.py'), 'warmup'])
         for flag in ('--global', '--fresh'):
             self.assertIn(flag, stages['snapshot'].argv)

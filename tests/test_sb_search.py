@@ -161,7 +161,7 @@ class SearchTests(unittest.TestCase):
                     hits, meta = searcher.vector_search("apple", searcher.Scope("multi", ["alpha", "beta"]), 2, str(self.chroma))
                     sleep.assert_called_once_with(0.3)
                 collection.query.assert_called_once_with(
-                    query_texts=["apple"], n_results=16,
+                    query_texts=["apple"], n_results=18,
                     where={"project": {"$in": ["alpha", "beta"]}}, include=["metadatas", "distances"])
         self.assertTrue(meta["ok"], meta["error"])
         self.assertEqual([hit.obs_id for hit in hits], [1, 2])
@@ -323,7 +323,7 @@ class SearchTests(unittest.TestCase):
             snapshot_meta = self.snapshot / "snapshot_meta.json"
             created = json.loads(snapshot_meta.read_text(encoding='utf-8'))["created_at_epoch"]
             snapshot_mtime = self.snapshot.stat().st_mtime_ns
-            with patch.object(searcher.shutil, "copytree", side_effect=AssertionError("cache hit must not copy")):
+            with patch.object(searcher, "_clone_tree", side_effect=AssertionError("cache hit must not copy")):
                 hits, meta = searcher.vector_search("apple", searcher.Scope("multi", ["alpha", "beta"]), 5, str(self.chroma))
             self.assertTrue(meta["ok"], meta["error"])
             self.assertEqual({hit.obs_id for hit in hits}, {1, 2, 3})
@@ -332,7 +332,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(json.loads(snapshot_meta.read_text(encoding='utf-8'))["created_at_epoch"], created)
             self.assertEqual(self.snapshot.stat().st_mtime_ns, snapshot_mtime)
             with patch.dict(os.environ, {"SB_CHROMA_SNAPSHOT_TTL": "0"}):
-                with patch.object(searcher.shutil, "copytree", wraps=searcher.shutil.copytree) as copy:
+                with patch.object(searcher, "_clone_tree", wraps=searcher._clone_tree) as copy:
                     _, meta = searcher.vector_search("apple", searcher.Scope("global", []), 5, str(self.chroma))
                 self.assertTrue(copy.called)
             self.assertTrue(meta["ok"], meta["error"])
@@ -349,7 +349,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(before, after)
             client.close()
             output, errors = io.StringIO(), io.StringIO()
-            with patch.object(searcher.shutil, "copytree", side_effect=AssertionError("snapshot disabled")):
+            with patch.object(searcher, "_clone_tree", side_effect=AssertionError("snapshot disabled")):
                 with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                     self.assertEqual(searcher.main(["apple", "--global", "--json", "--no-snapshot"]), 0)
             direct = json.loads(output.getvalue())
@@ -367,7 +367,7 @@ class SearchTests(unittest.TestCase):
                 "metadatas": [[{"sqlite_id": 1, "doc_type": "observation"}]],
                 "distances": [[0.1]],
             }
-            with patch.object(searcher.shutil, "copytree", side_effect=AssertionError("snapshot disabled")):
+            with patch.object(searcher, "_clone_tree", side_effect=AssertionError("snapshot disabled")):
                 with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                     self.assertEqual(searcher.main(["apple", "--global", "--json", "--no-snapshot"]), 0)
         payload = json.loads(output.getvalue())
@@ -388,7 +388,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(Path(path), self.snapshot)
         metadata = self.snapshot / "snapshot_meta.json"
         metadata.write_text("broken json", encoding='utf-8')
-        with patch.object(searcher.shutil, "copytree", wraps=searcher.shutil.copytree) as copy:
+        with patch.object(searcher, "_clone_tree", wraps=searcher._clone_tree) as copy:
             with searcher._vector_snapshot(self.chroma):
                 self.assertTrue(copy.called)
         preserved = metadata.read_bytes()
@@ -449,6 +449,262 @@ class SearchTests(unittest.TestCase):
         other.mkdir()
         with patch.dict(os.environ, {"SB_RULES_DIR": str(other)}):
             self.assertEqual(searcher._rules_items("alpha")["status"], "empty")
+
+    def _built_snapshot(self) -> Path:
+        self.chroma.mkdir()
+        with contextlib.closing(sqlite3.connect(self.chroma / "chroma.sqlite3")) as connection:
+            connection.execute("CREATE TABLE segments (id TEXT, scope TEXT)")
+        segment = self.chroma / "segment"
+        segment.mkdir()
+        (segment / "data.bin").write_bytes(b"segment data")
+        with searcher._vector_snapshot(self.chroma):
+            pass
+        return self.snapshot / "snapshot_meta.json"
+
+    def test_snapshot_manifest_mismatch_rejects_metadata(self) -> None:
+        meta_path = self._built_snapshot()
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        # 키는 OS 와 무관하게 '/' 구분 상대경로다.
+        self.assertEqual(set(meta["files"]), {"chroma.sqlite3", "segment/data.bin"})
+        self.assertIsNotNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        data = self.snapshot / "segment" / "data.bin"
+        stat = data.stat()
+        os.utime(data, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000))
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        os.utime(data, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertIsNotNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        data.write_bytes(b"segment dat!")  # 같은 크기라도 mtime 이 바뀌면 거부
+        os.utime(data, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000))
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        data.unlink()
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+
+    def test_snapshot_manifest_rejects_unsafe_entries(self) -> None:
+        meta_path = self._built_snapshot()
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        for files in ({"segment/data.bin": [1, 1]},                      # chroma.sqlite3 빠짐
+                      dict(meta["files"], **{"../outside": [1, 1]}),      # 스냅샷 밖 경로
+                      dict(meta["files"], **{"segment/data.bin": [True, 1]}),
+                      dict(meta["files"], **{"segment/data.bin": [1]}),
+                      []):
+            self.assertIsNone(searcher._manifest_entries(self.snapshot, dict(meta, files=files)))
+
+    def test_snapshot_meta_without_files_forces_rebuild(self) -> None:
+        # files 키가 없는 예전 메타는 거부되고, 다음 조회가 매니페스트를 담아 다시 만든다.
+        meta_path = self._built_snapshot()
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        del meta["files"]
+        meta_path.write_text(json.dumps(meta), encoding='utf-8')
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        with patch.object(searcher, "_clone_tree", wraps=searcher._clone_tree) as copy:
+            with searcher._vector_snapshot(self.chroma):
+                self.assertTrue(copy.called)
+        self.assertIn("files", json.loads(meta_path.read_text(encoding='utf-8')))
+        self.assertIsNotNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+
+    def test_restore_manifest_times_only_for_same_size_files(self) -> None:
+        # Chroma 가 조회 중 chroma.sqlite3 를 제자리에서 다시 써도(크기 동일) 재사용 검증이 깨지지 않아야 한다.
+        self._built_snapshot()
+        database = self.snapshot / "chroma.sqlite3"
+        stat = database.stat()
+        os.utime(database, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000))
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        searcher._restore_manifest_times(self.snapshot)
+        self.assertEqual(database.stat().st_mtime_ns, stat.st_mtime_ns)
+        self.assertIsNotNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+        # 크기가 달라진 파일은 되돌리지 않아 다음 검증이 재생성하게 둔다.
+        data = self.snapshot / "segment" / "data.bin"
+        data.write_bytes(b"segment data grown")
+        changed = data.stat().st_mtime_ns
+        searcher._restore_manifest_times(self.snapshot)
+        self.assertEqual(data.stat().st_mtime_ns, changed)
+        self.assertIsNone(searcher._snapshot_metadata(self.snapshot, self.chroma))
+
+    def test_clone_tree_falls_back_to_copytree(self) -> None:
+        source = Path(self.temp.name) / "src"
+        (source / "sub").mkdir(parents=True)
+        (source / "sub" / "f.bin").write_bytes(b"x")
+        # darwin 에서 cp -c 가 실패하면(APFS 아님 등) 일반 복사로 내려간다.
+        with patch.object(searcher.sys, "platform", "darwin"), \
+                patch.object(searcher.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "cp")):
+            searcher._clone_tree(source, Path(self.temp.name) / "dst")
+        self.assertEqual((Path(self.temp.name) / "dst" / "sub" / "f.bin").read_bytes(), b"x")
+        # 다른 OS 는 cp 를 부르지 않고 바로 일반 복사한다.
+        with patch.object(searcher.sys, "platform", "win32"), \
+                patch.object(searcher.subprocess, "run", side_effect=AssertionError("cp must not run")):
+            searcher._clone_tree(source, Path(self.temp.name) / "dst2")
+        self.assertEqual((Path(self.temp.name) / "dst2" / "sub" / "f.bin").read_bytes(), b"x")
+
+    def test_title_normalization(self) -> None:
+        self.assertEqual(searcher.normalize_title("검색 최신성 기록됨"), searcher.normalize_title("검색최신성, 기록함."))
+        self.assertEqual(searcher.normalize_title("Push 완료했다"), searcher.normalize_title("push 완료"))
+        self.assertEqual(searcher.normalize_title("배포가 완료됐다!"), "배포가완료")
+        self.assertNotEqual(searcher.normalize_title("메일 확인"), searcher.normalize_title("메일 발송"))
+        self.assertEqual(searcher.normalize_title("다"), "다")  # 끝말만 남는 제목은 그대로
+        self.assertEqual(searcher.normalize_title(None), "")
+
+    def test_fold_duplicates_keeps_newest_in_first_rank_slot(self) -> None:
+        items = {
+            1: {"title": "스냅샷 검증 기록됨", "created_at": "2026-10-01T00:00:00Z", "title_norm_key": None},
+            2: {"title": "다른 주제", "created_at": "2026-10-02T00:00:00Z", "title_norm_key": "k"},
+            3: {"title": "스냅샷검증 기록함", "created_at": "2026-10-05T00:00:00Z", "title_norm_key": None},
+            4: {"title": "표현만 다른 같은 주제", "created_at": "2026-10-09T00:00:00Z", "title_norm_key": "k"},
+            5: {"title": "", "created_at": "2026-10-09T00:00:00Z", "title_norm_key": None},
+            6: {"title": None, "created_at": "2026-10-10T00:00:00Z", "title_norm_key": None},
+        }
+        self.assertEqual(searcher.fold_duplicates([1, 2, 3, 4, 5, 6], items),
+                         [(3, 1, 1), (4, 2, 1), (5, 5, 0), (6, 6, 0)])
+
+    def test_search_folds_and_still_fills_limit(self) -> None:
+        # 테스트 원장에는 title_norm_key 열이 없다 — 옛 DB 에서도 접기가 제목만으로 돌아야 한다.
+        dups = list(range(10, 18))  # 같은 주제를 표현만 바꿔 8번 기록
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for ident in dups:
+                title = ("Apple, apple 기록함" if ident % 2 else "apple apple 기록됨") + " " * (ident % 3)
+                conn.execute("INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (ident, "alpha", "discovery", title, "", "x", "", "[]", "[]",
+                              datetime.fromtimestamp(ident, timezone.utc).isoformat(), ident * 1000, "{}"))
+            conn.commit()
+        ranking = dups + [1, 3]
+        counts = []
+
+        def lexical(query, scope, count, db_path):
+            counts.append(count)
+            return [searcher.Hit(ident, 1.0 / rank, "fts") for rank, ident in enumerate(ranking[:count], 1)], "fts5"
+
+        with patch.object(searcher, "_lexical", side_effect=lexical):
+            result = searcher.search("apple", searcher.Scope("global", []), limit=2, db_path=str(self.db),
+                                     chroma_path=str(self.chroma))
+        self.assertEqual(counts, [6, 24])  # 접고 나니 1개뿐 → 후보를 4배로 다시 모음
+        self.assertEqual([(row["obs_id"], row["folded"]) for row in result["results"]], [(17, 7), (1, 0)])
+        scores = [row["score"] for row in result["results"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_refetch_stops_after_three_rounds(self) -> None:
+        # 후보가 계속 꽉 차서 돌아와도 재수집은 최대 3회(첫 수집 포함)에서 멈춘다.
+        counts = []
+
+        def lexical(query, scope, count, db_path):
+            counts.append(count)
+            return [searcher.Hit(1, 1.0, "fts")] * count, "fts5"
+
+        with patch.object(searcher, "_lexical", side_effect=lexical):
+            result = searcher.search("apple", searcher.Scope("global", []), limit=3, db_path=str(self.db),
+                                     chroma_path=str(self.chroma))
+        self.assertEqual(counts, [9, 36, 144])
+        self.assertEqual([row["obs_id"] for row in result["results"]], [1])
+
+    def test_refetch_candidates_capped(self) -> None:
+        # 4배씩 늘려도 후보 수는 상한(REFETCH_MAX_CANDIDATES)에서 멈춘다 — 벡터 n_results 가 limit×432 로 커지지 않게.
+        counts = []
+
+        def lexical(query, scope, count, db_path):
+            counts.append(count)
+            return [searcher.Hit(1, 1.0, "fts")] * count, "fts5"
+
+        with patch.object(searcher, "_lexical", side_effect=lexical):
+            searcher.search("apple", searcher.Scope("global", []), limit=30, db_path=str(self.db),
+                            chroma_path=str(self.chroma))
+            counts_big = list(counts)
+            counts.clear()
+            searcher.search("apple", searcher.Scope("global", []), limit=80, db_path=str(self.db),
+                            chroma_path=str(self.chroma))
+        self.assertEqual(counts_big, [90, searcher.REFETCH_MAX_CANDIDATES])
+        self.assertEqual(counts, [240])  # 첫 수집이 이미 상한보다 크면 재수집하지 않는다
+
+    def test_refetch_skips_failed_vector_and_reranks_once(self) -> None:
+        dups = list(range(10, 18))
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for ident in dups:
+                conn.execute("INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (ident, "alpha", "discovery", "apple 기록됨" if ident % 2 else "Apple 기록함", "", "x",
+                              "", "[]", "[]", datetime.fromtimestamp(ident, timezone.utc).isoformat(), ident * 1000, "{}"))
+            conn.commit()
+        ranking = dups + [1, 3]
+        counts, reranked = [], []
+
+        def lexical(query, scope, count, db_path):
+            counts.append(count)
+            return [searcher.Hit(ident, 1.0 / rank, "fts") for rank, ident in enumerate(ranking[:count], 1)], "fts5"
+
+        def fake_rerank(query, candidates, top_n):
+            reranked.append(([item["obs_id"] for item in candidates], top_n))
+            return [searcher.Hit(item["obs_id"], 1.0 / rank, "rerank") for rank, item in enumerate(candidates, 1)]
+
+        down = ([], {"ok": False, "error": "Failed to connect to Ollama", "chunks": 0})
+        with patch.object(searcher, "_lexical", side_effect=lexical), \
+                patch.object(searcher, "rerank", side_effect=fake_rerank), \
+                patch.object(searcher, "vector_search", return_value=down) as vector:
+            result = searcher.search("apple", searcher.Scope("global", []), limit=2, use_rerank=True,
+                                     db_path=str(self.db), chroma_path=str(self.chroma))
+        self.assertEqual(counts, [6, 24])        # 접고 나니 모자라 재수집은 그대로 한다
+        self.assertEqual(vector.call_count, 1)   # 실패한 벡터는 재수집 때 다시 부르지 않는다
+        self.assertEqual(reranked, [(ranking, 24)])  # 재순위는 최종 후보에 한 번만
+        self.assertEqual([(row["obs_id"], row["folded"]) for row in result["results"]], [(17, 7), (1, 0)])
+        self.assertTrue(result["meta"]["rerank_ok"])
+        self.assertFalse(result["meta"]["vector_ok"])
+        # 벡터가 살아 있으면 재수집 때 늘어난 후보 수로 다시 조회한다.
+        counts.clear()
+        with patch.object(searcher, "_lexical", side_effect=lexical), \
+                patch.object(searcher, "vector_search",
+                             return_value=([], {"ok": True, "error": None, "chunks": 0})) as vector:
+            searcher.search("apple", searcher.Scope("global", []), limit=2, db_path=str(self.db),
+                            chroma_path=str(self.chroma))
+        self.assertEqual([call.args[2] for call in vector.call_args_list], [6, 24])
+
+    def test_title_norm_key_column_folds_when_present(self) -> None:
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE observations ADD COLUMN title_norm_key TEXT")
+            conn.execute("UPDATE observations SET title_norm_key='same' WHERE id IN (1, 3)")
+            conn.commit()
+        self.assertEqual(searcher.hydrate([1, 2], str(self.db))[1]["title_norm_key"], "same")
+        self.assertIsNone(searcher.hydrate([1, 2], str(self.db))[2]["title_norm_key"])
+        with patch.object(searcher, "_lexical", return_value=([searcher.Hit(i, 1.0, "fts") for i in (1, 3, 2)], "fts5")):
+            result = searcher.search("apple", searcher.Scope("global", []), limit=5, db_path=str(self.db),
+                                     chroma_path=str(self.chroma))
+        self.assertEqual([(row["obs_id"], row["folded"]) for row in result["results"]], [(3, 1), (2, 0)])
+
+    def test_rerank_blend_matches_recalld_reranker(self) -> None:
+        # 상주 회수(sb_recalld.Reranker.order)와 CLI 재순위가 같은 모델·같은 RRF k=10 식으로 같은 순서를 내야 한다.
+        import sb_recalld
+        self.assertEqual(searcher.RERANK_MODEL, sb_recalld.RERANK_MODEL)
+
+        class FakeModel:
+            def __init__(self, scores):
+                self.scores = scores
+
+            def predict(self, pairs, batch_size=16):
+                return self.scores
+
+        for scores in ([0.1, 0.2, 0.3, 0.9], [0.9, 0.5, 0.1], [0.5, 0.5, 0.9, 0.1, 0.7], [0.0, 0.0]):
+            ids = list(range(100, 100 + len(scores)))
+            recalld = sb_recalld.Reranker.__new__(sb_recalld.Reranker)
+            recalld.model, recalld.error = FakeModel(scores), None
+            expected = recalld.order("q", ids, ["t"] * len(ids))
+            with patch.object(searcher, "_reranker", return_value=FakeModel(scores)):
+                hits = searcher.rerank("q", [{"obs_id": i, "title": "t"} for i in ids], len(ids))
+            self.assertEqual([hit.obs_id for hit in hits], expected)
+            self.assertEqual([hit.score for hit in hits], sorted((hit.score for hit in hits), reverse=True))
+        with patch.object(searcher, "_reranker", return_value=FakeModel([0.1, 0.2, 0.3, 0.9])):
+            hits = searcher.rerank("q", [{"obs_id": i} for i in (1, 2, 3, 4)], 2)
+        self.assertEqual([hit.obs_id for hit in hits], [1, 4])
+
+    def test_reranker_loads_configured_model_once(self) -> None:
+        calls = []
+
+        class FakeCrossEncoder:
+            def __init__(self, name, **kwargs):
+                calls.append((name, kwargs))
+
+        transformers = types.ModuleType("sentence_transformers")
+        transformers.CrossEncoder = FakeCrossEncoder
+        torch = types.ModuleType("torch")
+        torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+        with module_override("sentence_transformers", transformers), module_override("torch", torch), \
+                patch.object(searcher, "_RERANKER", None), patch.object(searcher, "RERANK_MODEL", "custom/reranker"):
+            first = searcher._reranker()
+            self.assertIs(searcher._reranker(), first)
+        self.assertEqual(calls, [("custom/reranker", {"device": "cpu", "max_length": 512, "local_files_only": True})])
 
 
 if __name__ == "__main__":

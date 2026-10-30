@@ -60,9 +60,13 @@ git 없이 받고 싶으면 GitHub 페이지의 Code → Download ZIP 으로 받
 ~/secondbrain-kit/install.sh --doctor          # 윈도우: ~\secondbrain-kit\install.ps1 --doctor
 ```
 
-`❌`가 없으면 된 것이다. 설치 직후엔 아래 두 개가 `⚠`인 게 정상이다:
+`❌`가 없으면 된 것이다. 설치 직후엔 아래가 `⚠`인 게 정상이다:
 - `캡처 — 아직 없음` → 4단계를 하면 사라진다
 - `sb 명령 — PATH 에 없음` → 새 터미널을 열면 사라진다
+- `회수 상주 서버(sb_recalld) — 꺼짐` → 새 세션을 열면 뜬다
+- `chroma-mcp 기동 — 5분 안에 안 뜸` → 첫 실행은 패키지를 내려받느라 오래 걸린다. 잠시 뒤 다시 확인
+
+`Claude 훅`은 Claude Code 2.1.119 이상이면 `6종 등록`, 그보다 낮으면 `5종 등록`이 정상이다(오류 시점 회수 훅 PostToolUseFailure는 2.1.119부터).
 
 ## 4단계. 첫 사용 확인
 
@@ -86,10 +90,12 @@ Codex만 쓰는 PC(Claude 구독 없음)라면 설치 전에 관측 요약 LLM�
 |---|---|
 | `~/.claude-mem/` | 세션 기록 DB·벡터 (claude-mem) |
 | `~/.secondbrain/` | 한국어 색인, 확정 사실(state.db), 미결, 로그, 파이썬 환경 |
-| `~/.claude/settings.json` | 훅 4종 추가 (기존 훅은 그대로) |
+| `~/.claude/settings.json` | 훅 6종 추가 — SessionStart · UserPromptSubmit · PreToolUse(AskUserQuestion) · Stop · SubagentStart · PostToolUseFailure(Claude Code 2.1.119 이상만, 그보다 낮으면 5종). 기존 훅은 그대로 |
 | `~/.codex/hooks.json`, `config.toml` | Codex 캡처·주입 훅 + 신뢰 등록 |
 | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` | "세컨브레인 기억 규칙" 블록 추가 (기존 내용은 그대로) |
+| uv 도구 `chroma-mcp` | pydantic 2.14 미만으로 고정한 chroma-mcp 0.2.6. claude-mem 워커가 이것을 다시 써서 벡터 동기화가 pydantic 비호환으로 멈추지 않는다 |
 | 자동 작업 | 한국어 색인 매시간, 야간 정리 05:07 (맥 launchd / 윈도우 작업 스케줄러) |
+| 상주 회수 서버 | `sb_recalld`(127.0.0.1:37791). 스케줄이 아니라 세션을 열 때 뜨고, 6시간 쓰지 않으면 스스로 꺼진다 |
 
 바뀐 설정 파일은 모두 `<파일>.sbkit-bak-<시각>`으로 백업된다.
 
@@ -100,6 +106,7 @@ Codex만 쓰는 PC(Claude 구독 없음)라면 설치 전에 관측 요약 LLM�
 | `--doctor`에 `Codex 훅 신뢰 ❌` | `~/.secondbrain/.venv/bin/python installer/codex_trust.py trust --match "<키트 폴더 경로>"` (윈도우는 `.venv\Scripts\python.exe`) |
 | `Ollama ❌` | Ollama 앱을 실행(맥: `brew services start ollama`), `ollama pull bge-m3` |
 | `벡터 임베딩 ⚠ default` | 원래 claude-mem을 쓰던 PC다. `docs/embedding.md` 절차로 교체 |
+| `chroma-mcp 기동 ❌` (pydantic·ImportError) | 벡터 동기화가 멈춘 상태다. `./install.sh`를 다시 실행해 고정 도구를 깔고 `--doctor`로 확인. 밀린 벡터는 claude-mem 워커가 다시 뜰 때 채워진다 |
 | 세션 시작 브리핑이 안 뜸 | 정상일 수 있다 — 확정 사실·미결이 하나도 없으면 아무것도 넣지 않는다 |
 | 전부 되돌리고 싶음 | `./install.sh --uninstall` (기록 데이터는 남김) |
 

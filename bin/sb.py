@@ -14,6 +14,9 @@
   sb index                                                    한국어 색인 증분 갱신
   sb nightly [--with-consolidate]                             야간 배치 수동 실행
   sb consolidate ...                                          주간 통합 수동 실행
+  sb rules [--dry-run] [--json]                               규칙층 갱신(feedback 자동 메모리 → rules/<scope>.md)
+  sb context [--query '<작업 설명>'] [--scope S] [--project P] [--max-bytes N]
+                                                              외부 작업자에게 넘길 맥락 블록(사실·다음 행동·규칙·관련 기록)
 """
 import os
 import runpy
@@ -27,7 +30,7 @@ ROUTES = {
     'search': 'sb_search.py', 'state': 'sb_state.py', 'loops': 'loops.py',
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
     'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py', 'pii-sweep': 'sb_pii_sweep.py',
-    'health': 'sb_health.py',
+    'health': 'sb_health.py', 'rules': 'sb_rules.py', 'context': 'sb_context.py',
 }
 
 

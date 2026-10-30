@@ -135,6 +135,25 @@ class ConsolidateTests(unittest.TestCase):
         self.post.assert_called_once()
         self.assertEqual(Path(self.db).read_bytes(), before)
 
+    def test_already_saved_part_skips_llm(self) -> None:
+        digest = cons.input_set_hash(cons.collect_inputs('demo', '2026-W35', self.db))
+        sid = 'consolidation:demo:2026-W35:1/1:' + digest
+        self.saved.return_value = True
+        result = cons.consolidate('demo', '2026-W35', self.db)
+        self.assertEqual(result['status'], 'duplicate')
+        self.assertEqual((result['parts'][0]['status'], result['parts'][0]['reason'], result['parts'][0]['sid']),
+                         ('duplicate', 'already_saved', sid))
+        self.llm.assert_not_called()
+        self.post.assert_not_called()
+        # 키는 저장 때 붙는 dedup_key 와 같다(키트 SOURCE 기준) — 그래야 저장된 조각을 알아본다.
+        self.saved.assert_called_with('secondbrain-consolidate:' + sid, self.db)
+        self.assertEqual(memory.dedup_key({'source': cons.SOURCE, 'sid': sid}, 'x', 'y'),
+                         'secondbrain-consolidate:' + sid)
+        # dry-run 은 저장 여부를 묻지 않고 계획만 보여 준다.
+        self.saved.reset_mock()
+        self.assertEqual(cons.consolidate('demo', '2026-W35', self.db, dry_run=True)['status'], 'dry_run')
+        self.saved.assert_not_called()
+
     def test_invalid_refs_dropped_and_empty_not_saved(self) -> None:
         self.output['decisions'].append({'text': 'Invented', 'source_ids': [1, 999]})
         self.llm.return_value = json.dumps(self.output)

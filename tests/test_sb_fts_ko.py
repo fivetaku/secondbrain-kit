@@ -26,6 +26,21 @@ import sb_config
 import sb_fts_ko as ko
 
 
+@contextlib.contextmanager
+def _module_override(name, value):
+    """sys.modules 의 키 하나만 바꿨다 되돌린다(tests/test_sb_search.py 의 module_override 와 같은 이유)."""
+    missing = object()
+    old = sys.modules.get(name, missing)
+    sys.modules[name] = value
+    try:
+        yield
+    finally:
+        if old is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = old
+
+
 class KoreanFTSTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -168,8 +183,11 @@ class KoreanFTSTests(unittest.TestCase):
 
     def test_import_failure_uses_bigram_metadata_and_search(self) -> None:
         self.insert()
+        # patch.dict(sys.modules, …) 는 끝날 때 그사이 import 된 모듈을 전부 지운다. 앞선 테스트의 재순위기 적재가
+        # 이 구간에 torch 하위 모듈을 지연 import 하면 지워진 뒤 재import 에서 pybind 타입이 중복 등록돼
+        # 프로세스째 죽는다(libc++abi 'GradBucket … already defined', 2026-10-30) — 키 하나만 바꿨다 되돌린다
         with patch.object(ko, '_loaded', False), patch.object(ko, '_kiwi', None), \
-                patch.dict(sys.modules, {'kiwipiepy': None}):
+                _module_override('kiwipiepy', None):
             self.assertIn('검색', ko.tokenize_ko('검색을'))
             self.assertIn('linear_sync.py', ko.tokenize_ko('LINEAR_SYNC.PY'))
             ko.build()
