@@ -6,6 +6,7 @@ Stages, in order, each under an sb_run deadline:
   preflight   sb_health.py ensure — claude-mem 워커·Ollama 기동      180s
   ko-index    sb_fts_ko.py build                                   900s  core
   automemory  sync_automemory.py --json                            600s  core
+  rules       sb_rules.py --json — feedback 메모리 → rules/<scope>.md  300s
   snapshot    sb_search.py warmup --global --limit 1 --fresh       600s
   consolidate consolidate.py run --since-days 7 --json (opt-in)   7200s
   health      sb_health.py --quiet — 결과를 logs/health.json 에 남김  300s
@@ -49,6 +50,8 @@ def build_stages(with_consolidate: bool = False) -> List[Stage]:
     stages = [
         Stage('ko-index', [py, str(BIN / 'sb_fts_ko.py'), 'build'], 900),
         Stage('automemory', [py, str(BIN / 'sync_automemory.py'), '--json'], 600),
+        # 규칙층(rules/<scope>.md)은 자동 메모리에서 다시 만들 수 있는 생성물이라 실패해도 핵심 실패가 아니다.
+        Stage('rules', [py, str(BIN / 'sb_rules.py'), '--json'], 300),
         Stage('snapshot', [py, str(BIN / 'sb_search.py'), 'warmup', '--global',
                            '--limit', '1', '--fresh', '--json'], 600, quiet=True),
     ]

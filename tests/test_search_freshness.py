@@ -140,7 +140,7 @@ class FreshnessTests(unittest.TestCase):
                          for p in self.chroma.rglob('*') if p.is_file() and not p.name.endswith('-shm')}
         index_before = self.index.read_bytes()
         with patch.object(ko, '_body', side_effect=AssertionError('unchanged document retokenized')), \
-                patch.object(searcher.shutil, 'copytree', side_effect=AssertionError('unchanged snapshot copied')):
+                patch.object(searcher, '_clone_tree', side_effect=AssertionError('unchanged snapshot copied')):
             result = self.query('기존기억')
         self.assert_both(result, 1)
         self.assertTrue(result['meta']['snapshot']['reused'])
@@ -328,7 +328,7 @@ class FreshnessTests(unittest.TestCase):
             return self.query('우주망원경')
 
         with patch.object(ko, '_body', wraps=ko._body) as body, \
-                patch.object(searcher.shutil, 'copytree', wraps=searcher.shutil.copytree) as copy, \
+                patch.object(searcher, '_clone_tree', wraps=searcher._clone_tree) as copy, \
                 ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(query) for _ in range(2)]
             barrier.wait(timeout=10)
@@ -387,7 +387,7 @@ class FreshnessTests(unittest.TestCase):
             db.commit()
             self.query('기존기억')
             db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            with patch.object(searcher.shutil, 'copytree', side_effect=AssertionError('checkpoint copied snapshot')):
+            with patch.object(searcher, '_clone_tree', side_effect=AssertionError('checkpoint copied snapshot')):
                 result = self.query('기존기억')
         self.assert_both(result, 1)
         self.assertTrue(result['meta']['snapshot']['reused'])

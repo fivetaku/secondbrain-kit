@@ -15,6 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 import sb_config  # noqa: E402
 import sb_lock  # noqa: E402
 
+# 윈도우: 훅·자식 프로세스의 표준 입출력이 기본 코드페이지(cp949)라 한국어가 깨지거나 인코딩 오류로 조용히 실패한다 — UTF-8 고정.
+for _s in (sys.stdin, sys.stdout):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def _recalld_url() -> str:
     if os.environ.get("SB_RECALLD_URL"):
@@ -134,7 +141,7 @@ def run(raw, sid, err, sig_hash, state_path):
     lines = "\n".join(f"- #{it['id']} {it['date'][5:]} {it['project'][:18]} · {it['title'][:80]}" for it in items)
     ctx = ("[세컨브레인 오류 회수] 방금 실패한 도구 호출과 비슷한 문제를 다룬 과거 기록이다. 원인·우회책이 있을 수 있으니 "
            "관련 있으면 get_observations([ID])로 본문을 보고, 아니면 무시한다.\n" + lines)
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": raw.get("_event", "PostToolUseFailure"), "additionalContext": ctx}}, ensure_ascii=False))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": raw.get("_event", "PostToolUseFailure"), "additionalContext": ctx}}))  # ASCII 이스케이프(윈도우 인코딩)
 
 
 if __name__ == "__main__":

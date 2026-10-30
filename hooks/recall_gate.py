@@ -20,6 +20,7 @@ IMPORTANT: 어떤 경로로도 exit 0. 차단 사고를 내지 않는다.
 import hashlib
 import json
 import os
+import re
 import pathlib
 import sys
 
@@ -49,8 +50,52 @@ EDIT_MSG = (
     "이미 고친 것을 다시 고치거나 사용자 결정을 덮는 것을 막는 리마인더입니다."
 )
 
-RECALL_PAT = ("sb search", "sb state", "sb timeline", "sb loops", "sb_search", "sb_state", "sb_timeline",
-              "sb_briefing", "claude-mem", "claude_mem", "mcp-search", "observations_fts", "user_prompts_fts", "recall")
+# 회상은 '실행'이어야 한다(2026-10-21). 글자 포함만 보던 이전 방식은 `cat hooks/recall_gate.py`·`grep -rn recall`·
+# `ls ~/.claude-mem` 처럼 기록층을 언급만 한 명령도 회상으로 세서, 실제 조회 없이 게이트가 풀렸다.
+# 명령 자리(첫머리·줄바꿈·; & | ( ` $( 뒤)에서 기록층 명령을 부르거나 claude-mem DB 를 sqlite3 로 조회할 때만 센다.
+# 2026-10-30: 실행인데 빠지던 꼴을 다시 넣는다 — 공백 든 따옴표 경로("C:\a b\bin\sb_search.py", '/x y/sb_search.py')와
+# timeout·env·time·nohup·uv run 래퍼 접두. 거꾸로 따옴표 안 문자열(echo "a; sb search")·커밋 메시지 줄바꿈 뒤
+# 'sb search' 는 is_recall_command 가 따옴표 상태로 걸러 낸다.
+_CMD = r"(?:^|[;&|(`\n]|\$\()\s*"                                    # 명령 자리
+_ASSIGN = r"(?:[A-Za-z_]\w*=(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"'])*\s+)*"  # 앞에 붙은 환경변수 지정(따옴표 값 허용)
+_WRAP = (r"(?:(?:[^\s\"';&|]*/)?(?:timeout(?:\s+-[ks]\s+\S+|\s+-\S+)*\s+\d[\d.]*[smhd]?"   # timeout [-k 5] 30
+         r"|env(?:\s+-u\s+\S+|\s+-\S+)*|time(?:\s+-\S+)*|nohup"
+         r"|uv\s+run(?:\s+--?[\w-]+(?:=\S+|\s+[^\s\-;&|][^\s;&|]*)?)*)\s+" + _ASSIGN + r")*")   # uv run [--project x]
+
+
+def _tok(name: str) -> str:
+    """경로 접두가 붙을 수 있는 실행 파일 토큰 — 공백 든 따옴표 경로("…\\a b\\…", '…/a b/…') 또는 맨 경로."""
+    return (r"(?:\"(?:[^\"\n]*[/\\])?" + name + r"\"|'(?:[^'\n]*[/\\])?" + name + r"'"
+            r"|(?:[^\s\"';&|]*[/\\])?" + name + r")")
+
+
+# 인터프리터 옵션: 값을 따로 받는 -X·-W(윈도우에서 흔한 python -X utf8 …\bin\sb_search.py)와 나머지 -옵션
+_PY = r"(?:" + _tok(r"py(?:thon[\d.]*)?(?:\.exe)?") + r"\s+(?:-[XW]\s+[^\s;&|-][^\s;&|]*\s+|-\S+\s+)*)?"   # python·py 로 스크립트를 돌리는 경우
+RECALL_RUN = re.compile(
+    _CMD + _ASSIGN + _WRAP + _PY
+    + r"(?:" + _tok(r"sb(?:\.cmd|\.ps1|\.py)?") + r"\s+(?:search|state|timeline|recall|loops)\b"
+    + r"|" + _tok(r"(?:sb_search|sb_state|sb_timeline|sb_briefing)\.py\b")
+    + r"|" + _tok(r"loops\.py") + r"\s+list\b)"
+    + r"|\bsqlite3\b[^|;&\n]*claude-mem\.db")
+# heredoc 본문은 실행이 아니라 데이터다 — git commit -m "$(cat <<'EOF' … EOF)" 의 메시지 줄이 명령 자리로 읽히지 않게 지운다.
+_HEREDOC = re.compile(r"(<<-?[ \t]*([\"']?)(\w+)\2[^\n]*)\n.*?\n[ \t]*\3[ \t]*(?=\n|\Z)", re.S)
+
+
+def _scan_quotes(s: str, i: int, end: int, q: str, esc: str = "\\"):
+    """s[i:end] 를 셸처럼 훑어 end 위치가 어느 따옴표 안인지('"'·"'"·'') 이어서 센다(후보마다 처음부터 다시 훑지 않게).
+    esc 는 이스케이프 문자 — bash 는 백슬래시(따옴표 밖 don\\'t 의 \\' 도 따옴표를 열지 않는다),
+    PowerShell 은 백틱(백슬래시는 그냥 경로 구분자라 "C:\\a b\\" 의 끝 \\" 가 따옴표를 닫는다).
+    작은따옴표 안에는 두 셸 모두 이스케이프가 없다."""
+    while i < end:
+        c = s[i]
+        if c == esc and q != "'":
+            i += 2
+            continue
+        if c in "\"'" and (not q or q == c):
+            q = "" if q else c
+        i += 1
+    return i, q
+
 
 EDIT_TOOLS = ("Edit", "Write", "NotebookEdit")
 SHELL_TOOLS = ("Bash", "PowerShell")
@@ -80,13 +125,39 @@ AGENT_TOOLS = ("Agent", "Task")
 AGENT_RECALL_PAT = ("sb timeline", "sb search", "sb recall", "get_observations", "sb state", "기록층")
 
 
-def _is_recall_tool(name: str, inp) -> bool:
+def is_recall_command(command: str, powershell: bool = False) -> bool:
+    """셸 명령이 기록층을 실제로 조회하나(RECALL_RUN).
+    명령 자리(; 줄바꿈 등)가 따옴표 안이면 문자열일 뿐이라 세지 않는다 — 단 큰따옴표 안의 $( ` 는 실제 명령 치환이라 센다.
+    한계(거짓 음성 쪽으로 기운다): bash -c "sb search x"·ssh host "sb …" 처럼 따옴표 안에서 실행되는 것과
+    bash <<EOF 로 넘기는 heredoc 속 명령은 못 센다. 거짓 양성은 게이트를 조회 없이 풀어 버리므로 그쪽을 줄였다.
+    powershell=True 면 따옴표를 PowerShell 규칙(백틱 이스케이프, 큰따옴표 안 명령 치환은 $( 만)으로 센다."""
+    esc, subst = ("`", ("$(",)) if powershell else ("\\", ("$(", "`"))
+    s = _HEREDOC.sub(r"\1", command or "")
+    pos, i, q = 0, 0, ""
+    while True:
+        m = RECALL_RUN.search(s, pos)
+        if not m:
+            return False
+        i, q = _scan_quotes(s, i, m.start(), q, esc)
+        # 명령 자리 문자(; | 등)가 이스케이프됐거나(a\; · a`;) PowerShell 의 백틱(명령 치환이 아니라 이스케이프) — 문자일 뿐이다
+        if i > m.start() or (powershell and s.startswith("`", m.start())):
+            pos = m.start() + 1
+            continue
+        if not q or (q == '"' and s.startswith(subst, m.start())):
+            return True
+        pos = m.start() + 1
+
+
+def _is_recall_tool_name(name: str) -> bool:
     low = (name or "").lower()
-    if "recall" in low or "mcp-search" in low or "mcp__plugin_claude-mem" in (name or ""):
+    return "recall" in low or "mcp-search" in low or "claude-mem" in low or "claude_mem" in low
+
+
+def _is_recall_tool(name: str, inp) -> bool:
+    if _is_recall_tool_name(name):
         return True
     if name in SHELL_TOOLS:
-        command = str((inp or {}).get("command") or "")
-        return any(pat in command for pat in RECALL_PAT)
+        return is_recall_command(str((inp or {}).get("command") or ""), powershell=name == "PowerShell")
     if name in AGENT_TOOLS:   # 기록층 조회를 맡긴 서브에이전트 — 2026-10-05 오탐(에이전트 결과 전달 답을 되돌림) 보정
         prompt = str((inp or {}).get("prompt") or "")
         return any(pat in prompt for pat in AGENT_RECALL_PAT)
@@ -249,13 +320,11 @@ def main() -> None:
         return
 
     # ── 회상 마커 기록 ───────────────────────────────────────────────
-    low = tool.lower()
-    if "recall" in low or "mcp-search" in low or "mcp__plugin_claude-mem" in tool:
+    if _is_recall_tool_name(tool):
         recalled()
         return
     if tool in SHELL_TOOLS:
-        command = str(tool_input.get("command") or "")
-        if any(pat in command for pat in RECALL_PAT):
+        if is_recall_command(str(tool_input.get("command") or ""), powershell=tool == "PowerShell"):
             recalled()
         return
 

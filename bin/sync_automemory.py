@@ -41,11 +41,14 @@ def project_from_slug(slug: str, home_slug: Optional[str] = None) -> str:
     return slug[index + len(home) + 1:] or 'home'
 
 
-def parse_memory_file(path: str) -> Dict[str, Any]:
-    """Read single-line scalar fields and metadata.type; preserve the body verbatim.
+def parse_memory_file(path: str, legacy_type: bool = True) -> Dict[str, Any]:
+    """Read single-line scalar fields and the type (metadata.type, else legacy top-level type);
+    preserve the body verbatim.
 
     Matching outer quotes are removed. Full YAML (lists, multiline scalars,
     escapes, anchors and inline comments) is deliberately unsupported.
+    legacy_type=False reproduces the old parser (metadata.type only) — sync uses it to tell
+    which already-synced files were stored as type=unknown.
     """
     with open(path, encoding='utf-8') as stream:
         text = stream.read()
@@ -74,6 +77,10 @@ def parse_memory_file(path: str) -> Dict[str, Any]:
                     fields[key] = value
                 if indented and metadata and key == 'type':
                     fields['type'] = value or 'unknown'
+                # 예전 형식은 type 을 최상위에 둔다(metadata 블록 없음). 이 형식이 전부 unknown 으로
+                # 들어가던 것을 교정한다(2026-10-14 운영 실측 41건). 둘 다 있으면 metadata.type 이 우선.
+                if legacy_type and not indented and key == 'type' and fields['type'] == 'unknown':
+                    fields['type'] = value or 'unknown'
     return {**fields, 'body': body, 'title': fields['description'] or fields['name']}
 
 
@@ -95,15 +102,54 @@ def project_map() -> Dict[str, str]:
     return json.loads(path.read_text(encoding='utf-8'))
 
 
+def projects_root(root: Optional[str] = None) -> Path:
+    """Claude Code 프로젝트 폴더(자동 메모리는 그 아래 <slug>/memory/*.md). sb_rules 도 같은 기준을 쓴다."""
+    return Path(os.path.abspath(os.path.expanduser(root or '~/.claude/projects')))
+
+
+def temp_roots() -> List[str]:
+    """임시 폴더 뿌리. macOS 는 /tmp·/var/folders 의 실체가 /private 아래라 둘 다 둔다. 윈도우는 %TEMP%
+    (gettempdir). sb_rules 의 임시 cwd 판정도 이 목록을 써서 두 곳의 기준이 갈리지 않게 한다."""
+    roots = ['/tmp', '/var/folders', '/private/tmp', '/private/var/folders', tempfile.gettempdir()]
+    real = os.path.realpath(roots[-1])   # 윈도우 8.3 짧은 이름·macOS 심볼릭 링크를 푼 모양도 함께 본다
+    return roots + ([real] if real != roots[-1] else [])
+
+
+def is_temp_slug(slug: str) -> bool:
+    """임시 폴더에서 연 세션(테스트·일회성 실행)의 프로젝트 슬러그인가 — 그 자동 메모리는 가져오지 않는다.
+    슬러그는 cwd 의 영숫자 아닌 글자를 '-' 로 바꾼 것이라 뿌리도 같은 규칙으로 바꿔 앞부분을 비교한다."""
+    fold = str.lower if IS_WINDOWS else str   # 윈도우는 드라이브 문자·폴더 대소문자가 섞인다
+    for root in temp_roots():
+        prefix = fold(re.sub(r'[^A-Za-z0-9]', '-', root).rstrip('-'))
+        if prefix and (fold(slug) == prefix or fold(slug).startswith(prefix + '-')):
+            return True
+    return False
+
+
 def discover(root: str = None) -> List[Tuple[str, str]]:
-    base = Path(os.path.abspath(os.path.expanduser(root or '~/.claude/projects')))
+    base = projects_root(root)
     skip = excluded_projects()
     mapping = project_map()
     return [(mapping.get(project_from_slug(path.parent.parent.name), project_from_slug(path.parent.parent.name)),
              str(path))
             for path in sorted(base.glob('*/memory/*.md'))
             if path.name != 'MEMORY.md' and path.is_file()
-            and project_from_slug(path.parent.parent.name) not in skip]
+            and project_from_slug(path.parent.parent.name) not in skip
+            and not is_temp_slug(path.parent.parent.name)]
+
+
+def memory_hash(memory: Dict[str, Any]) -> str:
+    """변경 감지·중복 키(sid)용 해시. type 도 넣는다 — 파싱 교정으로 type 만 바뀐 파일이 같은 sid 로 막히지 않고
+    다시 올라가게(운영 실측: 교정 뒤에도 type=unknown 관측 58건이 그대로 남았다)."""
+    return content_hash(memory['body'], '{}\n{}'.format(memory['title'], memory['type']))
+
+
+def _legacy_unchanged(path: str, memory: Dict[str, Any], previous: Dict[str, Any]) -> bool:
+    """type 칸이 없는 예전 상태 항목: 본문·제목이 같고 type 도 예전 파서가 본 값 그대로면 바뀐 게 없다.
+    예전 해시는 type 을 몰라 이걸 안 보면 모든 사용자가 첫 동기화에 전 파일을 다시 저장한다.
+    예전 파서(metadata.type 만)가 unknown 으로 본 파일이 지금 다른 type 이면 그것만 다시 올린다."""
+    return ('type' not in previous and previous.get('hash') == content_hash(memory['body'], memory['title'])
+            and parse_memory_file(path, legacy_type=False)['type'] == memory['type'])
 
 
 def _state_path(path: Optional[str] = None) -> Path:
@@ -156,12 +202,16 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
         result['details'].append(detail)
         try:
             memory = parse_memory_file(path)
-            digest = content_hash(memory['body'], memory['title'])
+            digest = memory_hash(memory)
             previous = state.get(path, {})
             detail['hash'] = digest
-            if previous.get('hash') == digest:
+            legacy = _legacy_unchanged(path, memory, previous)
+            if previous.get('hash') == digest or legacy:
                 result['unchanged'] += 1
                 detail['action'] = 'unchanged'
+                if not dry_run and legacy:
+                    previous.update(hash=digest, type=memory['type'])   # 상태만 새 해시로 옮긴다(재저장 없음)
+                    dirty = True
                 if not dry_run and 'deleted_at' in previous:
                     del previous['deleted_at']
                     dirty = True
@@ -189,7 +239,7 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
             supersedes = list(previous.get('supersedes', []))
             if old_id is not None and old_id not in supersedes:
                 supersedes.append(old_id)
-            state[path] = {'hash': digest, 'obs_id': obs_id, 'synced_at': now,
+            state[path] = {'hash': digest, 'type': memory['type'], 'obs_id': obs_id, 'synced_at': now,
                            'supersedes': supersedes}
             dirty = True
             result['saved'] += 1
@@ -197,7 +247,7 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
         except (RuntimeError, OSError, UnicodeError) as exc:
             result['failed'] += 1
             detail.update(action='failed', error=str(exc))
-    base = Path(os.path.abspath(os.path.expanduser(root or '~/.claude/projects')))
+    base = projects_root(root)
     for path, entry in state.items():
         source = Path(path)
         if (source.parent.name != 'memory' or source.parent.parent.parent != base

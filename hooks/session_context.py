@@ -67,6 +67,85 @@ def build(cwd: str):
     return '\n'.join(out).strip(), scope_id, method, shown, omitted, used_briefing
 
 
+CORRECTION_DAYS = 7
+CORRECTION_MAX = 3
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def correction_lines(cwd: str) -> list:
+    """세션 중 알림을 못 받고 끝난 교정 후보(hooks/sb_correction.py 대기열)를 다음 세션 시작에 한 번 보여 준다(2026-10-21).
+    판정은 백그라운드라 세션이 먼저 끝나면 같은 세션 다음 프롬프트 알림(sb_recall)을 못 받는다.
+    같은 폴더·최근 7일·최대 3건, 세션 중 이미 알린 것(*.corr.json notified)과 이미 브리핑한 것은 뺀다."""
+    import glob
+    import time
+    import sb_config
+    queue = os.environ.get('SB_CORRECTION_QUEUE') or sb_config.sb_path('index', 'correction_candidates.jsonl')
+    if not os.path.exists(queue):
+        return []
+    state_dir = os.environ.get('SB_RECALL_STATE_DIR') or sb_config.sb_path('index', 'sb-recall-state')
+    briefed_path = os.path.join(state_dir, 'corrections.briefed.json')
+    seen = set()
+    for fp in glob.glob(os.path.join(state_dir, '*.corr.json')):
+        try:
+            with open(fp, encoding='utf-8') as fh:
+                seen |= set(json.load(fh).get('notified', []))
+        except Exception:
+            pass
+    try:
+        with open(briefed_path, encoding='utf-8') as fh:
+            briefed = set(json.load(fh))
+    except Exception:
+        briefed = set()
+    cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(time.time() - CORRECTION_DAYS * 86400))  # 대기열 ts 와 같은 지역 시각
+    with open(queue, encoding='utf-8', errors='replace') as fh:
+        tail = fh.read().splitlines()[-500:]
+    cands = []
+    for line in tail:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or not r.get('cwd') or not r.get('rule'):   # 빈 cwd 는 realpath('')=현재 폴더라 오매칭된다
+            continue
+        key = r.get('ts', '') + '|' + r['rule'][:40]   # sb_recall.pending_corrections 와 같은 키
+        if r.get('ts', '') >= cut and key not in seen and key not in briefed and _same_dir(r['cwd'], cwd):
+            cands.append((key, r['rule']))
+    if not cands:
+        return []
+    shown = cands[-CORRECTION_MAX:]
+    out = ['📝 지난 세션에서 규칙으로 저장되지 않은 사용자 교정 %d건 — 맞으면 지금 규칙·메모리에 저장하고 아니면 무시:' % len(cands)]
+    out += ['  · %s' % rule[:120] for _, rule in shown]
+    try:
+        import sb_lock
+        os.makedirs(state_dir, exist_ok=True)
+        # 같은 폴더 세션 둘이 동시에 시작하면 읽기·합치기·교체가 엇갈려 한쪽 키가 사라진다 — *.corr.json 과 같은 방식(<파일>.lock)으로 잠근다.
+        # 훅이라 오래 기다리지 않는다: 못 잡으면(TimeoutError 도 OSError) 이번 기록만 건너뛴다 — 다음 세션에 같은 후보가 한 번 더 뜰 뿐.
+        with open(briefed_path + '.lock', 'a') as lk:   # 닫으면 잠금도 풀린다
+            sb_lock.lock_with_timeout(lk, sb_lock.LOCK_EX, 0.5)
+            try:   # 잠근 뒤 다시 읽어 합친다 — 앞서 읽은 뒤 다른 세션이 써 넣은 키를 덮지 않게
+                with open(briefed_path, encoding='utf-8') as fh:
+                    briefed = set(json.load(fh))
+            except Exception:
+                pass
+            # sb_recall 도 이 파일을 읽어 같은 세션 다음 프롬프트의 [교정 감지]에서 뺀다(resume·compact 이중 표시 방지) —
+            # 쓰다 만 파일을 읽지 않게 임시 파일에 쓰고 통째로 바꾼다(교체 실패로 남은 .tmp 는 sb_recall 의 오래된 상태 파일 정리가 지운다).
+            tmp = briefed_path + '.%d.tmp' % os.getpid()
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                # 7일 창을 지난 키는 다시 뜰 일이 없으니 버린다(파일이 계속 커지지 않게)
+                json.dump(sorted({k for k in briefed if k[:19] >= cut} | {k for k, _ in shown}), fh)
+            try:
+                os.replace(tmp, briefed_path)
+            except PermissionError:   # 윈도우: sb_recall 이 마침 읽는 중이면 교체가 거부된다 — 잠깐 뒤 한 번만 더
+                time.sleep(0.05)
+                os.replace(tmp, briefed_path)
+    except OSError:
+        pass
+    return out
+
+
 def health_line() -> str:
     """기록층 건강 점검 — 문제가 있으면 경고 한 줄, 고칠 수 있으면 백그라운드 자동 복구(sb_health --fix)."""
     if os.environ.get('SB_HEALTH', '1') == '0':
@@ -127,6 +206,12 @@ def main() -> None:
             import traceback
             traceback.print_exc()
         return
+    try:
+        corr = correction_lines(cwd)
+    except Exception:  # noqa: BLE001 — 교정 후보 표시 실패가 세션 시작을 막으면 안 된다
+        corr = []
+    if corr:
+        text = (text + '\n\n' + '\n'.join(corr)).strip()
     try:
         warn = health_line()
     except Exception:  # noqa: BLE001 — 점검 실패가 세션 시작을 막으면 안 된다

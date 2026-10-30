@@ -14,6 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 import sb_config  # noqa: E402
 import sb_lock  # noqa: E402
 
+# 윈도우: 훅·자식 프로세스의 표준 입출력이 기본 코드페이지(cp949)라 한국어가 깨지거나 인코딩 오류로 조용히 실패한다 — UTF-8 고정.
+for _s in (sys.stdin,):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 QUEUE = os.environ.get("SB_CORRECTION_QUEUE") or sb_config.sb_path("index", "correction_candidates.jsonl")
 def _llm_conf() -> dict:

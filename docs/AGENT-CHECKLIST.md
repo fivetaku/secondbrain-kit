@@ -38,13 +38,14 @@
   - [ ] claude-mem 설정 (mode=code--ko)
   - [ ] 벡터 임베딩 = `openai` (기존 사용자면 `ollama`도 정상)
   - [ ] Ollama bge-m3, `~/.chroma_env`
-  - [ ] Claude 훅 5종(SessionStart·UserPromptSubmit·PreToolUse(AskUserQuestion)·Stop·SubagentStart — 도구 호출마다 뜨는 훅은 두지 않는다), Claude claude-mem 플러그인 (Claude 쓰는 경우)
+  - [ ] **chroma-mcp 기동** — 워커와 같은 인자로 실제로 띄워 본 결과. ❌에 `eval_type_backport`가 보이면 pydantic 고정 도구가 빠진 것이다(설치기 재실행). 첫 실행은 내려받기로 오래 걸려 ⚠일 수 있다
+  - [ ] Claude 훅 6종(SessionStart·UserPromptSubmit·PreToolUse(AskUserQuestion)·Stop·SubagentStart·PostToolUseFailure). PostToolUseFailure는 Claude Code 2.1.119 이상에서만 걸리므로 그보다 낮으면 `5종 등록`이 정상이다. 키트는 도구 호출마다 뜨는 PostToolUse 훅을 두지 않는다(claude-mem 플러그인의 캡처 훅은 별개). Claude claude-mem 플러그인도 확인 (Claude 쓰는 경우)
   - [ ] **회수 훅 실동작** — 한국어 프롬프트를 실제로 넣어 주입이 나오는지(등록 여부만으론 부족: 윈도우 cp949에서 조용히 전부 빗나간 사례)
   - [ ] 윈도우: `sb 명령(Git Bash)` — Claude Code 의 Bash 도구는 `sb.cmd` 를 `sb` 로 못 부른다
   - [ ] Codex 훅, **Codex 훅 신뢰 N개**, Codex claude-mem 플러그인 훅 = 꺼짐 (Codex 쓰는 경우)
   - [ ] 규칙 블록 (CLAUDE.md / AGENTS.md)
   - [ ] 상태층(state.db)
-- [ ] 이 시점에 ⚠여도 되는 것: `claude-mem worker`(세션 열면 뜸), `캡처 … 아직 없음`, `sb 명령 PATH`(새 터미널에서 해결)
+- [ ] 이 시점에 ⚠여도 되는 것: `claude-mem worker`(세션 열면 뜸), `회수 상주 서버(sb_recalld)`(세션 열거나 `sb recall` 한 번이면 뜸), `캡처 … 아직 없음`, `sb 명령 PATH`(새 터미널에서 해결)
 
 ## D. 실제 동작 확인 (새 터미널에서)
 
@@ -57,7 +58,8 @@
   - 답을 git·파일만 보고 끝내려 하면 Stop 게이트가 1회 되돌리는지
 - [ ] **D-4 한국어 검색**: `sb search '<방금 작업 키워드(한국어)>' --global --limit 5` 에 결과가 나오는지. 기존 claude-mem 사용자인데 임베딩이 `default`면 `docs/embedding.md` 절차를 사용자에게 제안(자동 실행 금지 — 재색인 필요)
 - [ ] **D-5 결정 기록**: 사용자에게 간단한 결정 하나(예: "이 프로젝트 기본 브랜치는 main")를 말하게 하고 → `sb prompt-id` → `sb state propose/verify/accept` → 새 세션에서 브리핑에 `user-confirmed`로 뜨는지
-- [ ] **D-6 스케줄**: 맥 `launchctl list | grep secondbrain-kit` (koindex·nightly), 윈도우 `schtasks /Query /TN "secondbrain-kit\nightly"`
+- [ ] **D-6 교정 감지(선택)**: 기본은 꺼져 있다(판정 LLM 설정이 없으면 아무것도 하지 않는다). 사용자가 원할 때만 README "교정 감지" 절차로 `~/.secondbrain/index/correction_llm.json`을 만들게 한다 — 키는 사용자가 직접 넣는다
+- [ ] **D-7 스케줄**: 맥 `launchctl list | grep secondbrain-kit` (koindex·nightly), 윈도우 `schtasks /Query /TN "secondbrain-kit\nightly"`
 
 ## E. 실패 대응
 
@@ -66,6 +68,7 @@
 | [1] 필수 도구 없음 | node/git 미설치, Node 20.12 미만 | 사용자에게 설치 명령 안내 후 재실행 |
 | [2] venv | uv 설치 직후 PATH 미반영 | 새 터미널에서 재실행 |
 | [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@13.24.23 install --provider <p> --no-auto-start`를 직접 실행해 오류 확인 |
+| [3] `chroma-mcp 고정 설치 실패` 경고 | uv 네트워크, uv 없음 | 그대로 두면 벡터 동기화가 pydantic 2.14로 멈출 수 있다. 원인을 고친 뒤 설치기 재실행 → doctor `chroma-mcp 기동` ✅ 확인 |
 | [4] 임베딩 | Ollama 서버 미기동, 모델 다운로드 실패 | Ollama 앱 실행 → `ollama pull bge-m3` → 재실행. 급하면 `--no-embed` |
 | [7] Codex | 신뢰 등록 실패 | venv 파이썬으로 `installer/codex_trust.py trust --match "<키트 경로>"` |
 | 윈도우 전반 | PowerShell 실행 정책 | `powershell -ExecutionPolicy Bypass -File .\install.ps1` |

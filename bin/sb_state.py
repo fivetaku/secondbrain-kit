@@ -446,7 +446,17 @@ def check_user_utterance(cand: sqlite3.Row, target: str) -> Tuple[str, str, str]
             return 'rejected', '', 'prompt session project %r does not belong to scope' % row['project']
         text = str(row['prompt_text'] or '')
     else:
+        # 사용자 발화 파일 근거는 등록된 발화 기록(SB_UTTERANCE_FILES, os.pathsep 구분)이면서 그 scope 의 경로 안일 때만 받는다.
+        # 허용 루트 안이라는 것만으로는 봇·에이전트가 쓴 파일도 '사용자 발화'가 된다(2026-10-30 복사본 시험에서 재현).
         path, lines = _check_path(target)
+        norm = os.path.normcase(str(path))
+        allowed = {_norm_path(f.strip()) for f in os.environ.get('SB_UTTERANCE_FILES', '').split(os.pathsep) if f.strip()}
+        if norm not in allowed:
+            return 'rejected', '', 'file is not a registered user-utterance record'
+        roots = [_norm_path(e) for k, es in _load_aliases().items() if _norm_name(k) == _norm_name(cand['scope_id'])
+                 for e in es if is_path_entry(e)]
+        if not any(path_within(norm, r) and norm != r for r in roots):
+            return 'rejected', '', 'utterance file outside scope paths'
         if not path.is_file():
             return 'unknown', '', 'record file missing'
         text = _read_region(path, lines)

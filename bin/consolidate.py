@@ -197,6 +197,10 @@ def consolidate(project: str, week: str, db_path: str = None, dry_run: bool = Fa
             outcome = {'status': 'skipped', 'reason': 'prompt_limit'}
         elif dry_run:
             outcome = {'status': 'dry_run'}
+        elif sb_memory.already_saved(sb_memory.dedup_key({'source': SOURCE, 'sid': sid}, '', ''), db_path):
+            # 같은 입력으로 이미 저장된 조각은 LLM 을 부르지 않는다 — 저장 직전 중복 판정만으로는
+            # 재실행마다 조각 수만큼 LLM 을 다시 불러 시간 한도를 넘긴다(2026-10 운영 실측).
+            outcome = {'status': 'duplicate', 'reason': 'already_saved'}
         else:
             outcome = _consolidate_part(project, week, retained, db_path=db_path,
                                         prompt=prompt, sid=sid, extra=extra)

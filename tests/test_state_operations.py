@@ -32,6 +32,13 @@ class StateOpsBase(unittest.TestCase):
         self.evidence = self.tmp / 'deploy.txt'
         self.evidence.write_text('deploy target: staging-2\nport: 8443\n', encoding='utf-8')
 
+    def register_utterance(self, record):
+        """파일 발화 근거는 등록된 기록이면서 scope 경로 안이어야 한다(2026-10-31)."""
+        (self.tmp / 'aliases.json').write_text(json.dumps({'proj-a': [str(self.tmp), 'legacy-a'], 'proj-b': ['/nonexistent/proj-b']}),
+                                               encoding='utf-8')
+        os.environ['SB_UTTERANCE_FILES'] = str(record)
+        self.addCleanup(os.environ.pop, 'SB_UTTERANCE_FILES', None)
+
     def tearDown(self):
         for k, v in self._old.items():
             if v is None:
@@ -94,6 +101,9 @@ class CandidateGateTests(StateOpsBase):
         self.assertEqual(wrong['result'], 'rejected')
         with self.assertRaises(sb_state.StateError):
             sb_state.accept(r['candidate_id'], 0)
+        unregistered = sb_state.verify(r['candidate_id'], 'user_utterance_check', str(record) + '#1-1')
+        self.assertEqual(unregistered['result'], 'rejected')
+        self.register_utterance(record)
         ok = sb_state.verify(r['candidate_id'], 'user_utterance_check', str(record) + '#1-1')
         self.assertEqual(ok['result'], 'confirmed')
         acc = sb_state.accept(r['candidate_id'], 0)
@@ -136,10 +146,22 @@ class CandidateGateTests(StateOpsBase):
         with self.assertRaises(sb_state.StateError):
             sb_state.verify(r['candidate_id'], 'file_contains', 'relative/path.txt')
 
+    def test_user_utterance_file_outside_scope_paths_is_rejected(self):
+        record = self.tmp / 'bot-proposals.jsonl'
+        record.write_text('배포 대상은 staging-2 로 확정한다\n', encoding='utf-8')
+        os.environ['SB_UTTERANCE_FILES'] = str(record)
+        self.addCleanup(os.environ.pop, 'SB_UTTERANCE_FILES', None)
+        r = self.propose(kind='user_decision', write_id='d-scope')
+        v = sb_state.verify(r['candidate_id'], 'user_utterance_check', str(record))
+        self.assertEqual((v['result'], v['detail']), ('rejected', 'utterance file outside scope paths'))
+        with self.assertRaises(sb_state.StateError):
+            sb_state.accept(r['candidate_id'], 0)
+
     def test_line_span_forms_and_hash_in_filename(self):
         record = self.tmp / 'notes#v2.md'
         record.write_text('header\nuser: 배포 대상은 staging-2 로 확정한다\nfooter\n', encoding='utf-8')
         r = self.propose(kind='user_decision', write_id='span')
+        self.register_utterance(record)
         for target in (str(record) + '#L2-L2', str(record) + '#2-3', str(record) + '#L2', str(record)):
             with self.subTest(target=target):
                 self.assertEqual(sb_state.verify(r['candidate_id'], 'user_utterance_check', target)['result'], 'confirmed')

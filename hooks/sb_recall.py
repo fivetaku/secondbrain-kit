@@ -24,7 +24,9 @@ for _s in (sys.stdin, sys.stdout):
         pass
 
 WORKER = os.environ.get("SB_RECALL_WORKER") or sb_config.worker_base_url()
-MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "5"))
+MAX_ITEMS = int(os.environ.get("SB_RECALL_MAX", "3"))   # 2026-10-31: 5→3. 실제 프롬프트 40개 블라인드 평가에서 잡음 -39, 쓸모 있는 기록을 받은 프롬프트 수는 그대로
+FETCH = int(os.environ.get("SB_RECALL_FETCH", "10"))    # 자기 세션·20분 내 기록을 거른 뒤에도 MAX_ITEMS 를 채우려고 넉넉히 받는다
+LAST = {}   # 마지막 recalld 응답의 후보 순서·게이트 — 회수 방식 비교의 운영 기준선으로 남긴다
 MAX_CHARS = 700
 MIN_PROMPT = 12
 # 세션별 주입 원장. 2026-10-21: 임시 폴더는 재부팅마다 지워져 같은 세션에 같은 기록이 다시 주입됐다 → SB_HOME 아래 영속 경로.
@@ -166,6 +168,17 @@ def _bodies(ids):
 
 # 검색 백엔드: worker(claude-mem 의미검색, 문턱 없음) | recalld(상주 형태소 색인 + 문턱)
 BACKEND = os.environ.get("SB_RECALL_BACKEND", "recalld")
+# recalld 응답 대기(초). 2026-10-20 재순위기가 켜진 뒤 질의당 0.4~0.9초가 실측돼 1.5초면 느린 PC에서 버려졌다 → 3초.
+# 훅 전체 제한(15초) 안에서 워커 폴백(3초)까지 들어간다. SB_RECALLD_TIMEOUT 으로 조정.
+RECALLD_TIMEOUT_DEFAULT = 3.0
+
+
+def recalld_timeout() -> float:
+    try:
+        v = float(os.environ.get("SB_RECALLD_TIMEOUT") or RECALLD_TIMEOUT_DEFAULT)
+    except ValueError:
+        return RECALLD_TIMEOUT_DEFAULT
+    return v if v > 0 else RECALLD_TIMEOUT_DEFAULT
 
 
 def recalld_search(prompt: str, project: str):
@@ -173,8 +186,8 @@ def recalld_search(prompt: str, project: str):
     try:
         import sb_recalld
         url = sb_recalld.base_url() + "/recall?" + urllib.parse.urlencode(
-            {"q": prompt[:500], "project": project, "limit": str(MAX_ITEMS)})
-        with urllib.request.urlopen(url, timeout=1.5) as r:
+            {"q": prompt[:500], "project": project, "limit": str(FETCH)})
+        with urllib.request.urlopen(url, timeout=recalld_timeout()) as r:
             d = json.loads(r.read().decode("utf-8"))
     except Exception:
         try:
@@ -185,6 +198,7 @@ def recalld_search(prompt: str, project: str):
         return None
     if d.get("db") and d["db"] != sb_recalld.db_path():   # 다른 DB 를 보는 서버(테스트 등) — 쓰지 않는다
         return None
+    LAST.update(gate=d.get("gate"), cand=[it["id"] for it in d.get("items", [])])
     if not (d.get("gate") or {}).get("pass"):
         return []
     return [{"id": it["id"], "date": it.get("date", ""), "kind": "", "title": it.get("title", ""),
@@ -351,6 +365,17 @@ def pending_corrections(sid: str, notified: set):
     return out
 
 
+def briefed_corrections() -> set:
+    """세션 시작 브리핑(hooks/session_context.py)이 이미 보여 준 교정 후보 키(2026-10-30).
+    같은 세션 ID 로 이어지는 시작(resume·compact)에서 브리핑에 뜬 후보가 다음 프롬프트 [교정 감지]에 또 뜨지 않게 뺀다.
+    이 훅은 읽기만 하고 쓰는 쪽은 session_context 하나라 두 훅이 같은 파일을 다투지 않는다."""
+    try:
+        with open(os.path.join(STATE_DIR, "corrections.briefed.json"), encoding="utf-8") as fh:
+            return set(json.load(fh))
+    except Exception:
+        return set()
+
+
 def correction_note(sid: str, prompt: str, cwd: str) -> str:
     """교정 판정 작업을 프롬프트당 한 번 띄우고, 이 세션에 쌓인 미통지 후보를 최대 3건 알린다(보여 준 것만 통지 완료)."""
     path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".corr.json")
@@ -366,7 +391,7 @@ def correction_note(sid: str, prompt: str, cwd: str) -> str:
             if p and not p.startswith(("/", "<")) and ph not in cst["checked"]:
                 cst["checked"] = (cst["checked"] + [ph])[-200:]
                 spawn_correction_check(sid, p, cwd)
-            shown = pending_corrections(sid, set(cst["notified"]))[:3]
+            shown = pending_corrections(sid, set(cst["notified"]) | briefed_corrections())[:3]
             if shown:
                 note = ("[교정 감지] 이 세션의 사용자 교정이 지속 규칙으로 보인다. 맞으면 지금 규칙·메모리에 저장하고, 아니면 무시한다.\n"
                         + "\n".join("- " + rule for _, rule in shown))
@@ -458,7 +483,9 @@ def _main_locked(raw, prompt, sid, project, state_path, corr):
     fresh = [it for it in items if it["id"] not in seen][:MAX_ITEMS]
     hint = TIME_HINT if is_history_question(prompt) else ""
     recall_log({"sid": hashlib_sid(sid), "project": project, "ids": [it["id"] for it in fresh],
-                "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000)})
+                "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000),
+                "prompt_sha": hashlib_sid(prompt.strip()), "cand": LAST.get("cand", []), "gate": LAST.get("gate"),
+                "kept": [it["id"] for it in items], "max": MAX_ITEMS})
     if not fresh and not hint:
         emit(corr)
         return

@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -120,6 +121,28 @@ class AutomemoryTests(unittest.TestCase):
             'name': 'plain', 'description': '', 'type': 'unknown',
             'body': 'No frontmatter.\n', 'title': 'plain'})
 
+    def test_parser_legacy_top_level_type(self) -> None:
+        # 예전 형식: metadata 블록 없이 최상위 type: — unknown 이 아니라 그 값을 읽는다.
+        self.plain.write_text('---\nname: old\ndescription: 예전 규칙\ntype: "feedback"\n---\n본문\n',
+                              encoding='utf-8')
+        self.assertEqual(automemory.parse_memory_file(str(self.plain))['type'], 'feedback')
+        # 둘 다 있으면 순서와 상관없이 metadata.type 이 우선한다.
+        for text in ('---\ntype: user\nmetadata:\n  type: feedback\n---\nb\n',
+                     '---\nmetadata:\n  type: feedback\ntype: user\n---\nb\n'):
+            self.plain.write_text(text, encoding='utf-8')
+            self.assertEqual(automemory.parse_memory_file(str(self.plain))['type'], 'feedback', text)
+        # 본문 안의 type: 줄은 프론트매터가 아니다.
+        self.plain.write_text('---\nname: x\n---\ntype: feedback\n', encoding='utf-8')
+        self.assertEqual(automemory.parse_memory_file(str(self.plain))['type'], 'unknown')
+
+    def test_legacy_type_reaches_saved_text(self) -> None:
+        self.plain.write_text('---\nname: old\ndescription: 예전 규칙\ntype: feedback\n---\n본문\n',
+                              encoding='utf-8')
+        automemory.sync(root=str(self.root), state_path=str(self.state_path), only_project='secondbrain')
+        payload = self.post.call_args.args[1]
+        self.assertTrue(payload['text'].startswith('[자동 메모리 · type=feedback · file=plain.md]'))
+        self.assertEqual(payload['metadata']['extra']['type'], 'feedback')
+
     def test_parser_unterminated_frontmatter_preserves_body(self) -> None:
         text = '---\nname: incomplete\n본문\n'
         self.plain.write_text(text, encoding='utf-8')
@@ -135,7 +158,7 @@ class AutomemoryTests(unittest.TestCase):
         self.assertEqual((first['scanned'], first['saved'], first['failed']), (2, 2, 0))
         self.assertEqual(self.post.call_count, 2)
         payload = self.post.call_args_list[0].args[1]
-        digest = sb_memory.content_hash('본문 보존\n', '개발: 선호')
+        digest = sb_memory.content_hash('본문 보존\n', '개발: 선호\nfeedback')   # type 도 해시에 든다
         self.assertEqual(payload['text'],
                          '[자동 메모리 · type=feedback · file=preferences.md]\n본문 보존\n')
         self.assertEqual(payload['title'], '[automemory] sample-app · 개발: 선호')
@@ -168,6 +191,69 @@ class AutomemoryTests(unittest.TestCase):
             stream.write('third version\n')
         self.run_sync()
         self.assertEqual(automemory.load_state()[str(self.topic)]['supersedes'], [old_id, second_id])
+
+    def old_state(self) -> Dict[str, Any]:
+        """type 칸이 없던 예전 상태(해시는 본문·제목만)로 되돌린다."""
+        state = automemory.load_state()
+        for path, entry in state.items():
+            memory = automemory.parse_memory_file(path)
+            entry['hash'] = sb_memory.content_hash(memory['body'], memory['title'])
+            del entry['type']
+        automemory.save_state(state, str(self.state_path))
+        return state
+
+    def test_old_state_migrates_without_resaving(self) -> None:
+        # 해시 형식이 바뀌어도 기존 사용자가 첫 동기화에 전 파일을 다시 저장하지 않는다
+        self.run_sync()
+        before = self.old_state()
+        self.assertEqual(self.run_sync(dry_run=True)['unchanged'], 2)
+        self.assertEqual(automemory.load_state(), before)   # dry-run 은 상태도 안 바꾼다
+        result = self.run_sync()
+        self.assertEqual((result['unchanged'], result['saved'], self.post.call_count), (2, 0, 2))
+        state = automemory.load_state()
+        self.assertEqual(state[str(self.topic)]['type'], 'feedback')
+        self.assertEqual(state[str(self.topic)]['obs_id'], before[str(self.topic)]['obs_id'])
+        self.assertEqual(state[str(self.plain)]['hash'],
+                         automemory.memory_hash(automemory.parse_memory_file(str(self.plain))))
+        self.assertEqual(self.run_sync()['unchanged'], 2)
+
+    def test_old_state_legacy_type_file_resynced_once(self) -> None:
+        # 예전 파서가 type=unknown 으로 올린 최상위 type: 파일만 교정된 type 으로 다시 올린다(나머지는 그대로)
+        self.plain.write_text('---\nname: old\ndescription: 예전 규칙\ntype: feedback\n---\n본문\n', encoding='utf-8')
+        self.run_sync()
+        old_id = automemory.load_state()[str(self.plain)]['obs_id']
+        self.old_state()
+        result = self.run_sync()
+        self.assertEqual((result['saved'], result['unchanged']), (1, 1))
+        payload = self.post.call_args.args[1]
+        self.assertTrue(payload['text'].startswith('[자동 메모리 · type=feedback · file=plain.md]'))
+        self.assertEqual(payload['metadata']['extra']['supersedes'], old_id)
+        self.assertEqual(automemory.load_state()[str(self.plain)]['supersedes'], [old_id])
+        self.assertEqual(self.run_sync()['saved'], 0)
+
+    def test_type_only_change_resyncs(self) -> None:
+        self.run_sync()
+        self.topic.write_text(self.topic.read_text(encoding='utf-8').replace('type: feedback', 'type: user'),
+                              encoding='utf-8')
+        result = self.run_sync()
+        self.assertEqual((result['saved'], result['unchanged']), (1, 1))
+        self.assertTrue(self.post.call_args.args[1]['text'].startswith('[자동 메모리 · type=user'))
+
+    def test_discover_skips_temp_folder_projects(self) -> None:
+        slug = lambda path: re.sub(r'[^A-Za-z0-9]', '-', path)  # noqa: E731
+        temp_slugs = ['-tmp-scratch', '-private-tmp-run1', '-private-var-folders-ab-cd-T-tmpxyz',
+                      slug(os.path.join(tempfile.gettempdir(), 'tmpproj'))]   # 윈도우에서는 %TEMP% 아래
+        for name in temp_slugs + ['-Users-demo-tmp-notes', '-tmpwork']:
+            folder = self.root / name / 'memory'
+            folder.mkdir(parents=True)
+            (folder / 'note.md').write_text('body\n', encoding='utf-8')
+        found = {Path(path).parent.parent.name for _, path in automemory.discover(str(self.root))}
+        self.assertFalse(found & set(temp_slugs))
+        self.assertTrue({'-Users-demo-tmp-notes', '-tmpwork', '-Users-demo-sample-app'} <= found)
+        with patch.object(automemory, 'IS_WINDOWS', True), \
+                patch.object(automemory, 'temp_roots', return_value=['C:\\Users\\kim\\AppData\\Local\\Temp']):
+            self.assertTrue(automemory.is_temp_slug('c--users-kim-AppData-Local-Temp-proj'))
+            self.assertFalse(automemory.is_temp_slug('C--Users-kim-proj'))
 
     def test_dry_run_has_no_post_or_state_write(self) -> None:
         result = self.run_sync(dry_run=True)
