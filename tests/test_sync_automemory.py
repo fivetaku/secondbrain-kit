@@ -320,5 +320,221 @@ class AutomemoryTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.base.iterdir()), ['projects', 'state.json'])
 
 
+LONG_BODY = '\n\n'.join('## 구간 {}\n'.format(i) + ('내용 문장 {} 입니다. '.format(i) * 18) for i in range(1, 7))
+
+
+class SplitBodyTests(unittest.TestCase):
+    def test_short_body_stays_whole(self) -> None:
+        self.assertEqual(automemory.split_body('짧은 본문', 800), ['짧은 본문'])
+
+    def test_zero_cap_disables_split(self) -> None:
+        self.assertEqual(automemory.split_body(LONG_BODY, 0), [LONG_BODY])
+
+    def test_every_part_fits_cap_and_keeps_content(self) -> None:
+        parts = automemory.split_body(LONG_BODY, 300)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= 300 for part in parts))
+        squeeze = lambda text: re.sub(r'\s', '', text)  # noqa: E731
+        self.assertEqual(squeeze(''.join(parts)), squeeze(LONG_BODY))
+
+    def test_parts_start_at_headings_when_possible(self) -> None:
+        parts = automemory.split_body(LONG_BODY, 300)
+        self.assertTrue(parts[0].startswith('## 구간 1'))
+        self.assertTrue(any(part.startswith('## 구간 2') for part in parts[1:]))
+
+    def test_single_long_line_is_sliced(self) -> None:
+        parts = automemory.split_body('가' * 2000, 800)
+        self.assertEqual([len(part) for part in parts], [800, 800, 400])
+
+
+class AutomemorySplitTests(unittest.TestCase):
+    fake_post = AutomemoryTests.fake_post
+    run_sync = AutomemoryTests.run_sync
+
+    def setUp(self) -> None:
+        AutomemoryTests.setUp(self)
+        self.long = self.alpha / 'handoff.md'
+        self.long.write_text('---\nname: handoff\ndescription: 인계 문서\nmetadata:\n  type: project\n---\n'
+                             + LONG_BODY + '\n', encoding='utf-8')
+        env = patch.dict(os.environ, {'SB_AUTOMEM_CHUNK_CHARS': '300'})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def saved_titles(self) -> list:
+        return [call.args[1]['title'] for call in self.post.call_args_list]
+
+    def long_entry(self) -> Dict[str, Any]:
+        return json.loads(self.state_path.read_text(encoding='utf-8'))[str(self.long)]
+
+    def test_long_file_becomes_numbered_parts(self) -> None:
+        self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        parts = len(entry['obs_ids'])
+        self.assertGreater(parts, 1)
+        self.assertEqual(entry['obs_id'], entry['obs_ids'][0])
+        self.assertEqual(entry['split'], 300)
+        titles = [t for t in self.saved_titles() if '인계 문서' in t]
+        self.assertEqual(len(titles), parts)
+        self.assertEqual(len(set(titles)), parts)   # 근사 중복 접기에 묶이지 않게 제목이 달라야 한다
+        self.assertTrue(titles[1].endswith('(2/{})'.format(parts)))
+
+    def test_part_text_repeats_memory_title(self) -> None:
+        self.run_sync(only_project='sample-app')
+        texts = [c.args[1]['text'] for c in self.post.call_args_list if '인계 문서' in c.args[1]['title']]
+        self.assertIn('조각 2/', texts[1])
+        self.assertTrue(all('인계 문서' in text for text in texts))   # 벡터엔 본문만 들어가 제목을 본문에도 넣는다
+
+    def test_short_file_keeps_old_shape(self) -> None:
+        self.run_sync(only_project='sample-app')
+        state = json.loads(self.state_path.read_text(encoding='utf-8'))
+        entry = state[str(self.topic)]
+        self.assertEqual(entry['split'], 0)
+        self.assertEqual(entry['obs_ids'], [entry['obs_id']])
+        titles = [t for t in self.saved_titles() if '선호' in t]
+        self.assertEqual(titles, ['[automemory] sample-app · 개발: 선호'])
+
+    def test_second_run_saves_nothing(self) -> None:
+        self.run_sync()
+        calls = self.post.call_count
+        result = self.run_sync()
+        self.assertEqual(self.post.call_count, calls)
+        self.assertEqual(result['saved'], 0)
+
+    def test_existing_whole_record_is_migrated_once(self) -> None:
+        with patch.dict(os.environ, {'SB_AUTOMEM_CHUNK_CHARS': '0'}):
+            self.run_sync(only_project='sample-app')
+        old = self.long_entry()['obs_id']
+        result = self.run_sync(dry_run=True, only_project='sample-app')
+        pending = [d for d in result['details'] if d.get('action') == 'would_save']
+        self.assertEqual([d['path'] for d in pending], [str(self.long)])
+        self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        self.assertIn(old, entry['supersedes'])
+        self.assertGreater(len(entry['obs_ids']), 1)
+        calls = self.post.call_count
+        self.run_sync(only_project='sample-app')
+        self.assertEqual(self.post.call_count, calls)
+
+    def test_turning_split_off_restores_whole_record(self) -> None:
+        saved: Dict[str, int] = {}
+        real = self.fake_post
+
+        def tracking(url: str, payload: Dict[str, Any], timeout: int) -> Tuple[int, str]:
+            status, body = real(url, payload, timeout)
+            saved[payload['metadata']['dedup_key']] = json.loads(body)['id']
+            return status, body
+
+        self.post.side_effect = tracking
+        with patch.object(sb_memory, 'already_saved', side_effect=lambda key, db=None: key in saved), \
+                patch.object(automemory, 'find_saved_id', side_effect=saved.get):
+            with patch.dict(os.environ, {'SB_AUTOMEM_CHUNK_CHARS': '0'}):
+                self.run_sync(only_project='sample-app')
+            whole = self.long_entry()['obs_id']
+            self.run_sync(only_project='sample-app')
+            parts = self.long_entry()['obs_ids']
+            with patch.dict(os.environ, {'SB_AUTOMEM_CHUNK_CHARS': '0'}):
+                self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        self.assertEqual(entry['obs_ids'], [whole])
+        self.assertNotIn(whole, entry['supersedes'])   # 다시 쓰는 기록이 회수에서 숨겨지면 안 된다
+        self.assertTrue(set(parts) <= set(entry['supersedes']))
+        self.assertEqual(entry['split'], 0)
+
+    def test_changed_file_supersedes_every_old_part(self) -> None:
+        self.run_sync(only_project='sample-app')
+        old = self.long_entry()['obs_ids']
+        self.long.write_text(self.long.read_text(encoding='utf-8') + '\n추가 문단\n', encoding='utf-8')
+        self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        self.assertTrue(set(old) <= set(entry['supersedes']))
+        self.assertFalse(set(old) & set(entry['obs_ids']))
+
+    def test_failed_part_keeps_state_and_resumes_without_duplicates(self) -> None:
+        saved: Dict[str, int] = {}
+        real = self.fake_post
+
+        def flaky(url: str, payload: Dict[str, Any], timeout: int) -> Tuple[int, str]:
+            if '(3/' in payload['title'] and not hasattr(self, 'failed_once'):
+                raise OSError('worker down')
+            status, body = real(url, payload, timeout)
+            saved[payload['metadata']['dedup_key']] = json.loads(body)['id']
+            return status, body
+
+        self.post.side_effect = flaky
+        with patch.object(sb_memory, 'already_saved', side_effect=lambda key, db=None: key in saved), \
+                patch.object(automemory, 'find_saved_id', side_effect=saved.get), \
+                patch.object(sb_memory.time, 'sleep'):
+            first = self.run_sync(only_project='sample-app')
+            self.assertEqual(first['failed'], 1)
+            self.assertNotIn('hash', self.long_entry())
+            self.assertEqual(len(self.long_entry()['pending']), 2)
+            self.failed_once = True
+            before = len(saved)
+            self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        self.assertEqual(len(entry['obs_ids']), len(set(entry['obs_ids'])))
+        self.assertTrue(set(list(saved.values())[:before]) <= set(entry['obs_ids']) | {self.state_topic_id()})
+
+    def fail_third_part_once(self) -> None:
+        real = self.fake_post
+        self.failed_once = False
+
+        def flaky(url: str, payload: Dict[str, Any], timeout: int) -> Tuple[int, str]:
+            if '(3/' in payload['title'] and not self.failed_once:
+                raise OSError('worker down')
+            return real(url, payload, timeout)
+
+        self.post.side_effect = flaky
+
+    def test_parts_of_abandoned_version_are_hidden_after_edit(self) -> None:
+        self.fail_third_part_once()
+        with patch.object(sb_memory.time, 'sleep'):
+            self.run_sync(only_project='sample-app')
+        orphans = self.long_entry()['pending']
+        self.failed_once = True
+        self.long.write_text(self.long.read_text(encoding='utf-8') + '\n수정\n', encoding='utf-8')
+        self.run_sync(only_project='sample-app')
+        entry = self.long_entry()
+        self.assertTrue(set(orphans) <= set(entry['supersedes']))
+        self.assertNotIn('pending', entry)
+
+    def test_parts_of_failed_save_are_hidden_when_file_is_deleted(self) -> None:
+        self.fail_third_part_once()
+        with patch.object(sb_memory.time, 'sleep'):
+            self.run_sync(only_project='sample-app')
+        orphans = self.long_entry()['pending']
+        self.long.unlink()
+        self.run_sync(only_project='sample-app')
+        self.assertTrue(set(orphans) <= set(self.long_entry()['supersedes']))
+
+    def test_chunk_size_change_never_reuses_old_parts(self) -> None:
+        self.run_sync(only_project='sample-app')
+        keys = {c.args[1]['metadata']['dedup_key'] for c in self.post.call_args_list}
+        with patch.dict(os.environ, {'SB_AUTOMEM_CHUNK_CHARS': '290'}):
+            self.run_sync(only_project='sample-app')
+        new = {c.args[1]['metadata']['dedup_key'] for c in self.post.call_args_list} - keys
+        self.assertEqual(len(new), len(self.long_entry()['obs_ids']))
+
+    def test_part_keeps_leading_indent(self) -> None:
+        parts = automemory.split_body('a' * 10 + '\n\n    들여쓴 코드\n', 12)
+        self.assertEqual(parts[1], '    들여쓴 코드')
+
+    def state_topic_id(self) -> int:
+        return json.loads(self.state_path.read_text(encoding='utf-8'))[str(self.topic)]['obs_id']
+
+    def test_deleted_file_hides_every_part(self) -> None:
+        self.run_sync(only_project='sample-app')
+        ids = set(self.long_entry()['obs_ids'])
+        self.long.unlink()
+        self.run_sync(only_project='sample-app')
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'hooks'))
+        import sb_recall
+        import sb_recalld
+        with patch.object(sb_recalld.sb_config, 'sb_path', return_value=str(self.state_path)):
+            self.assertTrue(ids <= sb_recalld.superseded_ids())
+        with patch.object(sb_recall.sb_config, 'sb_path', return_value=str(self.state_path)):
+            self.assertTrue(ids <= sb_recall.superseded_ids())
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -52,15 +52,20 @@ def dedup_key(prov: Dict[str, Any], text: str, title: str) -> str:
     return '{}:{}'.format(prov['source'], prov.get('sid') or content_hash(text, title))
 
 
-def already_saved(key: str, db_path: str = None) -> bool:
+def find_saved_id(key: str, db_path: str = None) -> Optional[int]:
     target = Path(db_path or os.environ.get('SB_CLAUDE_MEM_DB') or
                   sb_config.claude_mem_db()).expanduser().resolve()
     if not target.exists():
-        return False
+        return None
     with closing(sqlite3.connect(target.as_uri() + '?mode=ro', uri=True)) as db:
-        return db.execute(
-            "SELECT 1 FROM observations WHERE json_extract(metadata,'$.dedup_key') = ? LIMIT 1",
-            (key,)).fetchone() is not None
+        row = db.execute(
+            "SELECT id FROM observations WHERE json_extract(metadata,'$.dedup_key') = ? LIMIT 1",
+            (key,)).fetchone()
+    return row[0] if row else None
+
+
+def already_saved(key: str, db_path: str = None) -> bool:
+    return find_saved_id(key, db_path) is not None
 
 
 def journal(event: Dict[str, Any], path: str = None) -> None:

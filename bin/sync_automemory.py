@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -13,7 +14,51 @@ from typing import List, Dict, Any, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sb_config import IS_WINDOWS, sb_path
-from sb_memory import build_provenance, content_hash, save_memory
+from sb_memory import build_provenance, content_hash, dedup_key, find_saved_id, save_memory
+
+
+# 긴 메모리 파일을 나누는 글자 수. 파일 통째 1관측이면 벡터 1개로 뭉쳐 묻히고, Ollama /v1/embeddings 는 2048토큰 뒤를
+# 오류 없이 버린다(2026-11-06 실측). 800자: 긴 문서 질문 30개 3위 안 4→13, 일반 관측 질문 40개 악화 0.
+DEFAULT_CHUNK_CHARS = 800
+_BLOCK_START = re.compile(r'(?m)^(?=#{1,4} |\*\*[^\n]{2,80}\*\*\s*$|\*\*[^\n]{2,40}\*\*[:：])|\n\s*\n')
+
+
+def chunk_chars() -> int:
+    """SB_AUTOMEM_CHUNK_CHARS. 0 이면 나누지 않는다. 숫자가 아니거나 음수면 기본값."""
+    try:
+        value = int(os.environ.get('SB_AUTOMEM_CHUNK_CHARS', DEFAULT_CHUNK_CHARS))
+    except ValueError:
+        return DEFAULT_CHUNK_CHARS
+    return value if value >= 0 else DEFAULT_CHUNK_CHARS
+
+
+def _blocks(body: str) -> List[str]:
+    """제목·굵은 글씨 줄·빈 줄 경계로 자른 블록."""
+    edges = [0] + [match.start() for match in _BLOCK_START.finditer(body)] + [len(body)]
+    return [body[start:end] for start, end in zip(edges, edges[1:]) if body[start:end].strip()]
+
+
+def _pieces(block: str, cap: int) -> List[str]:
+    """cap 을 넘는 블록을 줄 단위로, 그래도 넘는 줄은 글자 단위로 자른다."""
+    if len(block) <= cap:
+        return [block]
+    return [line[start:start + cap] for line in block.splitlines(keepends=True)
+            for start in range(0, len(line), cap)]
+
+
+def split_body(body: str, cap: int) -> List[str]:
+    """본문을 cap 글자 이하 조각으로 나눈다. 겹침 없이 앞에서부터 블록을 채운다. cap 0 이나 짧은 본문은 그대로."""
+    if cap <= 0 or len(body) <= cap:
+        return [body]
+    parts: List[str] = []
+    current = ''
+    for piece in (piece for block in _blocks(body) for piece in _pieces(block, cap)):
+        if current and len(current) + len(piece) > cap:
+            parts.append(current.strip('\r\n'))
+            current = ''
+        current += piece
+    parts.append(current.strip('\r\n'))
+    return [part for part in parts if part.strip()]
 
 
 def _home_slug() -> str:
@@ -187,6 +232,59 @@ def save_state(state: Dict[str, Any], path: str = None) -> None:
             os.unlink(temporary)
 
 
+class PartialSave(RuntimeError):
+    """조각 저장이 중간에 멈췄다. ids 는 이미 저장된 조각 — 다음 판으로 넘어가면 숨겨야 한다."""
+
+    def __init__(self, ids: List[int], cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.ids = ids
+
+
+def _retire_pending(entry: Dict[str, Any]) -> bool:
+    """실패로 남은 조각 중 현재 판이 쓰지 않는 것을 supersedes 로 옮긴다. 옮길 게 있었으면 True."""
+    pending = entry.pop('pending', [])
+    current = entry.get('obs_ids', [])
+    supersedes = entry.get('supersedes', [])
+    entry['supersedes'] = supersedes + [i for i in pending if i not in current and i not in supersedes]
+    return bool(pending)
+
+
+def _save_parts(project: str, path: str, memory: Dict[str, Any], digest: str, parts: List[str],
+                old_id: Optional[int], reuse_whole: bool, chunk_size: int) -> List[int]:
+    """파일 하나를 관측 1건 이상으로 저장하고 id 목록을 돌려준다. 통째 저장이 이미 있으면 빈 목록
+    (분할을 끄거나 줄여 예전 통째 기록으로 돌아가는 reuse_whole 이면 그 id).
+    조각 저장은 중간에 실패해도 다음 실행이 이어간다 — 이미 저장된 조각은 dedup_key 로 id 를 찾아 다시 쓴다."""
+    total = len(parts)
+    title = '[automemory] {} · {}'.format(project, memory['title'])
+    ids: List[int] = []
+    for number, part in enumerate(parts, 1):
+        whole = total == 1
+        # 조각 크기를 넣는다 — 같은 내용을 다른 크기로 나눠 개수만 같을 때 옛 조각을 다시 쓰지 않게
+        sid = path + '#' + digest if whole else '{}#{}#{}:{}/{}'.format(path, digest, chunk_size, number, total)
+        prov = build_provenance(
+            source='claude-code-automemory', kind='automemory-sync',
+            origin='sync_automemory', created_by='secondbrain-batch',
+            sid=sid, content_hash=digest, verification='user-authored',
+            extra={'type': memory['type'], 'name': memory['name'], 'path': path, 'supersedes': old_id})
+        head = '[자동 메모리 · type={} · file={}'.format(memory['type'], Path(path).name)
+        # 벡터에는 본문만 들어가 제목을 본문 첫머리에도 둔다
+        text = head + ']\n' + part if whole else '{} · 조각 {}/{}]\n{}\n{}'.format(
+            head, number, total, memory['title'], part)
+        part_title = title if whole else '{} ({}/{})'.format(title, number, total)
+        try:
+            obs_id = save_memory(text=text, title=part_title, project=project, prov=prov)
+            if obs_id == -1:
+                if whole and not reuse_whole:
+                    return []
+                obs_id = find_saved_id(dedup_key(prov, text, part_title))
+                if obs_id is None:
+                    raise RuntimeError('saved part not found: {}'.format(part_title))
+        except (RuntimeError, sqlite3.Error) as exc:
+            raise PartialSave(ids, exc) from exc
+        ids.append(obs_id)
+    return ids
+
+
 def sync(root: str = None, state_path: str = None, dry_run: bool = False,
          only_project: Optional[str] = None) -> Dict[str, Any]:
     state = load_state(state_path)
@@ -194,6 +292,7 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
               'failed': 0, 'details': []}
     now = datetime.now(timezone.utc).isoformat()
     dirty = False
+    cap = chunk_chars()
     for project, path in discover(root):
         if only_project is not None and project != only_project:
             continue
@@ -206,7 +305,9 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
             previous = state.get(path, {})
             detail['hash'] = digest
             legacy = _legacy_unchanged(path, memory, previous)
-            if previous.get('hash') == digest or legacy:
+            parts = split_body(memory['body'], cap)
+            split = cap if len(parts) > 1 else 0
+            if (previous.get('hash') == digest or legacy) and previous.get('split', 0) == split:
                 result['unchanged'] += 1
                 detail['action'] = 'unchanged'
                 if not dry_run and legacy:
@@ -215,36 +316,37 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
                 if not dry_run and 'deleted_at' in previous:
                     del previous['deleted_at']
                     dirty = True
+                if not dry_run and _retire_pending(previous):
+                    dirty = True
                 continue
             old_id = previous.get('obs_id')
             if dry_run:
                 detail.update(action='would_save', supersedes=old_id)
                 continue
-            prov = build_provenance(
-                source='claude-code-automemory', kind='automemory-sync',
-                origin='sync_automemory', created_by='secondbrain-batch',
-                sid=path + '#' + digest, content_hash=digest,
-                verification='user-authored',
-                extra={'type': memory['type'], 'name': memory['name'],
-                       'path': path, 'supersedes': old_id})
-            obs_id = save_memory(
-                text='[자동 메모리 · type={} · file={}]\n{}'.format(
-                    memory['type'], Path(path).name, memory['body']),
-                title='[automemory] {} · {}'.format(project, memory['title']),
-                project=project, prov=prov)
-            if obs_id == -1:
+            resplit = previous.get('split', 0) != split
+            obs_ids = _save_parts(project, path, memory, digest, parts, old_id, resplit, split)
+            if not obs_ids:
                 result['skipped_dup'] += 1
                 detail['action'] = 'skipped_dup'
                 continue
             supersedes = list(previous.get('supersedes', []))
-            if old_id is not None and old_id not in supersedes:
-                supersedes.append(old_id)
-            state[path] = {'hash': digest, 'type': memory['type'], 'obs_id': obs_id, 'synced_at': now,
-                           'supersedes': supersedes}
+            supersedes += [i for i in previous.get('obs_ids', [old_id]) if i is not None and i not in supersedes]
+            supersedes = [i for i in supersedes if i not in obs_ids]   # 다시 쓰는 기록은 숨기지 않는다
+            state[path] = {'hash': digest, 'type': memory['type'], 'obs_id': obs_ids[0], 'obs_ids': obs_ids,
+                           'split': split, 'synced_at': now, 'supersedes': supersedes,
+                           'pending': previous.get('pending', [])}
+            _retire_pending(state[path])
             dirty = True
             result['saved'] += 1
-            detail.update(action='saved', obs_id=obs_id, supersedes=old_id)
-        except (RuntimeError, OSError, UnicodeError) as exc:
+            detail.update(action='saved', obs_id=obs_ids[0], parts=len(obs_ids), supersedes=old_id)
+        except PartialSave as exc:
+            if exc.ids:
+                pending = previous.get('pending', [])
+                state[path] = {**previous, 'pending': pending + [i for i in exc.ids if i not in pending]}
+                dirty = True
+            result['failed'] += 1
+            detail.update(action='failed', error=str(exc))
+        except (RuntimeError, OSError, UnicodeError, sqlite3.Error) as exc:
             result['failed'] += 1
             detail.update(action='failed', error=str(exc))
     base = projects_root(root)
@@ -261,6 +363,7 @@ def sync(root: str = None, state_path: str = None, dry_run: bool = False,
                                       'action': 'would_mark_deleted' if dry_run else 'deleted'})
             if not dry_run:
                 entry['deleted_at'] = now
+                _retire_pending(entry)
                 dirty = True
     if dirty:
         save_state(state, state_path)
