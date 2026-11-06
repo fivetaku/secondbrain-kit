@@ -9,6 +9,16 @@ claude-mem은 벡터 컬렉션(`cm__claude-mem`)을 만들 때 임베딩을 지�
 - chroma-mcp는 홈 디렉토리의 `~/.chroma_env`에서 `CHROMA_OPENAI_API_KEY=ollama`를 읽는다(값은 Ollama가 무시하지만 변수는 있어야 한다).
 - Ollama가 꺼져 있으면 벡터 저장·검색이 실패하고, 검색은 한국어 형태소 색인만으로 계속 동작한다.
 
+## 입력 길이 한도 (num_batch)
+- 2026-11-06 원 PC 실측(Ollama 0.40.13): `ollama ps`는 bge-m3 컨텍스트를 8192로 보여 주지만 러너가 `-c 8192 -b 2048 -ub 2048`로 떠서, `/api/embed`와 `/v1/embeddings` 모두 **2048토큰 뒤를 에러 없이 버린다**(꼬리만 다른 두 입력의 벡터가 같다). 한국어는 약 2.1자/토큰이라 약 4,300자부터 잘린다. `num_ctx`를 올려도 그대로다.
+- 설치기는 `ollama pull bge-m3` 직후 모델에 `PARAMETER num_batch 8192`를 넣는다(`ollama create bge-m3`). 그러면 8192토큰(모델 한도)까지 반영된다. 2048토큰 이하 입력의 벡터는 바뀌지 않아(cos 1.0) 기존 컬렉션과 그대로 호환된다. 러너 메모리는 약 0.35GB 늘고 짧은 질의 지연은 같다.
+- `ollama pull bge-m3`를 따로 실행하면 이름표가 원본으로 돌아가 다시 잘린다. `./install.sh --doctor`의 `bge-m3 입력 한도`가 ⚠이면 설치기를 다시 돌리거나 아래를 실행한다.
+  ```
+  printf 'FROM bge-m3\nPARAMETER num_batch 8192\n' > /tmp/bge-m3.Modelfile
+  ollama create bge-m3 -f /tmp/bge-m3.Modelfile
+  ```
+- 이미 저장된 긴 기록(2048토큰 초과)은 예전처럼 앞부분만 반영된 벡터로 남는다. 새로 저장되는 기록부터 전체가 반영된다. 원 PC에서는 긴 문서 50건 시험에서 뒷부분 내용으로 찾을 때 MRR 0.426→0.555, 앞부분으로 찾을 때 0.739→0.716이었다.
+
 ## chroma-mcp 버전 고정
 - 2026-10-12, uvx가 chroma-mcp 환경을 새로 풀면서 pydantic 2.14.1을 받았다. chroma-mcp 0.2.6이 고정한 mcp 1.6.0은 2.14에서 사라진 `pydantic._internal._typing_extra.eval_type_backport`를 import해 시작하자마자 죽었고, 벡터 동기화가 4시간 넘게 멈췄다. 2026-10-30에 고정 없이 다시 띄워도 같은 ImportError가 났다.
 - claude-mem 워커는 자기 인자(`uvx --python 3.13 --with onnxruntime>=1.20 --with protobuf<7 --from chroma-mcp==0.2.6 chroma-mcp`)로 chroma-mcp를 띄우므로, 설치기가 자기 명령에 붙인 고정은 워커에 닿지 않는다. 그래서 설치기는 같은 인자에 `--with "pydantic<2.14"`를 더해 `uv tool install`로 도구를 깔아 둔다. uvx는 요구를 만족하는 설치 도구가 있으면 새로 풀지 않고 그 환경을 쓴다(uv 0.10 실측).

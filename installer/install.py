@@ -274,6 +274,28 @@ def chroma_ef_name(chroma_dir: Path) -> str:
     return m.group(1)
 
 
+# Ollama(0.40.13 실측)는 bge-m3 러너를 -c 8192 -b 2048 -ub 2048 로 띄워 /api/embed·/v1/embeddings 가
+# 2048토큰 뒤를 에러 없이 버린다. 모델에 num_batch 8192 를 넣으면 8192토큰(모델 한도)까지 반영된다.
+# 짧은 입력의 벡터는 그대로라 기존 컬렉션과 호환된다(docs/embedding.md "입력 길이 한도").
+EMBED_NUM_BATCH = 8192
+
+
+def ensure_embed_num_batch(ollama: str) -> None:
+    if DRY:
+        say('  [dry-run] ollama create bge-m3 (PARAMETER num_batch %d)' % EMBED_NUM_BATCH)
+        return
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        mf = Path(tmp) / 'Modelfile'
+        mf.write_text('FROM bge-m3\nPARAMETER num_batch %d\n' % EMBED_NUM_BATCH, encoding='utf-8')
+        r = run([ollama, 'create', 'bge-m3', '-f', mf], check=False, capture=True)
+    if r.returncode != 0:
+        say('  ⚠ bge-m3 num_batch 설정 실패 — 2048토큰 넘는 기록은 앞부분만 임베딩됩니다: %s'
+            % (r.stderr or '').strip()[-200:])
+    else:
+        say('  bge-m3 num_batch=%d (8192토큰까지 임베딩)' % EMBED_NUM_BATCH)
+
+
 def setup_embedding(args, tools) -> None:
     say('\n[4] 한국어 임베딩 (Ollama bge-m3)')
     if args.no_embed:
@@ -283,6 +305,7 @@ def setup_embedding(args, tools) -> None:
         raise SystemExit('ollama 실행 파일을 찾지 못했습니다. 방금 설치했다면 새 터미널에서 다시 실행하세요(또는 --no-embed).')
     ensure_ollama_running(tools['ollama'])
     run([tools['ollama'], 'pull', 'bge-m3'])
+    ensure_embed_num_batch(tools['ollama'])   # pull 이 이름표를 원본으로 되돌리므로 pull 뒤에 매번 다시 넣는다
     env_file = HOME / '.chroma_env'
     line = 'CHROMA_OPENAI_API_KEY=ollama'
     text = env_file.read_text(encoding='utf-8') if env_file.exists() else ''

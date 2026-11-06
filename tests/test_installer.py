@@ -156,6 +156,34 @@ class HasEquivalentTest(unittest.TestCase):
         self.assertTrue(any('건너뜀: UserPromptSubmit' in m for m in log), log)
 
 
+class EmbedNumBatchTest(unittest.TestCase):
+    # Ollama 는 bge-m3 를 -b 2048 -ub 2048 로 띄워 2048토큰 뒤를 조용히 버린다 → 모델에 num_batch 8192 를 넣는다
+    def test_create_after_pull_with_num_batch(self):
+        seen = {}
+
+        def fake_run(cmd, check=True, capture=False, env=None, cwd=None):
+            seen['argv'] = [str(c) for c in cmd]
+            seen['modelfile'] = Path(cmd[-1]).read_text(encoding='utf-8')
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        with mock.patch.object(inst, 'run', side_effect=fake_run), mock.patch.object(inst, 'DRY', False):
+            inst.ensure_embed_num_batch('ollama')
+        self.assertEqual(seen['argv'][:3], ['ollama', 'create', 'bge-m3'])
+        self.assertIn('FROM bge-m3\n', seen['modelfile'])
+        self.assertIn('PARAMETER num_batch 8192', seen['modelfile'])
+
+    def test_create_failure_is_reported_not_raised(self):
+        with mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'boom')), \
+                mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'say') as say:
+            inst.ensure_embed_num_batch('ollama')
+        self.assertIn('num_batch 설정 실패', say.call_args[0][0])
+
+    def test_doctor_parses_num_batch(self):
+        self.assertEqual(doctor.parse_num_batch('num_batch                      8192'), 8192)
+        self.assertEqual(doctor.parse_num_batch('num_ctx 4096\nnum_batch 512\n'), 512)
+        self.assertEqual(doctor.parse_num_batch(''), 0)
+        self.assertEqual(doctor.parse_num_batch('stop "x"'), 0)
+
+
 class ChromaPinTest(unittest.TestCase):
     def test_chroma_uvx_pins_pydantic(self):
         i = inst.CHROMA_UVX.index('pydantic<2.14')
