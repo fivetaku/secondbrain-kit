@@ -389,8 +389,8 @@ def superseded_ids():
     for entry in st.values():
         if isinstance(entry, dict):
             out.update(i for i in entry.get('supersedes', []) if isinstance(i, int))
-            if entry.get('deleted_at') and isinstance(entry.get('obs_id'), int):
-                out.add(entry['obs_id'])
+            if entry.get('deleted_at'):
+                out.update(i for i in entry.get('obs_ids', [entry.get('obs_id')]) if isinstance(i, int))
     return out
 
 

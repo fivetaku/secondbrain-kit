@@ -154,6 +154,7 @@ Claude Code에서 도구 호출이 실패하면(PostToolUseFailure, Claude Code 
 | `SB_HOME` | `~/.secondbrain` | 키트 데이터 폴더(색인·상태층·미결·규칙층·로그·venv). 설치기가 `~/.claude/settings.json`의 `env`에 적는다. 바꾸려면 그 값으로 설치기를 다시 돌린다 |
 | **회수** | | |
 | `SB_RECALL` | `1` | `0`이면 프롬프트별 회수를 끈다(자동화·배치용) |
+| `SB_AUTOMEM_CHUNK_CHARS` | `800` | 자동 메모리 파일을 이 글자 수 이하 조각 관측으로 나눈다. 파일 통째 1관측이면 벡터 1개로 뭉쳐 묻히고 임베딩이 2048토큰 뒤를 조용히 버린다. `0`이면 나누지 않는다. 값을 바꾸면 다음 동기화가 다시 저장한다 |
 | `SB_RECALL_MAX` | `5` | 회수 목록 최대 줄 수 |
 | `SB_RECALL_BODIES` | `3` | 요지를 붙일 상위 건수. `0`이면 제목만 |
 | `SB_RECALL_BACKEND` | `recalld` | `worker`면 상주 서버 대신 claude-mem 워커 의미 검색(관련도 문턱 없음) |
