@@ -20,7 +20,7 @@ Claude Code와 Codex 세션에서 쌓인 작업 기록을 **다음 세션의 에
 ```
 [캡처]  Claude Code 훅 ─┐          Codex 훅(자동화 exec 제외) ─┐
                         └→ claude-mem worker → LLM이 도구 사용을 '관측'으로 요약
-[저장]  ~/.claude-mem/claude-mem.db (SQLite) + Chroma 벡터(bge-m3, 다국어)
+[저장]  ~/.claude-mem/claude-mem.db (SQLite) + Chroma 벡터(BGE-m3-ko, 한국어 추가학습 bge-m3)
 [파생]  ~/.secondbrain/index  한국어 형태소 색인(Kiwi) · 벡터 스냅샷
 [상태]  ~/.secondbrain/state.db  "지금 참인 사실" — 제안 → 검증 → 채택 (근거가 있어야 채택)
         ~/.secondbrain/loops     미결
@@ -31,7 +31,7 @@ Claude Code와 Codex 세션에서 쌓인 작업 기록을 **다음 세션의 에
 ```
 
 - **관측 로그(claude-mem)** 는 "그때 무슨 일이 있었나", **상태층** 은 "지금 무엇이 참인가"를 맡는다. 사용자 결정은 실제 발화를 인용해 검증된 뒤에만 `user-confirmed`로 채택된다.
-- 검색은 한국어 형태소 색인과 벡터를 RRF로 합친다. claude-mem 기본 임베딩(영어 전용 MiniLM)은 한국어 회수율이 거의 0이라, 설치 때 Ollama `bge-m3`로 컬렉션을 미리 만든다.
+- 검색은 한국어 형태소 색인과 벡터를 RRF로 합친다. claude-mem 기본 임베딩(영어 전용 MiniLM)은 한국어 회수율이 거의 0이라, 설치 때 Ollama `bge-m3-ko`(BGE-m3-ko)로 컬렉션을 미리 만든다.
 
 ## 요구사항
 
@@ -59,7 +59,7 @@ irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps
 설치가 하는 일 (모두 멱등, 바꾸는 설정 파일은 `.sbkit-bak-<시각>`으로 백업):
 1. `~/.secondbrain/.venv` 생성, 상태층 DB 초기화
 2. `npx claude-mem install` — Claude Code 플러그인 등록, bun/uv 설치. 이어서 chroma-mcp 고정 도구 설치(`uv tool install … --with "pydantic<2.14" chroma-mcp==0.2.6`) — 2026-10-12에 uvx가 pydantic 2.14를 받아 오자 chroma-mcp 0.2.6이 시작하자마자 ImportError로 죽고 벡터 동기화가 4시간 넘게 멈췄다. claude-mem 워커는 자기 인자로 chroma-mcp를 띄우지만, 조건에 맞는 설치 도구가 있으면 uvx가 그것을 다시 쓰므로 고정이 워커에도 걸린다([docs/embedding.md](docs/embedding.md#chroma-mcp-버전-고정))
-3. `ollama pull bge-m3`, Chroma 컬렉션을 다국어 임베딩으로 선생성, `~/.chroma_env`
+3. BGE-m3-ko GGUF를 받아 Ollama `bge-m3-ko` 생성(실패 시 `bge-m3`), Chroma 컬렉션을 한국어 임베딩으로 선생성, `~/.chroma_env`
 4. claude-mem 설정(한국어 관측 모드, 주입량) — 이미 있는 값은 건드리지 않음
 5. Claude Code 훅 6종 (`~/.claude/settings.json`, 기존 훅은 보존): SessionStart · UserPromptSubmit · PreToolUse(AskUserQuestion) · Stop · SubagentStart · PostToolUseFailure. PostToolUseFailure(오류 시점 회수)는 Claude Code 2.1.119 이상에서만 걸고, 그보다 낮으면 5종이다 — 2.1.101 이전 버전은 모르는 이벤트가 하나라도 있으면 settings.json 전체를 무시하기 때문이다. 같은 역할의 사용자 훅이 이미 있으면 그 이벤트는 건너뛴다
 6. Codex: claude-mem 플러그인(검색 MCP·스킬) 설치, 플러그인 훅은 끄고 키트의 캡처 훅으로 대체(`codex exec` 자동화 제외), **훅 신뢰 등록**까지 자동. 키트 훅은 SessionStart(브리핑)·UserPromptSubmit(회수)이고, 오류 시점 회수·회상 게이트는 Claude 전용이다
@@ -96,7 +96,7 @@ sb health [--fix]                   # 기록층이 막힌 곳이 없는지 점�
 | 점검 | 실패하면 |
 |---|---|
 | claude-mem 워커, 관찰기 프록시(`~/.claude-mem/.env`의 `ANTHROPIC_BASE_URL`이 있을 때) | 새 기록이 생기지 않는다 |
-| Ollama(설치기가 bge-m3 임베딩을 켠 PC만) | 의미 검색에 새 기록이 안 잡힌다 |
+| Ollama(설치기가 BGE-m3-ko 임베딩을 켠 PC만) | 의미 검색에 새 기록이 안 잡힌다 |
 | 야간 배치 결과·신선도 | 메모리 동기화·색인이 밀린다 |
 | 메모리 동기화 대기 · 벡터 미반영 · 한국어 색인 지연 | 회수 결과가 낡은 판에 머문다 |
 | 훅 대기열 정체·만료 | 세션 기록이 유실된다 |

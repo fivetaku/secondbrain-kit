@@ -6,6 +6,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -65,6 +66,22 @@ def check_settings():
         s.get('CLAUDE_MEM_PROVIDER', 'claude'), s.get('CLAUDE_MEM_MODEL', '-'), s.get('CLAUDE_MEM_MODE', '-')))
 
 
+def parse_num_batch(parameters: str) -> int:
+    m = re.search(r'^num_batch\s+(\d+)', parameters or '', re.M)
+    return int(m.group(1)) if m else 0
+
+
+def embed_num_batch(model='bge-m3-ko'):
+    """임베딩 모델 파라미터의 num_batch(없으면 0, 조회 실패면 None). Ollama 기본은 2048토큰에서 조용히 자른다."""
+    try:
+        req = urllib.request.Request('http://127.0.0.1:11434/api/show', data=json.dumps({'model': model}).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return parse_num_batch(json.loads(r.read().decode('utf-8')).get('parameters') or '')
+    except Exception:
+        return None
+
+
 def check_embedding():
     db = sb_config.claude_mem_dir() / 'chroma' / 'chroma.sqlite3'
     if not db.exists():
@@ -77,17 +94,28 @@ def check_embedding():
         return rec('⚠', '벡터 컬렉션', str(exc))
     text = (row or [''])[0] or ''
     name = 'openai' if '"name":"openai"' in text else 'ollama' if '"name":"ollama"' in text else 'default'
+    mm = re.search(r'"model_name":"([^"]+)"', text)
+    model = mm.group(1) if mm else ''
     if name == 'default':
         rec('⚠', '벡터 임베딩', 'default (영어 전용 — 한국어 검색 약함)')
     elif 'bge-m3' not in text:
-        rec('⚠', '벡터 임베딩', name + ' 이지만 bge-m3 가 아님 — 키트 설정과 다른 기존 컬렉션(docs/embedding.md)')
+        rec('⚠', '벡터 임베딩', name + ' 이지만 bge-m3 계열이 아님 — 키트 설정과 다른 기존 컬렉션(docs/embedding.md)')
+    elif model == 'bge-m3':
+        rec('✅', '벡터 임베딩', name + ' / bge-m3 (BGE-m3-ko 가 한국어 회수에 더 낫다 — 바꾸려면 재색인, docs/embedding.md)')
     else:
-        rec('✅', '벡터 임베딩', name + ' / bge-m3')
+        rec('✅', '벡터 임베딩', name + ' / ' + (model or 'bge-m3 계열'))
     if name in ('openai', 'ollama'):
+        model = model or 'bge-m3-ko'
         try:
             tags = json.loads(_get('http://127.0.0.1:11434/api/tags'))
-            ok = any(m.get('name', '').startswith('bge-m3') for m in tags.get('models', []))
-            rec('✅' if ok else '❌', 'Ollama bge-m3', '있음' if ok else 'ollama pull bge-m3 필요')
+            ok = any(m.get('name', '').split(':')[0] == model for m in tags.get('models', []))
+            rec('✅' if ok else '❌', 'Ollama ' + model, '있음' if ok else '없음 — 설치기 재실행(4단계가 모델을 준비)')
+            if ok:
+                nb = embed_num_batch(model)
+                if nb is not None:
+                    rec('✅' if nb >= 8192 else '⚠', model + ' 입력 한도',
+                        'num_batch %d (8192토큰)' % nb if nb >= 8192 else
+                        'num_batch 미설정 — 2048토큰 넘는 기록은 앞부분만 임베딩됨. 설치기 재실행(docs/embedding.md)')
         except Exception:
             rec('❌', 'Ollama', '127.0.0.1:11434 응답 없음 — Ollama 앱/서비스를 켜세요')
         if name == 'openai':

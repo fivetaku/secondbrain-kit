@@ -10,7 +10,7 @@
   1  사전 요구사항 확인 (node, git, uv, claude, codex, ollama)
   2  venv (~/.secondbrain/.venv) + requirements
   3  claude-mem 설치 (npx claude-mem install — bun/uv 자동 설치, 플러그인 등록까지) + chroma-mcp 고정 도구
-  4  한국어 임베딩: ollama bge-m3 + Chroma 컬렉션 선생성(OpenAI 호환 EF → Ollama /v1)
+  4  한국어 임베딩: Ollama bge-m3-ko(BGE-m3-ko GGUF, 실패 시 bge-m3) + Chroma 컬렉션 선생성(OpenAI 호환 EF → Ollama /v1)
   5  claude-mem settings.json 병합 (한국어 모드, 주입량)
   6  Claude Code 훅 (~/.claude/settings.json)
   7  Codex: claude-mem 플러그인 + 우리 훅 (~/.codex/hooks.json)
@@ -245,7 +245,7 @@ PRECREATE = textwrap.dedent('''
     from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
     os.environ.pop("OPENAI_API_KEY", None); os.environ["CHROMA_OPENAI_API_KEY"] = "ollama"
     c = chromadb.PersistentClient(path=sys.argv[1])
-    ef = OpenAIEmbeddingFunction(model_name="bge-m3", api_base="http://127.0.0.1:11434/v1",
+    ef = OpenAIEmbeddingFunction(model_name=sys.argv[2], api_base="http://127.0.0.1:11434/v1",
                                  api_key_env_var="CHROMA_OPENAI_API_KEY")
     col = c.get_or_create_collection("cm__claude-mem", embedding_function=ef,
                                      metadata={"hnsw:space": "cosine"})
@@ -270,19 +270,153 @@ def chroma_ef_name(chroma_dir: Path) -> str:
     if not m:
         return 'default'
     if m.group(1) in ('openai', 'ollama') and 'bge-m3' not in row[0]:
-        return m.group(1) + '(bge-m3 아님)'
+        return m.group(1) + '(bge-m3 계열 아님)'
     return m.group(1)
 
 
+def collection_model(chroma_dir: Path) -> str:
+    """기존 컬렉션에 저장된 임베딩 모델 이름(bge-m3 / bge-m3-ko 등). 컬렉션이 없거나 읽지 못하면 ''."""
+    db = chroma_dir / 'chroma.sqlite3'
+    if not db.exists():
+        return ''
+    import sqlite3
+    try:
+        con = sqlite3.connect('file:%s?mode=ro' % db.as_posix(), uri=True)
+        row = con.execute("SELECT schema_str FROM collections WHERE name='cm__claude-mem'").fetchone()
+        con.close()
+    except sqlite3.Error:
+        return ''
+    m = re.search(r'"model_name":"([^"]+)"', (row or [''])[0] or '')
+    return m.group(1) if m else ''
+
+
+# 기본 임베딩은 dragonkue/BGE-m3-ko(bge-m3 를 한국어로 추가 학습, Apache-2.0, 1024차원)다. 2026-11-07 원 PC 기록
+# 140질의 블라인드 비교에서 bge-m3 대비 nDCG@10 0.620→0.683, 상위30 회수 91→95(모두 유의)라 교체했다(docs/embedding.md).
+# 공개 GGUF(F16)를 리비전·sha256 고정으로 받아 Ollama 'bge-m3-ko' 로 만든다. 두 출처는 원 PC 변환본과 벡터가 같다(cos 1.0).
+# 받지 못하면 bge-m3 로 내려간다.
+EMBED_MODEL = 'bge-m3-ko'
+EMBED_FALLBACK = 'bge-m3'
+EMBED_GGUF = [
+    ('https://huggingface.co/CHKH01/BGE-m3-ko-GGUF/resolve/87d6f395b1fcefdfdd6bef326a2da1921ed226d9/BGE-m3-ko.f16.gguf',
+     'bd933d041b78ee0676ea851c3a95638c49348be2bc05424659c8fdbecae32ff7'),
+    ('https://huggingface.co/Neuwhufbox/BGE-m3-ko-gguf/resolve/bdde01133cb0d60c7493e419877c9076880ffeea/BGE-M3-567M-F16.gguf',
+     '929e82617dd5f377d3166f0122c2d28b069f704171e7d59c068781840787acea'),
+]
+# Ollama(0.40.13 실측)는 bge-m3 계열 러너를 -c 8192 -b 2048 -ub 2048 로 띄워 /api/embed·/v1/embeddings 가
+# 2048토큰 뒤를 에러 없이 버린다. 모델에 num_batch 8192 를 넣으면 8192토큰(모델 한도)까지 반영된다.
+# 짧은 입력의 벡터는 그대로라 기존 컬렉션과 호환된다(docs/embedding.md "입력 길이 한도").
+EMBED_NUM_BATCH = 8192
+
+
+def ollama_num_batch(model: str):
+    """모델 파라미터의 num_batch(없으면 0). 모델이 없거나 서버가 응답하지 않으면 None."""
+    import urllib.request
+    try:
+        req = urllib.request.Request('http://127.0.0.1:11434/api/show', data=json.dumps({'model': model}).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            params = json.loads(r.read().decode('utf-8')).get('parameters') or ''
+    except Exception:
+        return None
+    m = re.search(r'^num_batch\s+(\d+)', params, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def ensure_embed_num_batch(ollama: str, model: str = EMBED_FALLBACK) -> bool:
+    if DRY:
+        say('  [dry-run] ollama create %s (PARAMETER num_batch %d)' % (model, EMBED_NUM_BATCH))
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        mf = Path(tmp) / 'Modelfile'
+        mf.write_text('FROM %s\nPARAMETER num_batch %d\n' % (model, EMBED_NUM_BATCH), encoding='utf-8')
+        r = run([ollama, 'create', model, '-f', mf], check=False, capture=True)
+    if r.returncode != 0:
+        say('  ⚠ %s num_batch 설정 실패 — 2048토큰 넘는 기록은 앞부분만 임베딩됩니다: %s'
+            % (model, (r.stderr or '').strip()[-200:]))
+        return False
+    say('  %s num_batch=%d (8192토큰까지 임베딩)' % (model, EMBED_NUM_BATCH))
+    return True
+
+
+def download_gguf(dest: Path):
+    """EMBED_GGUF 출처를 차례로 받아 sha256 이 맞는 첫 파일 경로를 돌려준다. 모두 실패하면 None."""
+    import hashlib
+    import urllib.request
+    for url, sha in EMBED_GGUF:
+        part = dest.with_suffix('.part')
+        try:
+            say('  받는 중(약 1.2GB): %s' % url.split('/resolve/')[0].replace('https://huggingface.co/', 'hf:'))
+            h = hashlib.sha256()
+            req = urllib.request.Request(url, headers={'User-Agent': 'secondbrain-kit-installer'})
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, 'wb') as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+            if h.hexdigest() != sha:
+                say('  ⚠ sha256 불일치 — 다음 출처로')
+                part.unlink(missing_ok=True)
+                continue
+            part.replace(dest)
+            return dest
+        except Exception as exc:
+            say('  ⚠ 받기 실패(%s) — 다음 출처로' % (str(exc)[:120]))
+            part.unlink(missing_ok=True)
+    return None
+
+
+def ensure_embed_model(ollama: str) -> str:
+    """bge-m3-ko 를 준비하고(이미 있으면 num_batch 만 확인) 쓸 모델 이름을 돌려준다. 실패하면 bge-m3."""
+    if DRY:
+        say('  [dry-run] BGE-m3-ko GGUF 받기 → ollama create %s (num_batch %d)' % (EMBED_MODEL, EMBED_NUM_BATCH))
+        return EMBED_MODEL
+    nb = ollama_num_batch(EMBED_MODEL)
+    if nb is not None:
+        if nb < EMBED_NUM_BATCH:
+            ensure_embed_num_batch(ollama, EMBED_MODEL)
+        else:
+            say('  %s 있음 (num_batch %d)' % (EMBED_MODEL, nb))
+        return EMBED_MODEL
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        gguf = download_gguf(Path(tmp) / 'bge-m3-ko-f16.gguf')
+        if gguf:
+            mf = Path(tmp) / 'Modelfile'
+            mf.write_text('FROM %s\nPARAMETER num_batch %d\n' % (gguf.as_posix(), EMBED_NUM_BATCH), encoding='utf-8')
+            r = run([ollama, 'create', EMBED_MODEL, '-f', mf], check=False, capture=True)
+            if r.returncode == 0 and (ollama_num_batch(EMBED_MODEL) or 0) >= EMBED_NUM_BATCH:
+                say('  %s 준비됨 (BGE-m3-ko, num_batch %d)' % (EMBED_MODEL, EMBED_NUM_BATCH))
+                return EMBED_MODEL
+            say('  ⚠ ollama create %s 실패: %s' % (EMBED_MODEL, (r.stderr or '').strip()[-200:]))
+    WARNINGS.append('BGE-m3-ko 를 준비하지 못해 bge-m3 로 설치했습니다. 네트워크를 확인하고 설치기를 다시 실행하세요.')
+    say('  ⚠ BGE-m3-ko 준비 실패 — bge-m3 로 진행합니다')
+    run([ollama, 'pull', EMBED_FALLBACK])
+    ensure_embed_num_batch(ollama, EMBED_FALLBACK)
+    return EMBED_FALLBACK
+
+
 def setup_embedding(args, tools) -> None:
-    say('\n[4] 한국어 임베딩 (Ollama bge-m3)')
+    say('\n[4] 한국어 임베딩 (Ollama %s)' % EMBED_MODEL)
     if args.no_embed:
         say('  --no-embed: 건너뜀 (claude-mem 기본 영어 임베딩 사용)')
         return
     if not tools.get('ollama'):
         raise SystemExit('ollama 실행 파일을 찾지 못했습니다. 방금 설치했다면 새 터미널에서 다시 실행하세요(또는 --no-embed).')
     ensure_ollama_running(tools['ollama'])
-    run([tools['ollama'], 'pull', 'bge-m3'])
+    chroma = CM_DIR / 'chroma'
+    current = collection_model(chroma)
+    if current == EMBED_FALLBACK:
+        # 이미 bge-m3 로 쌓인 컬렉션은 그대로 쓴다(모델을 바꾸면 전체 재색인이 필요). pull 이 이름표를 원본으로
+        # 되돌리므로 pull 뒤에 매번 num_batch 를 다시 넣는다.
+        run([tools['ollama'], 'pull', EMBED_FALLBACK])
+        ensure_embed_num_batch(tools['ollama'], EMBED_FALLBACK)
+        say('  기존 컬렉션이 bge-m3 — 그대로 씁니다. BGE-m3-ko 로 바꾸려면 docs/embedding.md "BGE-m3-ko 로 바꾸기"')
+        model = EMBED_FALLBACK
+    else:
+        model = ensure_embed_model(tools['ollama'])
     env_file = HOME / '.chroma_env'
     line = 'CHROMA_OPENAI_API_KEY=ollama'
     text = env_file.read_text(encoding='utf-8') if env_file.exists() else ''
@@ -304,7 +438,7 @@ def setup_embedding(args, tools) -> None:
         tmp.write_text(PRECREATE, encoding='utf-8')
     env = dict(os.environ)
     env.pop('OPENAI_API_KEY', None)
-    run([tools['uvx'] or 'uvx'] + CHROMA_UVX + ['python', str(tmp), str(chroma)], env=env)
+    run([tools['uvx'] or 'uvx'] + CHROMA_UVX + ['python', str(tmp), str(chroma), model], env=env)
     say('  컬렉션 ef=%s' % (chroma_ef_name(chroma) or '(dry-run)'))
 
 
