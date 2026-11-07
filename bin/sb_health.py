@@ -9,7 +9,7 @@
 
 점검 항목
   worker      claude-mem 워커 응답 (/api/health)
-  ollama      벡터 임베딩(bge-m3) 서버 응답 — 꺼지면 벡터 저장·검색이 멈춘다
+  ollama      벡터 임베딩(bge-m3-ko) 서버 응답 — 꺼지면 벡터 저장·검색이 멈춘다
   nightly     야간 배치 결과·신선도 (nightly_status.json)
   automemory  메모리 파일 중 기록층에 아직 안 들어간 것
   vector      벡터 색인에 빠진 관측 수 (SQLite 대비)
@@ -498,7 +498,7 @@ def recall_usage(days: int = 7) -> Dict[str, Any]:
 
 
 def uses_ollama() -> bool:
-    """설치기가 Ollama 임베딩(bge-m3)을 켠 PC 인가 — ~/.chroma_env 의 CHROMA_OPENAI_API_KEY=ollama 표시.
+    """설치기가 Ollama 임베딩(bge-m3-ko·bge-m3)을 켠 PC 인가 — ~/.chroma_env 의 CHROMA_OPENAI_API_KEY=ollama 표시.
     기본 임베딩을 쓰는 PC 에서 'Ollama 꺼짐' 경고가 늘 뜨지 않게 한다. SB_HEALTH_OLLAMA=1|0 으로 강제."""
     forced = os.environ.get('SB_HEALTH_OLLAMA')
     if forced in ('0', '1'):

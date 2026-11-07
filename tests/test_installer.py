@@ -177,11 +177,83 @@ class EmbedNumBatchTest(unittest.TestCase):
             inst.ensure_embed_num_batch('ollama')
         self.assertIn('num_batch 설정 실패', say.call_args[0][0])
 
+    def test_num_batch_uses_given_model(self):
+        seen = {}
+
+        def fake_run(cmd, check=True, capture=False, env=None, cwd=None):
+            seen['argv'] = [str(c) for c in cmd]
+            seen['modelfile'] = Path(cmd[-1]).read_text(encoding='utf-8')
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        with mock.patch.object(inst, 'run', side_effect=fake_run), mock.patch.object(inst, 'DRY', False):
+            inst.ensure_embed_num_batch('ollama', 'bge-m3-ko')
+        self.assertEqual(seen['argv'][:3], ['ollama', 'create', 'bge-m3-ko'])
+        self.assertIn('FROM bge-m3-ko\n', seen['modelfile'])
+
     def test_doctor_parses_num_batch(self):
         self.assertEqual(doctor.parse_num_batch('num_batch                      8192'), 8192)
         self.assertEqual(doctor.parse_num_batch('num_ctx 4096\nnum_batch 512\n'), 512)
         self.assertEqual(doctor.parse_num_batch(''), 0)
         self.assertEqual(doctor.parse_num_batch('stop "x"'), 0)
+
+
+class EmbedModelTest(unittest.TestCase):
+    # 기본 임베딩은 BGE-m3-ko(공개 GGUF, 리비전·sha256 고정) — 받지 못하면 bge-m3 로 내려간다
+    def test_sources_are_pinned(self):
+        self.assertEqual(inst.EMBED_MODEL, 'bge-m3-ko')
+        self.assertGreaterEqual(len(inst.EMBED_GGUF), 2)
+        for url, sha in inst.EMBED_GGUF:
+            self.assertRegex(url, r'/resolve/[0-9a-f]{40}/')
+            self.assertRegex(sha, r'^[0-9a-f]{64}$')
+
+    def test_precreate_takes_model_argument(self):
+        self.assertIn('model_name=sys.argv[2]', inst.PRECREATE)
+
+    def test_download_skips_bad_checksum_and_uses_next_source(self):
+        import hashlib
+        import io
+        good = b'gguf-bytes'
+        sources = [('https://example/a', '0' * 64), ('https://example/b', hashlib.sha256(good).hexdigest())]
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(inst, 'EMBED_GGUF', sources), \
+                mock.patch.object(inst, 'say'), mock.patch('urllib.request.urlopen', side_effect=lambda req, timeout=0: Resp(good)):
+            out = inst.download_gguf(Path(tmp) / 'm.gguf')
+            self.assertIsNotNone(out)
+            self.assertEqual(out.read_bytes(), good)
+            self.assertFalse((Path(tmp) / 'm.part').exists())
+
+    def test_existing_model_is_reused_without_download(self):
+        with mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'ollama_num_batch', return_value=8192), \
+                mock.patch.object(inst, 'download_gguf') as dl, mock.patch.object(inst, 'say'):
+            self.assertEqual(inst.ensure_embed_model('ollama'), 'bge-m3-ko')
+        dl.assert_not_called()
+
+    def test_falls_back_to_bge_m3_when_download_fails(self):
+        calls = []
+        with mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'ollama_num_batch', return_value=None), \
+                mock.patch.object(inst, 'download_gguf', return_value=None), mock.patch.object(inst, 'say'), \
+                mock.patch.object(inst, 'WARNINGS', []) as warnings, \
+                mock.patch.object(inst, 'run', side_effect=lambda cmd, **k: calls.append([str(c) for c in cmd]) or subprocess.CompletedProcess(cmd, 0, '', '')):
+            self.assertEqual(inst.ensure_embed_model('ollama'), 'bge-m3')
+        self.assertIn(['ollama', 'pull', 'bge-m3'], calls)
+        self.assertEqual(len(warnings), 1)
+
+    def test_collection_model_reads_schema(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            con = sqlite3.connect(Path(tmp) / 'chroma.sqlite3')
+            con.execute('CREATE TABLE collections (name TEXT, schema_str TEXT)')
+            con.execute("INSERT INTO collections VALUES ('cm__claude-mem', ?)",
+                        ('{"embedding_function":{"type":"known","name":"openai","config":{"model_name":"bge-m3-ko"}}}',))
+            con.commit(); con.close()
+            self.assertEqual(inst.collection_model(Path(tmp)), 'bge-m3-ko')
+            self.assertEqual(inst.chroma_ef_name(Path(tmp)), 'openai')
+        self.assertEqual(inst.collection_model(Path('/nonexistent-dir')), '')
 
 
 class ChromaPinTest(unittest.TestCase):

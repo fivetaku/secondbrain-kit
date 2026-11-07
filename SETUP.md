@@ -104,7 +104,7 @@ Codex만 쓰는 PC(Claude 구독 없음)라면 설치 전에 관측 요약 LLM�
 | 증상 | 해결 |
 |---|---|
 | `--doctor`에 `Codex 훅 신뢰 ❌` | `~/.secondbrain/.venv/bin/python installer/codex_trust.py trust --match "<키트 폴더 경로>"` (윈도우는 `.venv\Scripts\python.exe`) |
-| `Ollama ❌` | Ollama 앱을 실행(맥: `brew services start ollama`), `ollama pull bge-m3` |
+| `Ollama ❌` | Ollama 앱을 실행(맥: `brew services start ollama`), 설치기 재실행(4단계가 bge-m3-ko 준비) |
 | `벡터 임베딩 ⚠ default` | 원래 claude-mem을 쓰던 PC다. `docs/embedding.md` 절차로 교체 |
 | `chroma-mcp 기동 ❌` (pydantic·ImportError) | 벡터 동기화가 멈춘 상태다. `./install.sh`를 다시 실행해 고정 도구를 깔고 `--doctor`로 확인. 밀린 벡터는 claude-mem 워커가 다시 뜰 때 채워진다 |
 | 세션 시작 브리핑이 안 뜸 | 정상일 수 있다 — 확정 사실·미결이 하나도 없으면 아무것도 넣지 않는다 |

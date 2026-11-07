@@ -8,7 +8,7 @@
 ```
 Claude Code 훅 ─┐   Codex 훅(hooks/codex_hook.py: exec 자동화 제외) ─┐
                 └→ claude-mem worker(127.0.0.1:<포트>) → LLM이 도구 사용을 '관측'으로 요약
-저장   ~/.claude-mem/claude-mem.db + ~/.claude-mem/chroma (bge-m3 via Ollama /v1)
+저장   ~/.claude-mem/claude-mem.db + ~/.claude-mem/chroma (bge-m3-ko via Ollama /v1)
 파생   ~/.secondbrain/index/ko_fts.sqlite (한국어 색인), index/chroma-snapshot
 상태   ~/.secondbrain/state.db (확정 사실: 제안→검증→채택), ~/.secondbrain/loops (미결), ~/.secondbrain/rules (규칙층, 생성물)
 회수   bin/sb_recalld.py 상주 회수 서버(127.0.0.1:37791, 형태소 색인+벡터, 재순위는 패키지·모델이 있을 때만). 세션 시작·sb recall 때 뜨고 6시간 유휴면 종료
@@ -85,7 +85,7 @@ venv 파이썬: 맥 `~/.secondbrain/.venv/bin/python`, 윈도우 `~/.secondbrain
 | 세션 기록이 안 쌓임(Claude) | worker 로그에 `INIT_COMPLETE` 없음, `runner-errors.log` | `~/.claude/settings.json`에 claude-mem 플러그인 활성(`enabledPlugins`), `npx claude-mem@13.24.23 repair` |
 | 세션 기록이 안 쌓임(Codex) | `codex_trust.py list`에서 키트 훅이 `trusted`인지 | 미신뢰면 `codex_trust.py trust --match "<키트 경로>"`. exec 세션은 설계상 제외(`SB_CODEX_CAPTURE_EXEC=1`로 강제) |
 | 특정 폴더만 안 쌓임 | 로그에 `Project excluded from tracking` | `~/.claude-mem/settings.json`의 `CLAUDE_MEM_EXCLUDED_PROJECTS` |
-| 한국어 의미 검색이 안 됨 | doctor `벡터 임베딩`, `Ollama` | Ollama 실행, `ollama pull bge-m3`, `~/.chroma_env`에 `CHROMA_OPENAI_API_KEY=ollama` |
+| 한국어 의미 검색이 안 됨 | doctor `벡터 임베딩`, `Ollama` | Ollama 실행, 설치기 재실행(4단계가 bge-m3-ko 준비), `~/.chroma_env`에 `CHROMA_OPENAI_API_KEY=ollama` |
 | 벡터 동기화 멈춤(새 기록이 의미 검색에 안 잡힘) | doctor `chroma-mcp 기동` ❌(eval_type_backport ImportError), `sb health`의 chroma-pending·chroma-log | `./install.sh` 재실행(chroma-mcp 고정 도구 설치). 밀린 대기분은 원인을 없앤 뒤 claude-mem 워커가 다시 떠야 채워진다 |
 | 프롬프트별 회수가 자주 빈손 | doctor `회수 상주 서버`·`회수 훅 실동작`, `logs/recall.jsonl`의 실패 기록 | `sb recall '<아무 검색어>'`로 서버 기동 확인. 느린 PC면 `SB_RECALLD_TIMEOUT`(기본 3초)을 올린다 |
 | 교정 감지 알림이 전혀 없음 | `index/correction_llm.json` 또는 `SB_CORRECTION_LLM_URL`·`SB_CORRECTION_MODEL` | 설정이 없으면 원래 꺼져 있다(정상). 켜는 법은 README "교정 감지" |

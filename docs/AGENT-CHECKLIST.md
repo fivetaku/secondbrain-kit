@@ -37,7 +37,7 @@
   - [ ] venv 패키지
   - [ ] claude-mem 설정 (mode=code--ko)
   - [ ] 벡터 임베딩 = `openai` (기존 사용자면 `ollama`도 정상)
-  - [ ] Ollama bge-m3, `~/.chroma_env`
+  - [ ] Ollama bge-m3-ko(num_batch 8192), `~/.chroma_env`
   - [ ] **chroma-mcp 기동** — 워커와 같은 인자로 실제로 띄워 본 결과. ❌에 `eval_type_backport`가 보이면 pydantic 고정 도구가 빠진 것이다(설치기 재실행). 첫 실행은 내려받기로 오래 걸려 ⚠일 수 있다
   - [ ] Claude 훅 6종(SessionStart·UserPromptSubmit·PreToolUse(AskUserQuestion)·Stop·SubagentStart·PostToolUseFailure). PostToolUseFailure는 Claude Code 2.1.119 이상에서만 걸리므로 그보다 낮으면 `5종 등록`이 정상이다. 키트는 도구 호출마다 뜨는 PostToolUse 훅을 두지 않는다(claude-mem 플러그인의 캡처 훅은 별개). Claude claude-mem 플러그인도 확인 (Claude 쓰는 경우)
   - [ ] **회수 훅 실동작** — 한국어 프롬프트를 실제로 넣어 주입이 나오는지(등록 여부만으론 부족: 윈도우 cp949에서 조용히 전부 빗나간 사례)
@@ -69,7 +69,7 @@
 | [2] venv | uv 설치 직후 PATH 미반영 | 새 터미널에서 재실행 |
 | [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@13.24.23 install --provider <p> --no-auto-start`를 직접 실행해 오류 확인 |
 | [3] `chroma-mcp 고정 설치 실패` 경고 | uv 네트워크, uv 없음 | 그대로 두면 벡터 동기화가 pydantic 2.14로 멈출 수 있다. 원인을 고친 뒤 설치기 재실행 → doctor `chroma-mcp 기동` ✅ 확인 |
-| [4] 임베딩 | Ollama 서버 미기동, 모델 다운로드 실패 | Ollama 앱 실행 → `ollama pull bge-m3` → 재실행. 급하면 `--no-embed` |
+| [4] 임베딩 | Ollama 서버 미기동, 모델 다운로드 실패 | Ollama 앱 실행 → 재실행(BGE-m3-ko GGUF 1.2GB를 받는다. 실패하면 bge-m3로 내려감). 급하면 `--no-embed` |
 | [7] Codex | 신뢰 등록 실패 | venv 파이썬으로 `installer/codex_trust.py trust --match "<키트 경로>"` |
 | 윈도우 전반 | PowerShell 실행 정책 | `powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 | 윈도우 훅 무반응 | Git Bash 없음, node가 시스템 PATH에 없음 | Git for Windows 설치, Node를 시스템 PATH로 재설치 후 새 창 |
