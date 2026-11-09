@@ -1,0 +1,20 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    # 테스트의 HTTP 호출은 mock 또는 127.0.0.1 가짜 서버뿐이다. 외부 API 키 불필요.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python3 -m pytest -q tests
