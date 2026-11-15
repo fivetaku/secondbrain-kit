@@ -33,7 +33,7 @@ ROUTES = {
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
     'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py', 'pii-sweep': 'sb_pii_sweep.py',
     'health': 'sb_health.py', 'rules': 'sb_rules.py', 'context': 'sb_context.py', 'vault': 'sb_vault.py',
-    'setup': 'sb_setup.py', 'sources': 'sb_sources.py',
+    'setup': 'sb_setup.py', 'sources': 'sb_sources.py', 'meeting': 'sb_meeting.py',
 }
 
 

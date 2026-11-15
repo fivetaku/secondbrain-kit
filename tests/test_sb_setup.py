@@ -353,7 +353,10 @@ class RouteTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('sb_cli_for_setup', str(BIN / 'sb.py'))
         sb = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sb)
-        self.assertEqual((sb.ROUTES['setup'], sb.ROUTES['sources']), ('sb_setup.py', 'sb_sources.py'))
+        self.assertEqual((sb.ROUTES['setup'], sb.ROUTES['sources'], sb.ROUTES['meeting']),
+                         ('sb_setup.py', 'sb_sources.py', 'sb_meeting.py'))
+        for script in sb.ROUTES.values():
+            self.assertTrue((BIN / script).is_file(), script)
 
     def test_doctor_exposes_checks(self):
         spec = importlib.util.spec_from_file_location('sbkit_doctor_for_setup', str(ROOT / 'installer' / 'doctor.py'))
