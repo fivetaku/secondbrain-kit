@@ -167,18 +167,55 @@ def health_line() -> str:
     return line
 
 
-def record_exposure(text: str) -> list:
+def exposure_skip_reason(raw: dict) -> str:
+    """사람이 보지 않는 세션이면 그 이유(노출로 세지 않는다). 회수 훅(sb_recall.automation_reason)과 같은 판정에
+    비대화형 실행(claude -p·SDK: CLAUDE_CODE_ENTRYPOINT 가 sdk-*)을 더한다. 이유 문자열에 경로를 담지 않는다."""
+    if os.environ.get('CLAUDE_MEM_INTERNAL') == '1':
+        return 'internal'
+    if os.environ.get('SB_RECALL', '1') == '0':
+        return 'sb_recall_off'
+    if (os.environ.get('CLAUDE_CODE_ENTRYPOINT') or '').startswith('sdk'):
+        return 'noninteractive'
+    try:
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import sb_recall
+        return sb_recall.automation_reason(raw if isinstance(raw, dict) else {}, '')
+    except Exception:  # noqa: BLE001 — 판정을 못 하면 세지 않는다(원장을 바꾸는 쪽이 보수적이어야 한다)
+        return 'unknown'
+
+
+TRACK_LINE = None
+
+
+def record_exposure(text: str, raw: dict = None) -> list:
     """브리핑이 실제로 보여 준 미결 ID를 노출로 기록한다(2026-11-16 M3 T4) — 백오프·stale 퇴장이 다시 돈다.
     loops.py exposed-ids 와 같은 판정: 열린 미결 중 재노출일이 됐고 오늘 아직 안 센 것만, 하루 한 번.
-    트랙 줄의 '[L…]' 표기만 센다 — 상태 본문·주의 줄에 지나가듯 나온 다른 scope 미결 ID는 노출로 치지 않는다.
+    트랙 줄('  · [L…] …')만 센다 — 상태 본문·주의 줄에 지나가듯 나온 다른 scope 미결 ID는 노출로 치지 않는다.
+    빼는 것(11-16 검토 P1):
+      - 자동화 세션(관찰기·SB_RECALL=0·임시 폴더·건너뛸 프로젝트·claude -p/SDK) — 사람이 보지 않은 노출이 백오프를 돌리면 안 된다
+      - 아침 문자 대상(high 가치·2일 안 마감) — 세션 시작이 next_review 를 미루면 같은 날 `loops.py brief` 에서 빠진다.
+        이들은 발송 뒤 record-exposure 가 센다
     잘린 브리핑은 남은 본문에 나온 ID만 센다. 끄기: SB_LOOPS_EXPOSURE=0. 실패해도 세션 시작은 막지 않는다."""
+    global TRACK_LINE
     if os.environ.get('SB_LOOPS_EXPOSURE', '1') == '0' or not text:
+        return []
+    if exposure_skip_reason(raw or {}):
         return []
     try:
         import re
+        import datetime
         import loops
-        ids = re.findall(r'\[(' + loops.LOOP_ID_RE.pattern + r')\]', text)
-        return loops.record_shown(ids, timeout=0.5)
+        if TRACK_LINE is None:
+            TRACK_LINE = re.compile(r'^\s*· \[(' + loops.LOOP_ID_RE.pattern + r')\]', re.M)
+        ids = TRACK_LINE.findall(text)
+        if not ids:
+            return []
+        soon = loops.iso(loops.today() + datetime.timedelta(days=2))
+        brief_targets = {i['id'] for i in loops.load_loops()
+                         if i.get('value') == 'high' or (i.get('due') and i['due'] <= soon)}
+        ids = [i for i in ids if i not in brief_targets]
+        return loops.record_shown(ids, timeout=0.5) if ids else []
     except Exception:  # noqa: BLE001 — 잠금 시간 초과·원장 손상이면 이번 기록만 건너뛴다
         return []
 
@@ -284,7 +321,7 @@ def main() -> None:
     payload = emit(args.harness, text)
     sys.stdout.write(payload + '\n')
     sys.stdout.flush()
-    record_exposure(briefed)
+    record_exposure(briefed, dict(raw if isinstance(raw, dict) else {}, cwd=cwd))
     try:  # 주입량 계측(본문은 남기지 않는다)
         import sb_config
         log = Path(os.environ.get('SB_INJECTION_LOG') or sb_config.sb_path('logs', 'injection.jsonl'))

@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional
 BIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN))
 import sb_recalld  # noqa: E402
-import sb_rules  # noqa: E402
 import sb_scope  # noqa: E402
 
 # '원' 뒤에 한글이 붙으면 '3원칙'·'2원화' 같은 낱말이라 금액이 아니다. 금액 뒤에 흔히 오는 조사·의존어만 허용한다
@@ -53,6 +52,17 @@ MASKS = [
 ]
 RECALL_LIMIT = 6
 RULES_MAX = 15
+
+
+def _rule_titles(body: str) -> List[str]:
+    """규칙 제목('출처' 블록 단위). sb_rules 는 필요할 때만 불러온다 — 그쪽 import 가 깨져도 sb_context 는 돈다(예전 방식으로 폴백)."""
+    try:
+        import sb_rules
+        return sb_rules.titles(body)
+    except Exception:  # noqa: BLE001
+        return re.findall(r'^## (.+)$', body, re.M)
+
+
 # 규칙 블록 최소 몫(줄 수): 앞 층(확정 사실·다음 행동)이 예산을 다 써도 규칙 머리와 제목 N줄은 남긴다(M3 T6). 끄기 0
 RULES_MIN_DEFAULT = 2
 # sb_search --mode 가 층 저장소를 아직 안 만든 새 사용자에게 내는 unavailable 경고 코드(상태층 DB·미결 원장·규칙 폴더 없음).
@@ -130,7 +140,7 @@ def build(query: str, scope: str, max_bytes: int, project: str = '') -> str:
     reserved = 0   # lines 안에서 규칙 머리부터 최소 몫까지의 줄 수(예산을 먼저 떼어 둔다)
     if rules:
         # 제목은 '출처' 블록 단위로 뽑는다 — 본문 안의 '## …' 줄을 규칙 제목으로 세지 않는다
-        titles = sb_rules.titles(rules[0].get('body') or '')
+        titles = _rule_titles(rules[0].get('body') or '')
         if titles:
             start = len(lines)
             lines.append('## 규칙(L3, 제목만)')

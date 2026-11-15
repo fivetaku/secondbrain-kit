@@ -70,6 +70,88 @@ def _norm_name(s: str) -> str:
     return ''.join(s.lower().replace('_', '-').split())
 
 
+# ── claude-mem project 꼬리표 비교 키(M3-T2, 2026-11-16) ────────────────────────────────
+# claude-mem 꼬리표는 세션 cwd 의 폴더 이름(가끔 경로형)이다. 홈 폴더가 '<u>'·'/Users/<u>'·'~' 로 갈라지고
+# 같은 폴더가 대소문자·'_'/'-' 차이로 갈라져 같은 프로젝트 기록이 '다른 프로젝트'로 취급됐다.
+# 훅(refine)과 recalld(같은 프로젝트 몫·project 질의)가 이 함수 하나로 비교한다. 끄기: SB_SCOPE_NORM=0.
+# 홈으로 묶는 것은 이 PC 현재 사용자의 홈뿐이다. 다른 PC 의 내 홈 이름은 SB_HOME_ALIASES(쉼표 구분 이름)에 적는다.
+PROJECT_HOME_KEY = '~'
+_HOME_ROOTS = ('/users', '/home', 'c:/users')
+_HOME_CACHE: Dict[Tuple[str, str, str], Tuple[frozenset, frozenset]] = {}
+
+
+def scope_norm_on() -> bool:
+    return os.environ.get('SB_SCOPE_NORM', '1') != '0'
+
+
+def slash_key(p: str) -> str:
+    """비교용 경로 문자열 — 구분자 '/' 통일, 끝 구분자 제거, 소문자(맥·윈도우 기본 파일시스템은 대소문자 무시)."""
+    s = re.sub(r'/+', '/', p.replace('\\', '/'))
+    return (s.rstrip('/') or '/').lower()
+
+
+def tag_base(p: str) -> str:
+    """claude-mem 규칙의 폴더 이름 — 윈도우 '\\' 구분자도 자른다."""
+    parts = [x for x in re.split(r'[\\/]+', p.strip()) if x]
+    return parts[-1] if parts else ''
+
+
+def is_pathlike_tag(s: str) -> bool:
+    return s.startswith(('/', '~', '\\')) or bool(re.match(r'^[A-Za-z]:[\\/]', s))
+
+
+def home_forms() -> Tuple[frozenset, frozenset]:
+    """현재 사용자의 홈 경로(비교용)와 홈 꼬리표 이름(홈 폴더 이름 + SB_HOME_ALIASES). 환경이 같으면 캐시한다."""
+    home = os.path.expanduser('~')
+    ck = (home, os.environ.get('SB_HOME_ALIASES', ''), os.name)
+    hit = _HOME_CACHE.get(ck)
+    if hit:
+        return hit
+    paths = {slash_key(home)}
+    try:
+        paths.add(slash_key(os.path.realpath(home)))
+    except (OSError, ValueError):
+        pass
+    names = {slash_key(home).rsplit('/', 1)[-1]}
+    names |= {x.strip().lower() for x in ck[1].split(',') if x.strip()}
+    names.discard('')
+    names.discard('/')
+    out = (frozenset(paths), frozenset(names))
+    if len(_HOME_CACHE) > 32:
+        _HOME_CACHE.clear()
+    _HOME_CACHE[ck] = out
+    return out
+
+
+def _tag_name_key(s: str) -> str:
+    # 대소문자·'_'/'-' 차이만 없앤다. 공백은 '-' 로 바꿔 'my app' 과 'myapp' 을 합치지 않는다
+    return '-'.join(s.strip().lower().replace('_', '-').split())
+
+
+def project_key(name) -> str:
+    """claude-mem project 꼬리표 비교 키. 현재 사용자 홈 표기('~'·'/Users/<u>'·'<u>'·'C:\\Users\\<u>')는 '~',
+    경로형 꼬리표는 그 폴더 이름(claude-mem 규칙), 이름은 대소문자·'_'/'-' 차이를 없앤다.
+    경로형 꼬리표의 폴더 이름이 사용자명과 같아도 홈으로 보지 않는다(홈 경로 자체일 때만)."""
+    s = str(name or '').strip()
+    if not s:
+        return ''
+    if not scope_norm_on():
+        return s
+    home_paths, home_names = home_forms()
+    if is_pathlike_tag(s):
+        p = slash_key(os.path.expanduser(s) if s.startswith('~') else s)
+        parent, _, last = p.rpartition('/')
+        # 이 PC 의 홈, 또는 다른 PC 의 같은 사용자 홈(/Users·/home·C:/Users 바로 아래 + 홈 이름)만 홈이다.
+        # 다른 사용자의 홈·/home/<공유폴더>·/Users/Shared 는 그냥 폴더 이름이다.
+        if p in home_paths or (parent in _HOME_ROOTS and last in home_names):
+            return PROJECT_HOME_KEY
+        base = tag_base(s)
+        return _tag_name_key(base) if base and base != '~' else ''
+    if s.lower() in home_names:
+        return PROJECT_HOME_KEY
+    return _tag_name_key(s)
+
+
 def _git_remote(realpath: str) -> Optional[str]:
     try:
         r = subprocess.run(['git', '-C', realpath, 'config', '--get', 'remote.origin.url'],

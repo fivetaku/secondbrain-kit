@@ -472,7 +472,7 @@ def check_recall(db) -> Dict[str, Any]:
 def recall_usage(days: int = 7) -> Dict[str, Any]:
     """활용 통계(정보용, 실패 판정 없음): 최근 N일 회수 주입·빈 결과·기간 질문 안내·확인 게이트 판정 수."""
     since = time.time() - days * 86400
-    out = {'ok': True, 'days': days, 'injections': 0, 'empty': 0, 'history_hints': 0, 'gate_block': 0, 'gate_pass': 0}
+    out = {'ok': True, 'days': days, 'injections': 0, 'empty': 0, 'history_hints': 0, 'gate_block': 0, 'gate_pass': 0, 'automation': 0}
 
     def rows(name):
         try:
@@ -488,6 +488,9 @@ def recall_usage(days: int = 7) -> Dict[str, Any]:
             return
 
     for ev in rows('recall.jsonl'):
+        if ev.get('automation'):   # 자동화로 판정해 회수를 건너뛴 줄(M3-T3)은 주입 시도가 아니다
+            out['automation'] += 1
+            continue
         out['injections'] += 1
         out['empty'] += 0 if ev.get('ids') else 1
         out['history_hints'] += 1 if ev.get('hint') else 0

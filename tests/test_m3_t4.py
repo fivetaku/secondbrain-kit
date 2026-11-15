@@ -162,9 +162,10 @@ class RecordShownTests(_Base):
 
 class SessionHookExposureTests(_Base):
     def records(self):
-        return [loop('L0000aaa1', next_review=YESTERDAY),          # 이 scope·재노출일 지남 → 노출
-                loop('L0000aaa2', next_review=TOMORROW),           # 이 scope지만 아직 → 보여도 세지 않음
-                loop('L0000bbb1', project='beta')]                 # 다른 scope → 안 보이고 안 셈
+        # value medium: high·마감 임박은 아침 문자 대상이라 세션 시작에서 세지 않는다(따로 시험)
+        return [loop('L0000aaa1', next_review=YESTERDAY, value='medium'),   # 이 scope·재노출일 지남 → 노출
+                loop('L0000aaa2', next_review=TOMORROW, value='medium'),    # 이 scope지만 아직 → 보여도 세지 않음
+                loop('L0000bbb1', project='beta', value='medium')]          # 다른 scope → 안 보이고 안 셈
 
     def test_briefing_records_shown_tracks_once_per_day(self):
         self.write(self.records())
@@ -201,7 +202,13 @@ class SessionHookExposureTests(_Base):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         self.write(self.records())
-        self.assertEqual(mod.record_exposure('주의: 연결된 미결 L0000bbb1 닫힘 · 트랙 [L0000aaa1]'), ['L0000aaa1'])
+        for k in ('CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_MEM_INTERNAL', 'SB_RECALL'):   # 이 시험을 돌리는 세션의 표지와 분리
+            p = mock.patch.dict(os.environ, {k: ''})
+            p.start()
+            self.addCleanup(p.stop)
+            os.environ.pop(k, None)
+        self.assertEqual(mod.record_exposure('주의: 연결된 미결 [L0000bbb1] 닫힘\n트랙 1건:\n  · [L0000aaa1] 할 일'),
+                         ['L0000aaa1'])
         self.assertNotIn('last_exposed', self.ledger_by_id()['L0000bbb1'])
 
 

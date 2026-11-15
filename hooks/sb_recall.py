@@ -62,8 +62,12 @@ def gate(prompt: str) -> bool:
 # 재측정 11-16: insane-writer 143이벤트 중 142건에 회수가 주입됐다(문턱 0). 자동화면 주입하지 않고
 # recall_log 에 automation:true 만 남긴다. 판정 끄기: SB_RECALL_AUTOMATION=0(환경 표지 CLAUDE_MEM_INTERNAL·SB_RECALL=0 은 그대로 막는다).
 AUTOMATION_DIRS = ("/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
-AUTOMATION_PHRASES = ("reply exactly", "ok only", "respond with only")   # 모델·연결 시험 문구(대소문자 무시)
-AUTOMATION_MARKS = ("<<autonomous-loop", "[SYSTEM NOTIFICATION")         # 루프·알림 표지
+# 모델·연결 시험 문구. 부분 문자열로 찾으면 "look only"·"book only"·문장 중간 "reply exactly" 같은 정상 대화가 걸렸다(11-16 검토).
+# 실측(11-04 이후 user_prompts): 시험 문구는 짧은 프롬프트의 맨 앞("Reply exactly: …") 아니면 맨 끝("… OK only")에만 있었다.
+PROBE_MAX_CHARS = 200
+PROBE_START = re.compile(r"^(reply exactly|respond with only)(?![a-z])", re.I)
+PROBE_END = re.compile(r"(?<![a-z])ok only[\s.!]*$", re.I)
+AUTOMATION_MARKS = ("<<autonomous-loop", "[SYSTEM NOTIFICATION")   # 루프·알림 표지 — 프롬프트 맨 앞일 때만(붙여 넣은 로그 제외)
 
 
 def _skip_projects():
@@ -87,8 +91,21 @@ def _cwd_project(cwd: str) -> str:
         return parts[-1] if parts else ""
 
 
+def _cwd_parts(cwd: str):
+    """cwd 의 폴더 이름들(홈 아래면 홈 아래 부분만) — 건너뛸 프로젝트의 하위 폴더에서 연 세션도 잡는다."""
+    c = os.path.expanduser(cwd) if cwd.startswith("~") else cwd
+    s = c.replace("\\", "/")
+    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    low, hlow = s.lower(), home.lower()
+    if len(hlow) > 1 and (low == hlow or low.startswith(hlow + "/")):
+        s = s[len(home):]
+    return [x for x in s.split("/") if x]
+
+
 def _under_automation_dir(cwd: str) -> bool:
-    """임시 폴더에서 돈 세션인가 — 맥·리눅스 임시 경로와 이 PC 의 임시 폴더(윈도우 %TEMP% 포함)."""
+    """임시 폴더에서 돈 세션인가 — 맥·리눅스 임시 경로와 이 PC 의 임시 폴더(윈도우 %TEMP% 포함).
+    cwd 를 덮는 가장 긴(가장 구체적인) 폴더로 정한다: 홈이면 아니고, 임시 폴더면 맞다.
+    홈이 임시 폴더 아래인 격리 시험(리눅스 CI)은 홈이 이기고, 홈 아래 임시 폴더(윈도우 %TEMP%)는 임시 폴더가 이긴다."""
     def norm(x):
         s = x.replace("\\", "/").rstrip("/")
         return s.lower() if os.name == "nt" else s
@@ -97,21 +114,30 @@ def _under_automation_dir(cwd: str) -> bool:
         dirs |= {norm(tempfile.gettempdir()), norm(os.path.realpath(tempfile.gettempdir()))}
     except Exception:
         pass
-    home = norm(os.path.expanduser("~"))
-    dirs -= {"", "/", home}   # TMPDIR 이 홈·루트를 가리키면 전부 자동화로 보지 않게
-    forms = {cwd}
+    home_raw = os.path.expanduser("~")
+    homes = {norm(home_raw)}
+    try:
+        homes.add(norm(os.path.realpath(home_raw)))
+    except (OSError, ValueError):
+        pass
+    homes -= {"", "/"}
+    dirs -= {"", "/"} | homes   # TMPDIR 이 홈·루트를 가리키면 전부 자동화로 보지 않게
+    forms = [cwd]
     if os.path.isabs(cwd):   # 상대 경로(다른 OS 경로 포함)를 realpath 하면 현재 폴더가 붙어 오판한다
         try:
-            forms.add(os.path.realpath(cwd))
+            forms.append(os.path.realpath(cwd))
         except (OSError, ValueError):
             pass
+    verdicts = []
     for c in forms:
         s = norm(c)
-        if len(home) > 1 and (s == home or s.startswith(home + "/")):
-            return False   # 홈 안의 폴더는 임시 폴더가 아니다(홈이 임시 폴더 아래인 격리 시험 포함)
-        if any(s == d or s.startswith(d + "/") for d in dirs):
-            return True
-    return False
+        best = max(((len(d), kind) for kind, group in (("home", homes), ("tmp", dirs)) for d in group
+                    if s == d or s.startswith(d + "/")), default=None)
+        if best:
+            verdicts.append(best[1])
+    if "home" in verdicts:   # 어느 표기로든 홈이 가장 구체적이면 사람 작업 폴더로 본다
+        return False
+    return "tmp" in verdicts
 
 
 def automation_reason(raw: dict, prompt: str) -> str:
@@ -126,14 +152,13 @@ def automation_reason(raw: dict, prompt: str) -> str:
     cwd = str(raw.get("cwd") or "").strip()
     if cwd and _under_automation_dir(cwd):
         return "tmp_cwd"
-    p = str(prompt or "")
-    low = p.lower()
-    if any(x in low for x in AUTOMATION_PHRASES):
+    p = str(prompt or "").strip()
+    if len(p) <= PROBE_MAX_CHARS and (PROBE_START.search(p) or PROBE_END.search(p)):
         return "probe_phrase"
-    if any(x in p for x in AUTOMATION_MARKS):
+    if p.startswith(AUTOMATION_MARKS):
         return "loop_marker"
     skip = {_project_key(x) for x in _skip_projects()}
-    if cwd and skip and _project_key(_cwd_project(cwd)) in skip:
+    if cwd and skip and any(_project_key(x) in skip for x in _cwd_parts(cwd)):
         return "skip_project"
     return ""
 
@@ -295,7 +320,8 @@ def recalld_search(prompt: str, project: str):
     if not (d.get("gate") or {}).get("pass"):
         return []
     return [{"id": it["id"], "date": it.get("date", ""), "kind": "", "title": it.get("title", ""),
-             "project": it.get("project", "")} for it in d.get("items", [])]
+             "project": it.get("project", ""), **({"pass": bool(it["pass"])} if "pass" in it else {})}
+            for it in d.get("items", [])]
 
 
 FRESH_MINUTES = 20   # observations younger than this are "what is happening right now", not recall
@@ -365,111 +391,41 @@ def _tokens(s: str):
 # ── scope 표기 통일(M3-T2, 2026-11-16) ─────────────────────────────────────────────
 # claude-mem 꼬리표는 세션 cwd 의 폴더 이름이다. 그런데 홈 폴더가 '<u>'·'/Users/<u>'·'~' 로 갈라지고
 # 같은 폴더가 경로형·대소문자·'_'/'-' 차이로 갈라져(재측정 11-16: resolve 불일치의 80.6%가 홈 표기),
-# 같은 프로젝트 기록이 '다른 프로젝트'로 취급됐다. 비교는 norm_project 로, 훅 project 는 hook_project 로 정한다.
-# 끄기: SB_SCOPE_NORM=0 (예전처럼 cwd basename·문자열 그대로 비교).
+# 같은 프로젝트 기록이 '다른 프로젝트'로 취급됐다. 비교 키는 sb_scope.project_key(recalld 와 같은 함수),
+# 훅 project 는 hook_project 로 정한다. 끄기: SB_SCOPE_NORM=0 (예전처럼 cwd basename·문자열 그대로 비교).
 HOME_KEY = "~"
-_HOME_ROOTS = ("/users", "/home", "c:/users")   # 이 바로 아래 폴더는 누군가의 홈이다(다른 PC 기록 포함)
-
-
-def _scope_norm_on() -> bool:
-    return os.environ.get("SB_SCOPE_NORM", "1") != "0"
-
-
-def _slash(p: str) -> str:
-    """비교용 경로 문자열 — 구분자 '/' 통일, 끝 구분자 제거, 소문자(맥·윈도우 기본 파일시스템은 대소문자 무시)."""
-    s = p.replace("\\", "/")
-    s = re.sub(r"/+", "/", s)
-    return (s.rstrip("/") or "/").lower()
-
-
-def _home_forms():
-    """현재 사용자의 홈 경로(비교용)와 홈을 가리키는 이름들(폴더 이름·사용자명)."""
-    home = os.path.expanduser("~")
-    paths = {_slash(home)}
-    try:
-        paths.add(_slash(os.path.realpath(home)))
-    except OSError:
-        pass
-    names = {_slash(home).rsplit("/", 1)[-1]}
-    for var in ("USER", "USERNAME", "LOGNAME"):
-        if os.environ.get(var):
-            names.add(os.environ[var].strip().lower())
-    names.discard("")
-    return paths, names
-
-
-def _base(p: str) -> str:
-    """claude-mem 규칙의 폴더 이름 — 윈도우 '\\' 구분자도 자른다."""
-    parts = [x for x in re.split(r"[\\/]+", p.strip()) if x]
-    return parts[-1] if parts else ""
-
-
-def _is_pathlike(s: str) -> bool:
-    return s.startswith(("/", "~", "\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", s))
-
-
-def _name_key(s: str) -> str:
-    try:
-        import sb_scope
-        return sb_scope._norm_name(s)
-    except Exception:
-        return "".join(s.lower().replace("_", "-").split())
 
 
 def norm_project(name) -> str:
-    """project 표기 비교 키. 홈 표기('~'·'/Users/<u>'·'<u>'·'C:\\Users\\<u>')는 모두 '~',
-    경로형 꼬리표는 그 폴더 이름(claude-mem 규칙), 이름은 대소문자·'_'/'-'·공백 차이를 없앤다."""
-    s = str(name or "").strip()
-    if not s:
-        return ""
-    if not _scope_norm_on():
-        return s
-    home_paths, home_names = _home_forms()
-    if _is_pathlike(s):
-        p = _slash(os.path.expanduser(s) if s.startswith("~") else s)
-        if p in home_paths or p.rsplit("/", 1)[0] in _HOME_ROOTS:
-            return HOME_KEY
-        s = _base(s)
-        if not s:
-            return ""
-    if s.lower() in home_names:
-        return HOME_KEY
-    return _name_key(s)
-
-
-def _alias_for(real_cmp: str) -> str:
-    """별칭 파일(sb_scope project_aliases.json)에 cwd 와 같은 경로 항목이 있으면 그 꼬리표명."""
+    """project 표기 비교 키 — sb_scope.project_key 와 같다(현재 사용자 홈 표기는 '~')."""
     try:
         import sb_scope
-        for key, entries in sb_scope._load_aliases().items():
-            for e in entries:
-                if sb_scope.is_path_entry(e) and sb_scope._norm_path(e) == real_cmp:
-                    return key
+        return sb_scope.project_key(name)
     except Exception:
-        pass
-    return ""
+        return str(name or "").strip()
 
 
 def hook_project(cwd) -> str:
-    """훅이 회수에 넘길 project. 기본은 claude-mem 꼬리표 규칙(cwd 폴더 이름)이고,
-    별칭 파일에 같은 경로가 있으면 그 꼬리표명, 홈 폴더 자체면 홈 폴더 이름 하나(norm_project 로 '~')."""
+    """훅이 회수에 넘길 project = claude-mem 꼬리표 규칙(cwd 폴더 이름). recalld·worker 가 이 값으로 정확 일치 질의를
+    하므로 sb_scope 별칭 키(다른 이름공간)로 바꾸지 않는다. 홈 폴더 자체면 홈 폴더 이름(색인에 쌓인 홈 꼬리표 표기)."""
     c = str(cwd or "").strip()
     if not c:
         return ""
-    if not _scope_norm_on():
+    if os.environ.get("SB_SCOPE_NORM", "1") == "0":
         return os.path.basename(os.path.normpath(c))
     try:
-        real = os.path.realpath(os.path.expanduser(c))
-    except (OSError, ValueError):
-        real = c
-    alias = _alias_for(os.path.normcase(real))
-    if alias:
-        return alias
-    home = os.path.expanduser("~")
-    home_paths, _ = _home_forms()
-    if _slash(real) in home_paths or _slash(os.path.expanduser(c)) in home_paths:
-        return _base(home)   # claude-mem·색인에 쌓인 홈 꼬리표와 같은 표기(색인 질의가 정확 일치라서)
-    return _base(os.path.expanduser(c) if c.startswith("~") else c)
+        import sb_scope
+        home = os.path.expanduser("~")
+        home_paths, _ = sb_scope.home_forms()
+        try:
+            real = os.path.realpath(os.path.expanduser(c))
+        except (OSError, ValueError):
+            real = c
+        if sb_scope.slash_key(real) in home_paths or sb_scope.slash_key(os.path.expanduser(c)) in home_paths:
+            return sb_scope.tag_base(home)
+        return sb_scope.tag_base(os.path.expanduser(c) if c.startswith("~") else c)
+    except Exception:
+        return os.path.basename(os.path.normpath(c))
 
 
 def refine(items, prompt: str, project: str):
@@ -488,7 +444,10 @@ def refine(items, prompt: str, project: str):
             continue
         out.append(it)
     # 같은 주제면 최신판이 먼저 — 상위 N건만 요지가 붙으므로 낡은 판이 요지를 차지하지 않게(2026-10-05)
-    out.sort(key=lambda it: (bool(pkey) and norm_project(it.get("project") or "") == pkey, it.get("_d", "")),
+    # 같은 프로젝트 우대는 그 기록 자체가 관련도 문턱을 넘을 때만(recalld 'pass'). 문턱 밖 같은 프로젝트 기록이
+    # 관련 높은 다른 프로젝트 기록을 밀어내던 문제(11-16 검토 P1). worker 결과에는 'pass' 가 없어 예전처럼 우대한다.
+    out.sort(key=lambda it: (bool(pkey) and it.get("pass", True) is not False
+                             and norm_project(it.get("project") or "") == pkey, it.get("_d", "")),
              reverse=True)
     return out
 
@@ -631,8 +590,10 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     internal = os.environ.get("CLAUDE_MEM_INTERNAL") == "1" or os.environ.get("SB_RECALL", "1") == "0"
     corr = "" if internal else correction_note(sid, prompt, str(raw.get("cwd") or ""))
+    if internal:   # 관찰기·야간 호출은 예전처럼 아무것도 쓰지 않는다(recall.jsonl 도 남기지 않음)
+        return
     why = automation_reason(raw, prompt)
-    if why:   # M3-T3: 자동화면 회수 주입 없이 기록만(교정 알림은 이전과 같다)
+    if why:   # M3-T3: 자동화면 회수 주입 없이 기록만(교정 알림은 이전과 같다). sb_health 는 automation 줄을 주입으로 세지 않는다
         recall_log({"sid": hashlib_sid(sid), "project": _cwd_project(str(raw.get("cwd") or "")),
                     "automation": True, "why": why})
         emit(corr)

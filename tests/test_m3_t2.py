@@ -42,9 +42,12 @@ class NormProjectTest(_FakeHome):
                  '/Users/kimuser', '/users/kimuser', 'C:\\Users\\kimuser', '/home/kimuser']
         self.assertEqual({sb_recall.norm_project(f) for f in forms}, {sb_recall.HOME_KEY})
 
-    def test_other_users_home_path_is_home_key(self):
-        # 다른 PC 의 홈 폴더 경로형 꼬리표도 '홈' — 이름만 있는 다른 사용자명은 그냥 이름이다
-        self.assertEqual(sb_recall.norm_project('/Users/someoneelse'), sb_recall.HOME_KEY)
+    def test_other_users_home_path_is_not_home_key(self):
+        # 다른 사용자의 홈·/home 아래 공유 폴더는 내 홈이 아니다(11-16 검토 P1) — 같은 사용자 이름의 다른 PC 홈만 홈
+        self.assertNotEqual(sb_recall.norm_project('/Users/someoneelse'), sb_recall.HOME_KEY)
+        self.assertNotEqual(sb_recall.norm_project('/home/bob'), sb_recall.norm_project('/Users/alice'))
+        self.assertNotEqual(sb_recall.norm_project('/home/projects'), sb_recall.HOME_KEY)
+        self.assertNotEqual(sb_recall.norm_project('/Users/Shared'), sb_recall.HOME_KEY)
         self.assertEqual(sb_recall.norm_project('someoneelse'), 'someoneelse')
 
     def test_case_and_separator_variants(self):
@@ -83,10 +86,12 @@ class HookProjectTest(_FakeHome):
     def test_windows_style_cwd(self):
         self.assertEqual(sb_recall.hook_project('C:\\Users\\kimuser\\Proj_A'), 'Proj_A')
 
-    def test_alias_path_wins(self):
+    def test_alias_file_does_not_change_claude_mem_tag(self):
+        # recalld·worker 는 claude-mem 꼬리표(폴더 이름)로 정확 일치 질의를 한다 — sb_scope 별칭 키로 바꾸면
+        # 같은 프로젝트 후보가 0건이 된다(11-16 검토 P1)
         self.aliases.write_text(json.dumps({'team-proj': [str(self.home / 'proj_a')], 'legacy': ['proj_a']}),
                                 encoding='utf-8')
-        self.assertEqual(sb_recall.hook_project(str(self.home / 'proj_a')), 'team-proj')
+        self.assertEqual(sb_recall.hook_project(str(self.home / 'proj_a')), 'proj_a')
         # 같은 경로만 — 하위 폴더나 이름 별칭으로는 바꾸지 않는다
         sub = self.home / 'proj_a' / 'sub'
         sub.mkdir()

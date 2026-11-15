@@ -13,8 +13,10 @@
                                           confirmed 검증 + 근거 조건 + 파일럿 gate 통과 시 한 트랜잭션으로 head 교체.
   head     --scope S [--fact-key K]      읽기 전용(mode=ro). DB/테이블을 만들지 않는다.
   history  --scope S --fact-key K         읽기 전용.
+  reopen   --candidate ID                 expire 가 닫은 후보를 proposed 로 되돌린다(전이 기록 남김).
   migrate  --db PATH                      추가 테이블 생성. 운영 DB 는 명시 승인 플래그 없이는 거부.
-  expire   [--dry-run]                    마지막 검증이 contradicted/rejected 인 proposed 후보를 rejected 로 닫는다.
+  expire   [--dry-run]                    마지막 검증이 contradicted 인 proposed 후보를 rejected 로 닫는다
+                                          (절차 오류 'rejected' 검증은 다시 검증하면 되므로 닫지 않는다).
                                           기본 꺼짐: SB_L2_EXPIRE=1 또는 vault.json layers.l2.reject_on_verify_fail=true
                                           일 때만 쓴다(SB_L2_EXPIRE=0 이면 vault 설정과 무관하게 끔). --dry-run 은 항상 읽기만.
 
@@ -698,7 +700,9 @@ def query(mode: str, scope_id: str, fact_key: Optional[str] = None, db_path: Opt
 # expire — 마지막 검증이 contradicted/rejected 인 proposed 후보를 rejected 로 전이 (기본 꺼짐)
 # ---------------------------------------------------------------------------
 
-EXPIRE_RESULTS = ('contradicted', 'rejected')
+# 'rejected' 검증 결과는 대부분 절차 오류(방법 잘못 고름·scope 밖 발화·value_json 없음)라 다시 검증하면 풀린다 —
+# 종결 대상은 증거와 어긋난 'contradicted' 뿐이다(11-16 검토 P1). 닫힌 후보는 reopen 으로 되살린다.
+EXPIRE_RESULTS = ('contradicted',)
 _EXPIRE_SELECT = (
     "SELECT c.id, c.scope_id, v.id AS vid, v.result FROM state_candidate c "
     "JOIN state_verification v ON v.id = (SELECT MAX(v2.id) FROM state_verification v2 WHERE v2.candidate_id = c.id) "
@@ -719,6 +723,46 @@ def expire_enabled() -> Tuple[bool, str]:
     if isinstance(l2, dict) and l2.get('reject_on_verify_fail') is True:
         return True, 'vault.json:layers.l2.reject_on_verify_fail'
     return False, 'default'
+
+
+def reopen(candidate_id: int, db_path: Optional[str] = None) -> Dict[str, Any]:
+    """expire 가 닫은 후보를 proposed 로 되돌린다(증거가 일시적으로 바뀌었던 경우 등). expire 전이 기록이 있는 후보만.
+    다시 verify → accept 하면 채택 경로를 그대로 탄다. 전이 기록을 한 줄 남긴다."""
+    with closing(write_connect(db_path)) as db:
+        require_extra_schema(db)
+        if 'state_candidate_transition' not in tables(db):
+            raise StateError('invalid', 'candidate %s was not closed by expire' % candidate_id)
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            cand = db.execute('SELECT id, scope_id, status FROM state_candidate WHERE id=?', (candidate_id,)).fetchone()
+            if not cand:
+                raise StateError('invalid', 'candidate %s not found' % candidate_id)
+            last = db.execute('SELECT to_status, reason FROM state_candidate_transition WHERE candidate_id=? '
+                              'ORDER BY id DESC LIMIT 1', (candidate_id,)).fetchone()
+            if cand['status'] != 'rejected' or not last or last['to_status'] != 'rejected' \
+                    or not str(last['reason'] or '').startswith('expire:'):
+                raise StateError('invalid', 'candidate %s was not closed by expire (status %r)' % (
+                    candidate_id, cand['status']))
+            if not state_scope_allowed(cand['scope_id']):
+                raise StateError('verification_failed', 'pilot gate: scope %r not in SB_STATE_PILOT_SCOPES %s' % (
+                    cand['scope_id'], state_pilot_scopes()))
+            db.execute("UPDATE state_candidate SET status='proposed' WHERE id=? AND status='rejected'", (candidate_id,))
+            db.execute('INSERT INTO state_candidate_transition(candidate_id, from_status, to_status, reason, '
+                       'basis_verification_id, transitioned_at) VALUES (?,?,?,?,?,?)',
+                       (candidate_id, 'rejected', 'proposed', 'reopen', None, utc_now()))
+            db.execute('COMMIT')
+        except sqlite3.OperationalError as exc:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            if _busy(exc):
+                raise StateError('busy', 'database busy: ' + str(exc))
+            raise
+        except Exception:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            raise
+    return {'schema_version': SCHEMA_VERSION, 'status': 'ok', 'candidate_id': candidate_id,
+            'from': 'rejected', 'to': 'proposed'}
 
 
 def expire(db_path: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
@@ -794,8 +838,10 @@ def main(argv: List[str]) -> int:
     a.add_argument('--allow-older', action='store_true', help='explicitly allow an older observed_at to replace the head')
     for name in ('head', 'history'):
         q = sub.add_parser(name); q.add_argument('--scope', required=True); q.add_argument('--fact-key')
-    e = sub.add_parser('expire', help='proposed 후보 중 마지막 검증이 contradicted/rejected 인 것을 rejected 로 닫는다(기본 꺼짐)')
+    e = sub.add_parser('expire', help='proposed 후보 중 마지막 검증이 contradicted 인 것을 rejected 로 닫는다(기본 꺼짐)')
     e.add_argument('--dry-run', action='store_true', help='대상만 세고 바꾸지 않는다(읽기 전용)')
+    ro = sub.add_parser('reopen', help='expire 가 닫은 후보를 proposed 로 되돌린다')
+    ro.add_argument('--candidate', type=int, required=True)
     m = sub.add_parser('migrate'); m.add_argument('--db', dest='mdb', required=True)
     m.add_argument('--allow-operational', action='store_true')
     ns = ap.parse_args(argv)
@@ -809,6 +855,8 @@ def main(argv: List[str]) -> int:
             out = accept(ns.candidate, ns.expected_version, ns.db, ns.memory_kind, ns.allow_older)
         elif ns.cmd == 'expire':
             out = expire(ns.db, ns.dry_run)
+        elif ns.cmd == 'reopen':
+            out = reopen(ns.candidate, ns.db)
         elif ns.cmd in ('head', 'history'):
             out = query(ns.cmd, ns.scope, ns.fact_key, ns.db)
         else:

@@ -125,22 +125,22 @@ class ExpireSelectionTests(ExpireBase):
         relapsed = self.candidate('rel', verification=['confirmed', 'contradicted'])
         unknown = self.candidate('unk', verification=['unknown'])
         never = self.candidate('none')
-        # 규칙 위반 rejected(user_decision 를 file_contains 로 검증) 도 실패로 친다
+        # 절차 오류 rejected(user_decision 를 file_contains 로 검증)는 다시 검증하면 되므로 닫지 않는다(11-16 검토 P1)
         r = sb_state.propose({'scope_id': 'alpha', 'fact_key': 'd', 'body': 'x', 'kind': 'user_decision',
                               'source': 't', 'write_id': 'ud'})
         self.assertEqual(sb_state.verify(r['candidate_id'], 'file_contains', str(self.loops))['result'], 'rejected')
         out = sb_state.expire()
-        self.assertEqual(sorted(out['candidate_ids']), sorted([bad, relapsed, r['candidate_id']]))
-        self.assertEqual(out['by_last_result'], {'contradicted': 2, 'rejected': 1})
-        self.assertEqual(out['changed'], 3)
-        for cid in (bad, relapsed, r['candidate_id']):
+        self.assertEqual(sorted(out['candidate_ids']), sorted([bad, relapsed]))
+        self.assertEqual(out['by_last_result'], {'contradicted': 2})
+        self.assertEqual(out['changed'], 2)
+        for cid in (bad, relapsed):
             self.assertEqual(self.status(cid), 'rejected')
-        for cid in (recovered, unknown, never):
+        for cid in (recovered, unknown, never, r['candidate_id']):
             self.assertEqual(self.status(cid), 'proposed')
         rows = self.transitions()
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 2)
         self.assertTrue(all(t[1:3] == ('proposed', 'rejected') for t in rows))
-        self.assertEqual({t[3] for t in rows}, {'expire:last_verification_contradicted', 'expire:last_verification_rejected'})
+        self.assertEqual({t[3] for t in rows}, {'expire:last_verification_contradicted'})
         self.assertTrue(all(t[4] for t in rows))
 
     def test_idempotent_and_head_untouched(self):
