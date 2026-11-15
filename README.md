@@ -69,6 +69,13 @@ irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps
 
 설치 뒤: `./install.sh --doctor` 로 전 항목 점검 → 새 Claude/Codex 세션을 열고 아무 도구나 한 번 쓰면 캡처가 시작된다.
 
+## 단계 셋업 (`sb setup`)
+
+설치 끝(`[12]`)에서 다섯 단계를 같은 순서·같은 판정으로 돈다: 1 설치 점검 → 2 자료 등록(과거 세션은 작업 폴더·시각·건수만, 폴더·회의록·링크) → 3 분류·필터(같은 seed 50건 표본) → 4 레이어 구성(볼트 구성안 승인) → 5 검증(회수 기록). 단계마다 수치 문턱으로 `pass`·`stop`·`pending`을 남기고, 멈춘 단계는 고치거나 이유를 적고 넘긴다(`sb setup accept N --reason`). 에이전트에게는 `/secondbrain-setup`. 자세한 표는 [SETUP.md](SETUP.md#6단계-단계-셋업-sb-setup).
+
+- 과거 세션은 기본으로 색인하지 않는다(`sb sources select <id>`로 고른 것만). 민감 신호가 있는 파일 이름·폴더는 건너뛴다.
+- 회의록은 머리에 `sensitivity: public`이 있을 때만 색인한다(`sb meeting index`·`sb meeting search`). 한국어 임베딩이 없으면 키워드 색인만 써서 적중이 낮다.
+
 ## 매일 쓰는 명령 (`sb`)
 
 ```sh

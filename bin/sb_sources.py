@@ -86,6 +86,9 @@ OK_TITLE = re.compile(r'(원인|해결|결정|확정|절차|규칙|교훈|해법
                       r'\bprocedure\b|\bhow\s+to\b|\bworkaround\b|\bgotcha\b)', re.IGNORECASE)
 NOISE_DUP_MAX, SCOPE_MISMATCH_MAX, UNJUDGED_MAX = 0.20, 0.05, 0.30
 JUDGE_VALUES = ('ok', 'noise', 'dup')
+# 이 판에는 관측 소음·중복을 자동으로 접는 도구가 없다 — 고칠 수 있는 것(판정 정정·넘김)만 안내한다
+NOISE_HINT = ('소음+중복 %.1f%% — 이 키트 판에는 관측 소음·중복 자동 정리가 없습니다. 판정이 틀렸으면 '
+              'sb setup judge --stage 3 로 고치고, 그대로 쓰려면 sb setup accept 3 --reason "<이유>"')
 
 
 # ---------------------------------------------------------------- 경로·파일
@@ -680,12 +683,12 @@ def evaluate(sample: Dict[str, Any]) -> Dict[str, Any]:
     if sm is not None and sm > SCOPE_MISMATCH_MAX:
         return _result(3, 'stop', metrics, 'scope 불일치 %.1f%% — sb vault analyze 로 별칭·꼬리표를 확인하세요' % (sm * 100))
     if nd_floor is not None and nd_floor > NOISE_DUP_MAX:
-        return _result(3, 'stop', metrics, '소음+중복 %.1f%% — 수집 제외·중복 정리 뒤 sb setup run --stage 3' % (nd_floor * 100))
+        return _result(3, 'stop', metrics, NOISE_HINT % (nd_floor * 100))
     if un is not None and un > UNJUDGED_MAX:
         return _result(3, 'pending', metrics, '표본 %d건을 판정해 주세요: sb setup judge --stage 3 --judgments ID:ok|noise|dup,…'
                        % unjudged)
     if nd is not None and nd > NOISE_DUP_MAX:
-        return _result(3, 'stop', metrics, '소음+중복 %.1f%% — 수집 제외·중복 정리 뒤 sb setup run --stage 3' % (nd * 100))
+        return _result(3, 'stop', metrics, NOISE_HINT % (nd * 100))
     return _result(3, 'pass', metrics)
 
 

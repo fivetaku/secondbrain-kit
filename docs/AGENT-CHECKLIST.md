@@ -25,7 +25,7 @@
   - 맥: `curl -fsSL https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.sh | sh`
   - 윈도우: `irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps1 | iex`
   - 옵션(필요 시): 맥 `| sh -s -- --provider gemini`, 윈도우 `$env:SBKIT_ARGS='--provider gemini'` 먼저 설정
-- [ ] 출력에 `[1]`~`[10]`이 모두 지나가고 `완료.`가 나왔는지
+- [ ] 출력에 `[1]`~`[12]`가 모두 지나가고 `완료.`가 나왔는지
 - [ ] `완료(경고 N건)`이면 경고 줄마다 처리(예: Codex 훅 신뢰 실패, `~/.local/bin/sb`가 다른 명령이라 덮어쓰지 않음)
 - [ ] 설정 JSON이 깨져 있다며 중단되면 해당 파일을 사용자와 함께 고친 뒤 재실행(설치기는 깨진 설정을 덮어쓰지 않는다)
 - [ ] 중간 실패 시: 실패한 단계 번호와 마지막 20줄을 확보 → "E. 실패 대응" 참고 → 고친 뒤 **같은 명령 재실행**(멱등)
@@ -68,6 +68,20 @@
 - [ ] **V-3 적용**: 사용자가 승인하면 `sb vault apply --plan <파일> --yes --hash <요약의 해시>` → `적용 완료`와 되돌리기 명령을 사용자에게 전달
 - [ ] **V-4 충돌**: 요약의 `충돌` 줄은 기존 값을 유지한 것이다. 바꾸려면 사용자가 직접 정한다(에이전트가 덮어쓰지 않는다)
 - [ ] **V-5 기록이 적을 때**: 기본 볼트로 두고 "기록이 쌓이면 다시 분석" 안내만 전한다
+
+## D++. 단계 셋업 (`sb setup`, 설치 직후)
+
+- [ ] `sb setup status --json` — `stages`에 1~5단계 판정이 있는지. 설치기 `[12]`가 돌았으면 1단계 `pass`가 있다
+- [ ] 첫 실행 질문(쓰는 에이전트·자료 위치·요약 LLM·한국어 임베딩)을 사용자에게 묻고 받은 답만 `sb setup answer ... --json`으로 기록. 사용자가 "기본값으로"라고 하면 묻지 않는다
+- [ ] `sb setup run --non-interactive --json` — 멈춘 단계·`hint`·`pass:false` 지표를 표로 보고
+- [ ] 4단계 `pending`이면 구성안 요약을 보여 주고, **사용자가 승인한다고 말한 경우에만** `sb setup approve <해시 앞 12자>`
+- [ ] 3단계 `pending`이면 표본 id별 판정을 사용자에게 받는다. 본문은 화면에 옮기지 않는다
+- [ ] `stop`을 넘길 때는 사용자가 말한 이유를 그대로 `sb setup accept N --reason "..."`에 적는다. 이유가 없으면 넘기지 않는다
+- [ ] 5단계는 세션이 쌓인 뒤 판정된다(`pending`이 정상). 사용자에게 "며칠 쓴 뒤 `sb setup --stage 5`"로 안내
+- [ ] 회의록 폴더를 넣었다면: 머리에 `sensitivity: public`이 없는 회의록은 색인되지 않는 것이 정상이다. 사용자에게 표기 방법을 안내
+- [ ] 보고: 단계별 판정과 `fingerprint` 앞 12자
+
+하지 말 것(추가): 사용자 대신 `approve`·`judge`·`accept` 실행, 판정 수치를 고쳐 적기, 대화·관측 본문을 보고서에 옮기기.
 
 ## E. 실패 대응
 
