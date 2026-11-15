@@ -122,13 +122,13 @@ def save_loops(items: Iterable[Dict], path: str = None) -> None:
 
 
 @contextmanager
-def locked_loops(path: str = None) -> Iterator[List[Dict]]:
+def locked_loops(path: str = None, timeout: float = 10.0) -> Iterator[List[Dict]]:
     """Serialize read-modify-write transactions; exceptions roll back changes."""
     target = loops_path() if path is None else path
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
     with open(target + '.lock', 'a', encoding='utf-8') as lock:
         try:
-            sb_lock.lock_with_timeout(lock, sb_lock.LOCK_EX, timeout=10.0)
+            sb_lock.lock_with_timeout(lock, sb_lock.LOCK_EX, timeout=timeout)
         except TimeoutError:
             raise TimeoutError('timed out waiting for ledger lock: ' + target)
         try:

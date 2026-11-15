@@ -167,6 +167,53 @@ def health_line() -> str:
     return line
 
 
+def record_exposure(text: str) -> list:
+    """브리핑이 실제로 보여 준 미결 ID를 노출로 기록한다(2026-11-16 M3 T4) — 백오프·stale 퇴장이 다시 돈다.
+    loops.py exposed-ids 와 같은 판정: 열린 미결 중 재노출일이 됐고 오늘 아직 안 센 것만, 하루 한 번.
+    트랙 줄의 '[L…]' 표기만 센다 — 상태 본문·주의 줄에 지나가듯 나온 다른 scope 미결 ID는 노출로 치지 않는다.
+    잘린 브리핑은 남은 본문에 나온 ID만 센다. 끄기: SB_LOOPS_EXPOSURE=0. 실패해도 세션 시작은 막지 않는다."""
+    if os.environ.get('SB_LOOPS_EXPOSURE', '1') == '0' or not text:
+        return []
+    try:
+        import re
+        import loops
+        ids = re.findall(r'\[(' + loops.LOOP_ID_RE.pattern + r')\]', text)
+        return loops.record_shown(ids, timeout=0.5)
+    except Exception:  # noqa: BLE001 — 잠금 시간 초과·원장 손상이면 이번 기록만 건너뛴다
+        return []
+
+
+RULES_BRIEF_MAX = 5
+
+
+def rules_lines(scope_id: str) -> list:
+    """현재 scope 규칙(L3, rules/<scope>.md — sb_rules 생성물 또는 손으로 쓴 파일)의 제목을 최신순 최대 N줄(2026-11-16 M3 T6).
+    제목은 '출처' 블록 단위로 뽑는다(본문 안 '## …' 줄은 제목이 아니다). 파일이 없거나 제목이 없으면 아무것도 넣지 않는다.
+    줄 수: SB_RULES_BRIEF_MAX(기본 5), 0이면 끈다."""
+    try:
+        limit = int(os.environ.get('SB_RULES_BRIEF_MAX', RULES_BRIEF_MAX))
+    except ValueError:
+        limit = RULES_BRIEF_MAX
+    if limit <= 0 or not scope_id:
+        return []
+    import sb_config
+    # sb_rules.rules_dir·scope_file 과 같은 규칙. sb_rules 는 무거운 모듈을 끌어오므로 파일이 있을 때만 부른다
+    base = Path(os.environ.get('SB_RULES_DIR') or sb_config.sb_path('rules')).expanduser().resolve()
+    name = scope_id.replace('/', '__').replace('\\', '__').replace('..', '_') + '.md'
+    path = (base / name).resolve()
+    if path.parent != base or not path.is_file():   # rules 폴더 밖을 가리키는 이름(sb_search 와 같은 거부)·없는 파일
+        return []
+    import sb_rules
+    titles = sb_rules.titles(path.read_bytes().decode('utf-8', errors='replace'))
+    if not titles:
+        return []
+    out = ['📏 이 scope(%s) 규칙 %d건 — 제목만, 최신순(본문: sb search --mode rules):' % (scope_id, len(titles))]
+    out += ['  · %s' % t[:100] for t in titles[:limit]]
+    if len(titles) > limit:
+        out.append('  · …외 %d건' % (len(titles) - limit))
+    return out
+
+
 def emit(harness: str, text: str) -> str:
     payload = {'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': text}}
     if harness == 'claude':
@@ -201,11 +248,18 @@ def main() -> None:
         pass
     try:
         text, scope_id, method, shown, omitted, used = build(cwd)
+        briefed = text   # 노출 기록은 미결 브리핑 부분만 본다(교정·건강 줄은 빼고)
     except Exception:
         if os.environ.get('SB_HOOK_DEBUG') == '1':   # 조용한 실패 진단용
             import traceback
             traceback.print_exc()
         return
+    try:
+        rules = rules_lines(scope_id)
+    except Exception:  # noqa: BLE001 — 규칙 표시 실패가 세션 시작을 막으면 안 된다
+        rules = []
+    if rules:
+        text = (text + '\n\n' + '\n'.join(rules)).strip()
     try:
         corr = correction_lines(cwd)
     except Exception:  # noqa: BLE001 — 교정 후보 표시 실패가 세션 시작을 막으면 안 된다
@@ -229,6 +283,8 @@ def main() -> None:
         return
     payload = emit(args.harness, text)
     sys.stdout.write(payload + '\n')
+    sys.stdout.flush()
+    record_exposure(briefed)
     try:  # 주입량 계측(본문은 남기지 않는다)
         import sb_config
         log = Path(os.environ.get('SB_INJECTION_LOG') or sb_config.sb_path('logs', 'injection.jsonl'))
@@ -238,7 +294,7 @@ def main() -> None:
                 'ts': _dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds'),
                 'harness': args.harness, 'scope_id': scope_id, 'scope_method': method,
                 'context_chars': len(text), 'items': shown, 'omitted': omitted,
-                'briefing': int(used)}, ensure_ascii=False) + '\n')
+                'briefing': int(used), 'rules': sum(1 for l in rules[1:] if not l.startswith('  · …외 '))}, ensure_ascii=False) + '\n')
     except Exception:
         pass
 

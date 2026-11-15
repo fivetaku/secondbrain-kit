@@ -97,6 +97,42 @@ def ensure_running(port=None):
 
 
 # 하이브리드(2026-10-20): 키워드 후보 + 벡터 후보를 점수 결합한 뒤 한국어 재순위기로 섞어 고친다.
+def same_min(limit: int) -> int:
+    """상위 limit 안에 둘 같은 프로젝트 최소 건수. 기본 ceil(limit*2/3)(limit 3이면 2).
+    SB_RECALLD_SAME_MIN: 정수면 건수, 0~1 사이 소수면 비율, 0이면 끈다. 값이 틀리면 기본값."""
+    dflt = -(-2 * limit // 3)
+    raw = (os.environ.get('SB_RECALLD_SAME_MIN') or '').strip()
+    if not raw:
+        return dflt
+    try:
+        v = float(raw)
+    except ValueError:
+        return dflt
+    if v <= 0:
+        return 0
+    n = -(-int(v * limit * 1000) // 1000) if v < 1 else int(v)
+    return min(n, limit)
+
+
+def same_project_share(rows, project, limit, proj_of, k=None):
+    """순서는 그대로 두고, 상위 limit 안 같은 프로젝트가 k건보다 적으면 limit 밖의 같은 프로젝트 후보로
+    가장 아래의 다른 프로젝트 항목을 바꾼다. 같은 프로젝트 후보가 모자라면 있는 만큼만. 판정(gate)과는 무관하다."""
+    top = list(rows[:limit])
+    k = same_min(limit) if k is None else k
+    if not project or k <= 0:
+        return top
+    have = sum(1 for r in top if proj_of(r) == project)
+    extra = [r for r in rows[limit:] if proj_of(r) == project][:max(0, k - have)]
+    drop = len(extra)
+    for i in range(len(top) - 1, -1, -1):
+        if not drop:
+            break
+        if proj_of(top[i]) != project:
+            del top[i]
+            drop -= 1
+    return top + extra
+
+
 # 실사용 프롬프트 200개(정답=그 프롬프트에서 기록된 관측) 평가 근거는 secondbrain RESEARCH/hybrid-search-quality_20261020_1600.
 # 주입 여부 판정(gate)은 그대로 키워드 1위 문서로 한다 — DOE로 맞춘 주입률을 바꾸지 않기 위해서다.
 HYBRID = os.environ.get('SB_RECALLD_HYBRID', '1') == '1'
@@ -318,7 +354,12 @@ class Engine:
         def keep(r):
             m = meta.get(r[0], {})
             return not (m.get('live') and m.get('epoch', 0) > cutoff) and r[0] not in dead
-        rows = [r for r in rows if keep(r)][:limit]
+        pool = [r for r in rows if keep(r)]
+        if ranked:   # 하이브리드 순서가 떨어뜨린 키워드 후보도 같은 프로젝트 몫을 채울 예비로 뒤에 둔다
+            shown = {r[0] for r in pool}
+            pool += [r for r in lexical if r[0] not in shown and keep(r)]
+        # 2026-11-16 M3-T3: 재정렬이 같은 프로젝트 우선을 깼다(같은 프로젝트 후보 3건 이상인데 다른 프로젝트 주입 31.1%).
+        rows = same_project_share(pool, project, limit, lambda r: r[2] or meta.get(r[0], {}).get('project', ''))
         judge = next((r for r in lexical if keep(r)), None)
         matched, cov, rare = 0, 0.0, 0
         counted = [t for t in toks if t not in TASK_WORDS]   # 판정은 주제 단어로만(검색에는 모두 씀)

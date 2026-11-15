@@ -5,6 +5,7 @@
   loops.py list [--all]          열린 루프 목록 (OPEN.md도 갱신)
   loops.py brief [--ids]         오늘의 브리프 생성(읽기 전용, 상위 3건) → stdout
   loops.py record-exposure <id> [<id>...]  발송 성공 후 노출 기록·백오프 적용
+  loops.py exposed-ids           stdin 본문에 나온 열린 미결 ID 중 오늘 노출로 셀 것(재노출일 도래·오늘 미노출) → stdout
   loops.py close <id> [메모]     완료 처리
   loops.py snooze <id> <일수>    N일 뒤로 미루기
   loops.py drop <id> [메모]      폐기(안 할 일로 확정)
@@ -21,6 +22,7 @@ import argparse
 import collections
 import datetime
 import os
+import re
 import sys
 from typing import Dict, List
 
@@ -85,6 +87,52 @@ def brief(ids: bool = False) -> str:
     return '\n'.join(lines)
 
 
+# 2026-11-16 M3 T4 (11-15 sbfix-3 안): 실제로 보여 준 본문에 나온 미결 ID만 노출로 센다.
+# 원장에 없는 ID·닫힌 미결은 빼서 record-exposure가 실패하거나 종결 건을 건드리지 않게 하고,
+# 재노출일(next_review)이 된 것만·하루 한 번만 센다 — 날마다 같은 미결을 보여 줘도 백오프(1→2→3→5→8→13일)를 지킨다.
+LOOP_ID_RE = re.compile(r'(?<![A-Za-z0-9])L[0-9a-f]{4}(?:[0-9a-f]{4})?(?![A-Za-z0-9])')
+
+
+def exposable(item: Dict, t: str) -> bool:
+    return (item.get('status') in ('open', 'waiting_external') and item.get('last_exposed') != t
+            and (item.get('next_review') or t) <= t)
+
+
+def exposed_ids(text: str) -> str:
+    t = iso(today())
+    live = {i['id'] for i in load_loops() if exposable(i, t)}
+    return ' '.join(lid for lid in dict.fromkeys(LOOP_ID_RE.findall(text)) if lid in live)
+
+
+def apply_exposure(selected: List[Dict], t: str) -> None:
+    for i in selected:
+        i['expose_count'] = i.get('expose_count', 0) + 1
+        i['last_exposed'] = t
+        if i['expose_count'] >= 6:
+            i['status'] = 'stale'
+            i['stale_at'] = t
+        else:
+            i['next_review'] = iso(today() + datetime.timedelta(days=BACKOFF[i['expose_count'] - 1]))
+
+
+def record_shown(ids, timeout: float = 1.0) -> List[str]:
+    """세션 시작 브리핑처럼 사람·에이전트에게 실제로 보여 준 미결을 노출로 기록한다(하루 한 번, 재노출일 도래분만).
+    대상이 없으면 원장을 열어 쓰지 않는다. 잠금을 timeout 안에 못 잡으면 TimeoutError — 호출자가 이번 기록만 건너뛴다."""
+    wanted = list(dict.fromkeys(ids))
+    t = iso(today())
+    if not wanted or not any(i['id'] in wanted and exposable(i, t) for i in load_loops()):
+        return []
+    with locked_loops(timeout=timeout) as items:   # 잠근 뒤 다시 판정한다 — 동시에 뜬 세션이 이미 기록했을 수 있다
+        by_id: Dict[str, List[Dict]] = {}
+        for i in items:
+            by_id.setdefault(i['id'], []).append(i)
+        selected = [by_id[lid][0] for lid in wanted if len(by_id.get(lid, ())) == 1 and exposable(by_id[lid][0], t)]
+        apply_exposure(selected, t)
+    if selected:
+        render(items)
+    return [i['id'] for i in selected]
+
+
 def find(items: List[Dict], lid: str) -> Dict:
     matches = [i for i in items if i['id'] == lid]
     if len(matches) > 1:
@@ -100,6 +148,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser('list').add_argument('--all', action='store_true')
     commands.add_parser('brief').add_argument('--ids', action='store_true')
     commands.add_parser('stats')
+    commands.add_parser('exposed-ids')
     for command in ('close', 'drop', 'reopen'):
         sub = commands.add_parser(command)
         sub.add_argument('id')
@@ -135,14 +184,7 @@ def mutate(items: List[Dict], args: argparse.Namespace) -> str:
         return f"추가: {it['id']}"
     if cmd == 'record-exposure':
         selected = [find(items, lid) for lid in dict.fromkeys(args.ids)]
-        for i in selected:
-            i['expose_count'] = i.get('expose_count', 0) + 1
-            i['last_exposed'] = t
-            if i['expose_count'] >= 6:
-                i['status'] = 'stale'
-                i['stale_at'] = t
-            else:
-                i['next_review'] = iso(today() + datetime.timedelta(days=BACKOFF[i['expose_count'] - 1]))
+        apply_exposure(selected, t)
         return "노출 기록: " + ' '.join(i['id'] for i in selected)
     i = find(items, args.id)
     if cmd == 'set-action':
@@ -201,6 +243,8 @@ def main() -> None:
             for i in live:
                 print(f"{i['id']} [{i.get('value','?')}/{i['status']}] {i['title'][:70]}")
             print(f"-- {len(live)}건. 상세: {open_md()}")
+        elif args.command == 'exposed-ids':
+            print(exposed_ids(sys.stdin.read()))
         elif args.command == 'stats':
             items = load_loops()
             print(dict(collections.Counter(i['status'] for i in items)), f"/ 총 {len(items)}")

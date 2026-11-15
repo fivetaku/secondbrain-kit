@@ -14,6 +14,9 @@
   head     --scope S [--fact-key K]      읽기 전용(mode=ro). DB/테이블을 만들지 않는다.
   history  --scope S --fact-key K         읽기 전용.
   migrate  --db PATH                      추가 테이블 생성. 운영 DB 는 명시 승인 플래그 없이는 거부.
+  expire   [--dry-run]                    마지막 검증이 contradicted/rejected 인 proposed 후보를 rejected 로 닫는다.
+                                          기본 꺼짐: SB_L2_EXPIRE=1 또는 vault.json layers.l2.reject_on_verify_fail=true
+                                          일 때만 쓴다(SB_L2_EXPIRE=0 이면 vault 설정과 무관하게 끔). --dry-run 은 항상 읽기만.
 
 종료 코드: 0 ok · 2 invalid · 3 stale_version · 4 busy · 5 conflict · 6 verification_failed · 7 schema_missing · 8 unavailable
 """
@@ -103,6 +106,17 @@ BEGIN
     WHERE NOT EXISTS (SELECT 1 FROM state_verification v WHERE v.id = NEW.verification_id
                       AND v.candidate_id = NEW.candidate_id AND v.result = 'confirmed');
 END;
+"""
+_TRANSITION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS state_candidate_transition (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER NOT NULL REFERENCES state_candidate(id),
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    basis_verification_id INTEGER REFERENCES state_verification(id),
+    transitioned_at TEXT NOT NULL
+);
 """
 EXTRA_TABLES = ('state_candidate', 'state_verification', 'state_acceptance')
 
@@ -681,6 +695,85 @@ def query(mode: str, scope_id: str, fact_key: Optional[str] = None, db_path: Opt
 
 
 # ---------------------------------------------------------------------------
+# expire — 마지막 검증이 contradicted/rejected 인 proposed 후보를 rejected 로 전이 (기본 꺼짐)
+# ---------------------------------------------------------------------------
+
+EXPIRE_RESULTS = ('contradicted', 'rejected')
+_EXPIRE_SELECT = (
+    "SELECT c.id, c.scope_id, v.id AS vid, v.result FROM state_candidate c "
+    "JOIN state_verification v ON v.id = (SELECT MAX(v2.id) FROM state_verification v2 WHERE v2.candidate_id = c.id) "
+    "WHERE c.status = 'proposed' AND v.result IN (%s) ORDER BY c.id" % ','.join("'%s'" % r for r in EXPIRE_RESULTS))
+
+
+def expire_enabled() -> Tuple[bool, str]:
+    """SB_L2_EXPIRE 가 정해져 있으면 그 값이 우선(1=켬, 그 밖=끔). 없으면 vault.json layers.l2.reject_on_verify_fail."""
+    raw = os.environ.get('SB_L2_EXPIRE')
+    if raw is not None and raw.strip() != '':
+        return raw.strip() == '1', 'env:SB_L2_EXPIRE'
+    vj = sb_config.home() / 'config' / 'vault.json'
+    try:
+        conf = json.loads(vj.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return False, 'default'
+    l2 = ((conf.get('layers') or {}).get('l2') or {}) if isinstance(conf, dict) else {}
+    if isinstance(l2, dict) and l2.get('reject_on_verify_fail') is True:
+        return True, 'vault.json:layers.l2.reject_on_verify_fail'
+    return False, 'default'
+
+
+def expire(db_path: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """state 표(head)는 건드리지 않는다. 전이 사유는 state_candidate_transition 에 한 줄씩 남긴다.
+
+    쓰기는 SB_STATE_PILOT_SCOPES 로 허용된 scope 의 후보만 한다(accept 와 같은 gate)."""
+    enabled, source = expire_enabled()
+    with closing(ro_connect(db_path) if dry_run or not enabled else write_connect(db_path)) as db:
+        require_extra_schema(db)
+        rows = db.execute(_EXPIRE_SELECT).fetchall()
+        allowed = [r for r in rows if state_scope_allowed(r['scope_id'])]
+        by_result: Dict[str, int] = {}
+        for r in allowed:
+            by_result[r['result']] = by_result.get(r['result'], 0) + 1
+        out = {'schema_version': SCHEMA_VERSION, 'status': 'ok', 'enabled': enabled, 'enabled_by': source,
+               'dry_run': dry_run, 'matched': len(allowed), 'skipped_scope_gate': len(rows) - len(allowed),
+               'by_last_result': by_result, 'candidate_ids': [r['id'] for r in allowed], 'changed': 0}
+        if not enabled and not dry_run:
+            out['status'] = 'disabled'
+            out['note'] = 'L2 실패 후보 종결은 기본 꺼짐: SB_L2_EXPIRE=1 또는 vault.json layers.l2.reject_on_verify_fail=true'
+            return out
+        if dry_run or not allowed:
+            return out
+        now = utc_now()
+        changed = 0
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute(_TRANSITION_SCHEMA.strip().rstrip(';'))  # 기존 DB 이행: IF NOT EXISTS
+            for r in db.execute(_EXPIRE_SELECT).fetchall():  # 잠금 뒤 다시 읽는다
+                if not state_scope_allowed(r['scope_id']):
+                    continue
+                cur = db.execute("UPDATE state_candidate SET status='rejected' WHERE id=? AND status='proposed'",
+                                 (r['id'],))
+                if cur.rowcount != 1:
+                    continue
+                db.execute('INSERT INTO state_candidate_transition(candidate_id, from_status, to_status, reason, '
+                           'basis_verification_id, transitioned_at) VALUES (?,?,?,?,?,?)',
+                           (r['id'], 'proposed', 'rejected', 'expire:last_verification_' + r['result'], r['vid'], now))
+                changed += 1
+            db.execute('COMMIT')
+        except sqlite3.OperationalError as exc:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            if _busy(exc):
+                raise StateError('busy', 'database busy: ' + str(exc))
+            raise
+        except Exception:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            raise
+        out['changed'] = changed
+        return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -701,6 +794,8 @@ def main(argv: List[str]) -> int:
     a.add_argument('--allow-older', action='store_true', help='explicitly allow an older observed_at to replace the head')
     for name in ('head', 'history'):
         q = sub.add_parser(name); q.add_argument('--scope', required=True); q.add_argument('--fact-key')
+    e = sub.add_parser('expire', help='proposed 후보 중 마지막 검증이 contradicted/rejected 인 것을 rejected 로 닫는다(기본 꺼짐)')
+    e.add_argument('--dry-run', action='store_true', help='대상만 세고 바꾸지 않는다(읽기 전용)')
     m = sub.add_parser('migrate'); m.add_argument('--db', dest='mdb', required=True)
     m.add_argument('--allow-operational', action='store_true')
     ns = ap.parse_args(argv)
@@ -712,6 +807,8 @@ def main(argv: List[str]) -> int:
             out = verify(ns.candidate, ns.method, ns.target, ns.evidence_ref, ns.db, ns.cross_scope)
         elif ns.cmd == 'accept':
             out = accept(ns.candidate, ns.expected_version, ns.db, ns.memory_kind, ns.allow_older)
+        elif ns.cmd == 'expire':
+            out = expire(ns.db, ns.dry_run)
         elif ns.cmd in ('head', 'history'):
             out = query(ns.cmd, ns.scope, ns.fact_key, ns.db)
         else:

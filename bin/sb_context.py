@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 BIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN))
 import sb_recalld  # noqa: E402
+import sb_rules  # noqa: E402
 import sb_scope  # noqa: E402
 
 # '원' 뒤에 한글이 붙으면 '3원칙'·'2원화' 같은 낱말이라 금액이 아니다. 금액 뒤에 흔히 오는 조사·의존어만 허용한다
@@ -51,10 +52,20 @@ MASKS = [
                 + r'\d[\d,]{5,}\d(?![\d.-])'), '<num>'),
 ]
 RECALL_LIMIT = 6
+RULES_MAX = 15
+# 규칙 블록 최소 몫(줄 수): 앞 층(확정 사실·다음 행동)이 예산을 다 써도 규칙 머리와 제목 N줄은 남긴다(M3 T6). 끄기 0
+RULES_MIN_DEFAULT = 2
 # sb_search --mode 가 층 저장소를 아직 안 만든 새 사용자에게 내는 unavailable 경고 코드(상태층 DB·미결 원장·규칙 폴더 없음).
 # 이것만이면 '조회 실패'가 아니라 '없음'이다. 상태층 테이블 없음·잠금 오류 같은 그 밖의 unavailable 은 실패로 둔다
 NOT_YET_CREATED = frozenset({'state_db_missing', 'loops_file_missing', 'rules_dir_missing'})
 UNAVAILABLE_EXIT = 8   # sb_search MODE_EXIT['unavailable']
+
+
+def rules_min() -> int:
+    try:
+        return max(0, int(os.environ.get('SB_CONTEXT_RULES_MIN', RULES_MIN_DEFAULT)))
+    except ValueError:
+        return RULES_MIN_DEFAULT
 
 
 def mask(text: str) -> str:
@@ -116,11 +127,15 @@ def build(query: str, scope: str, max_bytes: int, project: str = '') -> str:
         lines.append('## 다음 행동(L1)')
         lines += ['- {} {}'.format(n.get('item_id'), (n.get('body') or '')[:160]) for n in nexts]
     rules = mode('rules', scope)
+    reserved = 0   # lines 안에서 규칙 머리부터 최소 몫까지의 줄 수(예산을 먼저 떼어 둔다)
     if rules:
-        titles = re.findall(r'^## (.+)$', rules[0].get('body') or '', re.M)
+        # 제목은 '출처' 블록 단위로 뽑는다 — 본문 안의 '## …' 줄을 규칙 제목으로 세지 않는다
+        titles = sb_rules.titles(rules[0].get('body') or '')
         if titles:
+            start = len(lines)
             lines.append('## 규칙(L3, 제목만)')
-            lines += ['- ' + t[:120] for t in titles[:15]]
+            lines += ['- ' + t[:120] for t in titles[:RULES_MAX]]
+            reserved = (start, 1 + min(rules_min(), len(titles), RULES_MAX)) if rules_min() else 0
     hits: Optional[List[Dict[str, Any]]] = []
     if query:   # 현재 프로젝트 기록을 먼저, 남는 자리만 전역
         local = (recall(query, project) or []) if project else []
@@ -136,14 +151,36 @@ def build(query: str, scope: str, max_bytes: int, project: str = '') -> str:
                   for h in hits]
     if any(layer is None for layer in (facts, nexts, rules, hits)):
         lines.append('(일부 층 조회 실패 — 없는 것과 구분할 것)')
-    out, size = [], 0
-    for line in map(mask, lines):
-        cost = len(line.encode('utf-8')) + 1
-        if size + cost > max_bytes:
-            out.append('(용량 한도로 이하 생략)')
-            break
+    return _fit(list(map(mask, lines)), max_bytes, reserved)
+
+
+def _fit(lines: List[str], max_bytes: int, reserved: Any = 0) -> str:
+    """max_bytes 안에서 앞줄부터 싣는다. reserved=(시작 줄, 줄 수)면 그 줄들(규칙 머리·제목 최소 몫)의 자리를 먼저 떼어 두고,
+    앞 층이 넘쳐도 그 줄들은 싣는다. 머리 두 줄(안내문)은 최소 몫보다 앞선다 — 남는 자리만큼만 최소 몫을 둔다."""
+    cost = [len(line.encode('utf-8')) + 1 for line in lines]
+    keep = set()
+    if reserved:
+        start, count = reserved
+        budget = max_bytes - sum(cost[:2])
+        for i in range(start, start + count):
+            if budget - cost[i] < 0:
+                break
+            budget -= cost[i]
+            keep.add(i)
+        if keep and len(keep) < 2:   # 머리만 남고 제목이 하나도 안 들어가면 머리도 싣지 않는다
+            keep = set()
+    pending = sum(cost[i] for i in keep)
+    out, size, cut = [], 0, False
+    for i, line in enumerate(lines):
+        if i in keep:
+            pending -= cost[i]
+        elif cut or size + cost[i] + pending > max_bytes:
+            cut = True
+            continue
         out.append(line)
-        size += cost
+        size += cost[i]
+    if cut:
+        out.append('(용량 한도로 이하 생략)')
     return '\n'.join(out)
 
 

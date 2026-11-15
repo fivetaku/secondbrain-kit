@@ -70,7 +70,7 @@ def audit_scope(scope_id: str) -> Dict[str, Any]:
                 if 'state_candidate' in sb_state.tables(db):
                     candidates = db.execute(
                         "SELECT c.*, (SELECT result FROM state_verification v WHERE v.candidate_id=c.id ORDER BY v.id DESC LIMIT 1) AS last_result "
-                        "FROM state_candidate c WHERE c.scope_id=? AND c.status IN ('proposed','conflict','rejected') ORDER BY c.id",
+                        "FROM state_candidate c WHERE c.scope_id=? AND c.status IN ('proposed','conflict') ORDER BY c.id",
                         (scope_id,)).fetchall()
                     for h in head_rows.values():
                         row = db.execute('SELECT value_json FROM state_candidate c JOIN state_acceptance a ON a.candidate_id=c.id WHERE a.state_id=?',
