@@ -97,6 +97,79 @@ def ensure_running(port=None):
 
 
 # 하이브리드(2026-10-20): 키워드 후보 + 벡터 후보를 점수 결합한 뒤 한국어 재순위기로 섞어 고친다.
+SHARE_WINDOW_DEFAULT = 3   # 훅이 실제로 주입하는 건수(SB_RECALL_MAX 기본 3). 훅은 넉넉히(limit 10) 묻고 앞의 3건을 쓴다
+
+
+def _project_key(name) -> str:
+    try:
+        import sb_scope
+        return sb_scope.project_key(name)
+    except Exception:  # noqa: BLE001
+        return str(name or '').strip()
+
+
+def share_window(limit: int) -> int:
+    """같은 프로젝트 몫을 셀 상위 구간 — 주입되는 앞쪽 N건(SB_RECALLD_SHARE_WINDOW, 기본 3)과 limit 중 작은 값.
+    limit 10 으로 물어도 몫은 앞 3건 기준(2건)이다. 끝에 붙이면 주입되는 앞 3건이 그대로라 효과가 없었다(11-16 검토)."""
+    try:
+        w = int(os.environ.get('SB_RECALLD_SHARE_WINDOW') or SHARE_WINDOW_DEFAULT)
+    except ValueError:
+        w = SHARE_WINDOW_DEFAULT
+    return max(1, min(w if w > 0 else SHARE_WINDOW_DEFAULT, limit))
+
+
+def same_min(limit: int) -> int:
+    """상위 limit 안에 둘 같은 프로젝트 최소 건수. 기본 ceil(limit*2/3)(limit 3이면 2).
+    SB_RECALLD_SAME_MIN: 정수면 건수, 0~1 사이 소수면 비율, 0이면 끈다. 값이 틀리면(nan·inf 포함) 기본값."""
+    import math
+    dflt = -(-2 * limit // 3)
+    raw = (os.environ.get('SB_RECALLD_SAME_MIN') or '').strip()
+    if not raw:
+        return dflt
+    try:
+        v = float(raw)
+    except ValueError:
+        return dflt
+    if not math.isfinite(v):
+        return dflt
+    if v <= 0:
+        return 0
+    n = -(-int(v * limit * 1000) // 1000) if v < 1 else int(v)
+    return min(n, limit)
+
+
+def same_project_share(rows, project, limit, proj_of, k=None, window=None, eligible=None):
+    """상위 window 건(주입되는 앞쪽) 안 같은 프로젝트가 k건보다 적으면, window 밖의 같은 프로젝트 후보 중
+    eligible(r) 를 통과한 것으로 window 안 가장 아래의 다른 프로젝트 항목을 바꾼다. 밀려난 항목은 window 바로 뒤로 간다.
+    proj_of(r) 는 '같은 프로젝트인가'(참/거짓) 또는 project 문자열(project 와 정확 일치 비교)을 돌려준다.
+    eligible 이 없으면 모두 통과. 후보가 모자라면 있는 만큼만. 결과는 상위 limit 건."""
+    window = share_window(limit) if window is None else max(0, min(window, limit))
+    k = same_min(window) if k is None else min(k, window)
+    rows = list(rows)
+    if not project or k <= 0 or not rows:
+        return rows[:limit]
+
+    def same(r):
+        v = proj_of(r)
+        return v if isinstance(v, bool) else v == project
+    top = rows[:window]
+    have = sum(1 for r in top if same(r))
+    need = max(0, k - have)
+    extra = [r for r in rows[window:] if same(r) and (eligible is None or eligible(r))][:need]
+    if not extra:
+        return rows[:limit]
+    displaced = []
+    for i in range(len(top) - 1, -1, -1):
+        if len(displaced) == len(extra):
+            break
+        if not same(top[i]):
+            displaced.insert(0, top.pop(i))
+    extra = extra[:len(displaced)]
+    taken = {id(r) for r in extra}
+    rest = [r for r in rows[window:] if id(r) not in taken]
+    return (top + extra + displaced + rest)[:limit]
+
+
 # 실사용 프롬프트 200개(정답=그 프롬프트에서 기록된 관측) 평가 근거는 secondbrain RESEARCH/hybrid-search-quality_20261020_1600.
 # 주입 여부 판정(gate)은 그대로 키워드 1위 문서로 한다 — DOE로 맞춘 주입률을 바꾸지 않기 위해서다.
 HYBRID = os.environ.get('SB_RECALLD_HYBRID', '1') == '1'
@@ -269,11 +342,22 @@ class Engine:
         from collections import Counter
         df = Counter()
         n = 0
+        projects = set()
         with closing(self.ko.open_index(create=False)) as conn:
-            for (body,) in conn.execute('SELECT body FROM ko_fts'):
+            for proj, body in conn.execute('SELECT project, body FROM ko_fts'):
                 n += 1
+                projects.add(proj or '')
                 df.update(set((body or '').lower().split()))
         self.df, self.n_docs = df, max(1, n)
+        self.projects = frozenset(projects)   # 꼬리표 표기 변형(홈·대소문자·'_'/'-')을 같은 프로젝트 질의에 함께 넣는다
+
+    def project_tags(self, project):
+        """색인에 있는 꼬리표 중 project 와 같은 비교 키(sb_scope.project_key)인 것들 — project 자신 포함."""
+        key = _project_key(project)
+        tags = {project}
+        if key:
+            tags |= {t for t in getattr(self, 'projects', ()) if t and _project_key(t) == key}
+        return sorted(tags)
 
     def nouns(self, text):
         ident = [w.lower() for w in re.findall(r'[A-Za-z0-9_]+(?:[._/-][A-Za-z0-9_]+)*', text)]
@@ -288,8 +372,9 @@ class Engine:
         sql = 'SELECT obs_id, bm25(ko_fts), project, body FROM ko_fts WHERE ko_fts MATCH ?'
         params = [match]
         if project:
-            sql += ' AND project = ?'
-            params.append(project)
+            tags = [project] if isinstance(project, str) else list(project)
+            sql += ' AND project IN (%s)' % ','.join('?' * len(tags))
+            params += tags
         sql += ' ORDER BY bm25(ko_fts), obs_id LIMIT ?'
         return conn.execute(sql, [*params, limit]).fetchall()
 
@@ -301,7 +386,7 @@ class Engine:
         match = ' OR '.join('"' + t.replace('"', '""') + '"' for t in toks)
         width = max(limit * 2, CANDIDATES) if HYBRID else limit * 2
         with closing(self.ko.open_index(create=False)) as conn:
-            rows = self._search(conn, match, project, width) if project else []
+            rows = self._search(conn, match, self.project_tags(project), width) if project else []
             seen = {r[0] for r in rows}
             rows += [r for r in self._search(conn, match, None, width) if r[0] not in seen]
         lexical = rows
@@ -318,23 +403,43 @@ class Engine:
         def keep(r):
             m = meta.get(r[0], {})
             return not (m.get('live') and m.get('epoch', 0) > cutoff) and r[0] not in dead
-        rows = [r for r in rows if keep(r)][:limit]
-        judge = next((r for r in lexical if keep(r)), None)
-        matched, cov, rare = 0, 0.0, 0
+        pool = [r for r in rows if keep(r)]
+        if ranked:   # 하이브리드 순서가 떨어뜨린 키워드 후보도 같은 프로젝트 몫을 채울 예비로 뒤에 둔다
+            shown = {r[0] for r in pool}
+            pool += [r for r in lexical if r[0] not in shown and keep(r)]
         counted = [t for t in toks if t not in TASK_WORDS]   # 판정은 주제 단어로만(검색에는 모두 씀)
-        if judge and counted:
-            body = set((judge[3] or '').lower().split())
-            hit = [t for t in counted if t in body]
-            matched = len(hit)
+
+        def judge_body(body):
+            """이 본문만으로 주입 문턱을 넘는가 — 판정(1위 문서)과 같은 규칙."""
+            if not counted:
+                return 0, 0.0, False
+            words = set((body or '').lower().split())
+            hit = [t for t in counted if t in words]
             rare = (sum(1 for t in hit if self.df.get(t, 0) / self.n_docs < RARE_DF)
-                    if self.n_docs >= 50 else matched)   # 기록이 적으면 빈도 비율이 무의미
-            cov = matched / len(counted)
-        gate = gate_pass(matched, cov, rare)
+                    if self.n_docs >= 50 else len(hit))   # 기록이 적으면 빈도 비율이 무의미
+            cov = len(hit) / len(counted)
+            return len(hit), cov, gate_pass(len(hit), cov, rare)
+        own = {}
+
+        def passes(r):
+            if r[0] not in own:
+                own[r[0]] = judge_body(r[3])[2]
+            return own[r[0]]
+        pkey = _project_key(project)
+
+        def same(r):
+            return bool(pkey) and _project_key(r[2] or meta.get(r[0], {}).get('project', '')) == pkey
+        # 2026-11-16 M3-T3: 재정렬이 같은 프로젝트 우선을 깼다(같은 프로젝트 후보 3건 이상인데 다른 프로젝트 주입 31.1%).
+        # 몫은 주입되는 앞쪽 구간(share_window)에서 세고, 끌어올리는 기록은 그 자체로 주입 문턱을 넘어야 한다(11-16 검토 P1).
+        rows = same_project_share(pool, project, limit, same, window=share_window(limit), eligible=passes)
+        judge = next((r for r in lexical if keep(r)), None)
+        matched, cov, gate = judge_body(judge[3]) if judge else (0, 0.0, False)
         items = []
         for oid, score, proj, _body in rows:
             m = meta.get(oid, {})
             items.append({'id': oid, 'score': round(-score, 3), 'project': proj or m.get('project', ''),
-                          'title': m.get('title', ''), 'date': m.get('date', '')})
+                          'title': m.get('title', ''), 'date': m.get('date', ''),
+                          'pass': passes((oid, score, proj, _body))})   # 이 기록 자체가 문턱을 넘는가(훅의 같은 프로젝트 우대 조건)
         return {'items': items, 'gate': {'matched': matched, 'coverage': round(cov, 2), 'pass': gate}, 'tokens': toks}
 
     def _hybrid(self, query, lexical):

@@ -31,6 +31,76 @@ SESSION_FILES = 5   # cwd 를 찾을 때 볼 최근 세션 기록 수
 SESSION_LINES = 50  # 기록마다 앞에서 볼 줄 수(cwd 는 첫 몇 줄에 있다)
 HEADING = '# 규칙 — '   # 생성물 둘째 줄. 뒤가 scope_id
 SOURCE = '출처: '       # 규칙마다 붙는 정본 메모리 파일 경로
+READ_LIMIT = 20000      # 소비자(sb search --mode rules·세션 시작 브리핑)가 한 scope 파일에서 읽는 최대 바이트
+TRIM_NOTE = '\n\n(읽기 한도 {}B로 규칙 {}건 생략 — 나머지는 규칙 파일 원문)\n'
+CUT_NOTE = '\n\n(읽기 한도 {}B로 이하 생략 — 나머지는 규칙 파일 원문)\n'
+
+
+def _nbytes(text: str) -> int:
+    return len(text.encode('utf-8'))
+
+
+def split_blocks(text: str) -> Tuple[str, List[Tuple[str, str]], str]:
+    """규칙 파일 → (머리, [(제목, 블록 원문)], 꼬리). 세 부분을 이으면 원문과 같다.
+
+    블록은 '## 제목' 줄에서 시작해 '출처: ' 줄에서 끝난다 — 본문 안의 '## …' 줄은 제목이 아니다(가짜 제목 방지).
+    '출처: ' 줄이 하나도 없는 파일(사람이 쓴 파일)은 '## ' 줄마다 새 블록으로 본다. 윈도우 줄끝(\\r\\n)도 그대로 둔다."""
+    lines = text.splitlines(keepends=True)
+    sourced = any(line.startswith(SOURCE) for line in lines)
+    head: List[str] = []
+    gap: List[str] = []
+    blocks: List[Tuple[str, List[str]]] = []
+    current: Optional[Tuple[str, List[str]]] = None
+    for line in lines:
+        if line.startswith('## ') and (current is None or not sourced):
+            if current is not None:
+                blocks.append(current)
+            current, gap = (line[3:].strip(), gap + [line]), []
+            continue
+        if current is None:
+            (gap if blocks else head).append(line)
+            continue
+        current[1].append(line)
+        if sourced and line.startswith(SOURCE):
+            blocks.append(current)
+            current = None
+    if current is not None:   # 출처 줄 없이 끝난 마지막 블록
+        blocks.append(current)
+    return ''.join(head), [(title, ''.join(body)) for title, body in blocks], ''.join(gap)
+
+
+def titles(text: str) -> List[str]:
+    """출처 블록 단위로 뽑은 규칙 제목(파일 순서 = 최신순)."""
+    return [title for title, _ in split_blocks(text)[1] if title]
+
+
+def fit_rules(text: str, max_bytes: int = READ_LIMIT) -> Tuple[str, int]:
+    """max_bytes 를 넘는 규칙 파일을 앞에서 바이트로 자르지 않고 머리 + 상위 블록만 남긴다 → (본문, 뺀 블록 수).
+    블록 중간에서 끊지 않고, 넘친 블록부터는 통째로 뺀 뒤 생략 안내 한 줄을 붙인다(안내 포함 max_bytes 이하)."""
+    if _nbytes(text) <= max_bytes:
+        return text, 0
+    head, blocks, _ = split_blocks(text)
+    budget = max_bytes - _nbytes(TRIM_NOTE.format(max_bytes, len(blocks)))
+    if not blocks or _nbytes(head) > budget:
+        # 블록 구조가 없거나 머리만으로 넘친다 — 마지막 온전한 줄까지만 남긴다
+        cut = text.encode('utf-8')[:max(0, max_bytes - _nbytes(CUT_NOTE.format(max_bytes)))]
+        kept = cut.decode('utf-8', errors='ignore').rsplit('\n', 1)[0] if b'\n' in cut else ''
+        return kept.rstrip('\r\n') + CUT_NOTE.format(max_bytes), len(blocks)
+    out, size, kept_blocks = [head], _nbytes(head), 0
+    for _, block in blocks:
+        cost = _nbytes(block)
+        if size + cost > budget:
+            break   # '상위만' — 넘친 블록 뒤의 짧은 블록을 끼워 넣지 않는다(최신순 유지)
+        out.append(block)
+        size += cost
+        kept_blocks += 1
+    dropped = len(blocks) - kept_blocks
+    return ''.join(out).rstrip('\r\n') + TRIM_NOTE.format(max_bytes, dropped), dropped
+
+
+def read_rules(path: Any, max_bytes: int = READ_LIMIT) -> str:
+    """규칙 파일을 읽어 fit_rules 로 맞춘 본문(UTF-8, 깨진 바이트는 대체 문자)."""
+    return fit_rules(Path(path).read_bytes().decode('utf-8', errors='replace'), max_bytes)[0]
 
 
 def rules_dir() -> Path:

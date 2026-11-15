@@ -68,10 +68,17 @@ def audit_scope(scope_id: str) -> Dict[str, Any]:
         try:
             with closing(sb_state.ro_connect(None)) as db:
                 if 'state_candidate' in sb_state.tables(db):
+                    # expire 가 닫은 후보만 뺀다. 그 밖의 rejected(절차 오류 검증 등)는 예전처럼 표시한다 —
+                    # L2 종결이 꺼져 있으면 감사 출력도 그대로다(11-16 검토 P2).
+                    closed = ''
+                    if 'state_candidate_transition' in sb_state.tables(db):
+                        closed = (" AND NOT (c.status='rejected' AND EXISTS (SELECT 1 FROM state_candidate_transition t "
+                                  "WHERE t.candidate_id=c.id AND t.to_status='rejected' AND t.reason LIKE 'expire:%' "
+                                  "AND t.id=(SELECT MAX(t2.id) FROM state_candidate_transition t2 WHERE t2.candidate_id=c.id)))")
                     candidates = db.execute(
                         "SELECT c.*, (SELECT result FROM state_verification v WHERE v.candidate_id=c.id ORDER BY v.id DESC LIMIT 1) AS last_result "
-                        "FROM state_candidate c WHERE c.scope_id=? AND c.status IN ('proposed','conflict','rejected') ORDER BY c.id",
-                        (scope_id,)).fetchall()
+                        "FROM state_candidate c WHERE c.scope_id=? AND c.status IN ('proposed','conflict','rejected')" + closed +
+                        " ORDER BY c.id", (scope_id,)).fetchall()
                     for h in head_rows.values():
                         row = db.execute('SELECT value_json FROM state_candidate c JOIN state_acceptance a ON a.candidate_id=c.id WHERE a.state_id=?',
                                          (h['item_id'],)).fetchone()

@@ -705,7 +705,11 @@ def _rules_items(scope_id: str) -> Dict[str, Any]:
         return _mode_envelope('rules', scope_id, [], 'error', ['rules_path_outside_dir'])
     if not path.is_file():
         return _mode_envelope('rules', scope_id, [], 'empty', [])
-    text = path.read_bytes()[:20000].decode('utf-8', errors='replace')
+    if os.environ.get('SB_RULES_FIT', '1') == '0':   # 예전 동작: 앞 20000B 바이트 절단
+        text = path.read_bytes()[:20000].decode('utf-8', errors='replace')
+    else:   # 20000B 를 넘으면 블록 중간에서 끊지 않고 출처 블록 단위로 상위만(M3 T6). 이 모드에서만 불러 다른 검색을 늦추지 않는다
+        import sb_rules
+        text = sb_rules.read_rules(path)
     item = {'scope_id': scope_id, 'layer': 'L3', 'item_id': name, 'fact_key': None, 'body': text,
             'evidence_ref': str(path), 'observed_at': None, 'recorded_at': None, 'verification_status': 'document',
             'reason_codes': ['rules_document']}

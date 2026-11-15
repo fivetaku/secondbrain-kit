@@ -58,6 +58,116 @@ def gate(prompt: str) -> bool:
     return True
 
 
+# ── 자동화 프롬프트 판정(M3-T3, 2026-11-16) ─────────────────────────────────────────
+# 재측정 11-16: insane-writer 143이벤트 중 142건에 회수가 주입됐다(문턱 0). 자동화면 주입하지 않고
+# recall_log 에 automation:true 만 남긴다. 판정 끄기: SB_RECALL_AUTOMATION=0(환경 표지 CLAUDE_MEM_INTERNAL·SB_RECALL=0 은 그대로 막는다).
+AUTOMATION_DIRS = ("/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
+# 모델·연결 시험 문구. 부분 문자열로 찾으면 "look only"·"book only"·문장 중간 "reply exactly" 같은 정상 대화가 걸렸다(11-16 검토).
+# 실측(11-04 이후 user_prompts): 시험 문구는 짧은 프롬프트의 맨 앞("Reply exactly: …") 아니면 맨 끝("… OK only")에만 있었다.
+PROBE_MAX_CHARS = 200
+PROBE_START = re.compile(r"^(reply exactly|respond with only)(?![a-z])", re.I)
+PROBE_END = re.compile(r"(?<![a-z])ok only[\s.!]*$", re.I)
+AUTOMATION_MARKS = ("<<autonomous-loop", "[SYSTEM NOTIFICATION")   # 루프·알림 표지 — 프롬프트 맨 앞일 때만(붙여 넣은 로그 제외)
+
+
+def _skip_projects():
+    raw = os.environ.get("SB_RECALL_SKIP_PROJECTS")
+    raw = "insane-writer,model-probe" if raw is None else raw
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _project_key(name: str) -> str:
+    try:
+        return norm_project(name)   # M3-T2 정규화와 같은 키로 비교(아래 정의, 호출 시점에 찾는다)
+    except Exception:
+        return str(name or "").strip().lower()
+
+
+def _cwd_project(cwd: str) -> str:
+    try:
+        return hook_project(cwd)
+    except Exception:
+        parts = [x for x in re.split(r"[\\/]+", cwd) if x]
+        return parts[-1] if parts else ""
+
+
+def _cwd_parts(cwd: str):
+    """cwd 의 폴더 이름들(홈 아래면 홈 아래 부분만) — 건너뛸 프로젝트의 하위 폴더에서 연 세션도 잡는다."""
+    c = os.path.expanduser(cwd) if cwd.startswith("~") else cwd
+    s = c.replace("\\", "/")
+    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    low, hlow = s.lower(), home.lower()
+    if len(hlow) > 1 and (low == hlow or low.startswith(hlow + "/")):
+        s = s[len(home):]
+    return [x for x in s.split("/") if x]
+
+
+def _under_automation_dir(cwd: str) -> bool:
+    """임시 폴더에서 돈 세션인가 — 맥·리눅스 임시 경로와 이 PC 의 임시 폴더(윈도우 %TEMP% 포함).
+    cwd 를 덮는 가장 긴(가장 구체적인) 폴더로 정한다: 홈이면 아니고, 임시 폴더면 맞다.
+    홈이 임시 폴더 아래인 격리 시험(리눅스 CI)은 홈이 이기고, 홈 아래 임시 폴더(윈도우 %TEMP%)는 임시 폴더가 이긴다."""
+    def norm(x):
+        s = x.replace("\\", "/").rstrip("/")
+        return s.lower() if os.name == "nt" else s
+    dirs = set(AUTOMATION_DIRS)
+    try:
+        dirs |= {norm(tempfile.gettempdir()), norm(os.path.realpath(tempfile.gettempdir()))}
+    except Exception:
+        pass
+    home_raw = os.path.expanduser("~")
+    homes = {norm(home_raw)}
+    try:
+        homes.add(norm(os.path.realpath(home_raw)))
+    except (OSError, ValueError):
+        pass
+    homes -= {"", "/"}
+    dirs -= {"", "/"} | homes   # TMPDIR 이 홈·루트를 가리키면 전부 자동화로 보지 않게
+    forms = [cwd]
+    if os.path.isabs(cwd):   # 상대 경로(다른 OS 경로 포함)를 realpath 하면 현재 폴더가 붙어 오판한다
+        try:
+            forms.append(os.path.realpath(cwd))
+        except (OSError, ValueError):
+            pass
+    verdicts = []
+    for c in forms:
+        s = norm(c)
+        best = max(((len(d), kind) for kind, group in (("home", homes), ("tmp", dirs)) for d in group
+                    if s == d or s.startswith(d + "/")), default=None)
+        if best:
+            verdicts.append(best[1])
+    if "home" in verdicts:   # 어느 표기로든 홈이 가장 구체적이면 사람 작업 폴더로 본다
+        return False
+    return "tmp" in verdicts
+
+
+def automation_reason(raw: dict, prompt: str) -> str:
+    """자동화로 보이는 이유(없으면 ''). 이유 문자열에는 프롬프트·경로를 담지 않는다."""
+    if os.environ.get("CLAUDE_MEM_INTERNAL") == "1":
+        return "internal"
+    if os.environ.get("SB_RECALL", "1") == "0":
+        return "sb_recall_off"
+    if os.environ.get("SB_RECALL_AUTOMATION", "1") == "0":
+        return ""
+    raw = raw if isinstance(raw, dict) else {}
+    cwd = str(raw.get("cwd") or "").strip()
+    if cwd and _under_automation_dir(cwd):
+        return "tmp_cwd"
+    p = str(prompt or "").strip()
+    if len(p) <= PROBE_MAX_CHARS and (PROBE_START.search(p) or PROBE_END.search(p)):
+        return "probe_phrase"
+    if p.startswith(AUTOMATION_MARKS):
+        return "loop_marker"
+    skip = {_project_key(x) for x in _skip_projects()}
+    if cwd and skip and any(_project_key(x) in skip for x in _cwd_parts(cwd)):
+        return "skip_project"
+    return ""
+
+
+def is_automation_prompt(raw: dict, prompt: str) -> bool:
+    """자동화(관찰기·시험·루프·알림·지정 프로젝트) 프롬프트인가 — 그렇다면 회수를 주입하지 않는다."""
+    return bool(automation_reason(raw, prompt))
+
+
 def _rows(text: str):
     items, date = [], ""
     for line in text.splitlines():
@@ -85,27 +195,35 @@ def search(q: str, project: str):
     jobs = []
     with ThreadPoolExecutor(max_workers=2) as ex:
         if project:
-            jobs.append(ex.submit(_get, "/api/search/observations", {"query": q, "limit": "3", "project": project}))
+            jobs.append(ex.submit(_get, "/api/search/observations", {"query": q, "limit": str(max(3, MAX_ITEMS)), "project": project}))
         jobs.append(ex.submit(_get, "/api/search/observations", {"query": q, "limit": str(MAX_ITEMS)}))
-    items, errors = [], 0
-    for j in jobs:
+    items, errors, n_proj = [], 0, 0
+    for n, j in enumerate(jobs):
         try:
-            items += _rows(j.result())
+            rows = _rows(j.result())
         except Exception:
             errors += 1
+            continue
+        items += rows
+        if project and n == 0:
+            n_proj = len(rows)   # 프로젝트 한정 결과 수(실패하면 0)
     if errors == len(jobs):
         raise RuntimeError("search failed")
     # Cross-project (global) hits must share at least one content token with the prompt;
     # the worker orders semantic candidates by date, so this cheap lexical check removes drifters.
     toks = {t.lower() for t in re.findall(r"[A-Za-z0-9]{2,}|[가-힣]{2,}", q)}
-    n_proj = 3 if project else 0
     out, seen = [], set()
     for i, it in enumerate(items):
         if it["id"] in seen:
             continue
-        if i >= n_proj:
+        if i < n_proj:
+            it["project"] = project   # 같은 프로젝트 몫: 프로젝트 한정 결과가 앞에 온다(M3-T3)
+        else:
             title = it["title"].lower()
             if not any(t in title for t in toks):
+                continue
+            # refine 과 같은 교차 프로젝트 거르기(M3-T3): 프로젝트 한정 결과 밖의 전역 결과는 제목 단어 2개 이상 공유
+            if project and len(_tokens(q) & _tokens(it["title"])) < CROSS_MIN_SHARED:
                 continue
         seen.add(it["id"]); out.append(it)
     return out
@@ -202,7 +320,8 @@ def recalld_search(prompt: str, project: str):
     if not (d.get("gate") or {}).get("pass"):
         return []
     return [{"id": it["id"], "date": it.get("date", ""), "kind": "", "title": it.get("title", ""),
-             "project": it.get("project", "")} for it in d.get("items", [])]
+             "project": it.get("project", ""), **({"pass": bool(it["pass"])} if "pass" in it else {})}
+            for it in d.get("items", [])]
 
 
 FRESH_MINUTES = 20   # observations younger than this are "what is happening right now", not recall
@@ -269,22 +388,67 @@ def _tokens(s: str):
     return {t.lower() for t in re.findall(r"[A-Za-z0-9]{2,}|[가-힣]{2,}", s or "")}
 
 
+# ── scope 표기 통일(M3-T2, 2026-11-16) ─────────────────────────────────────────────
+# claude-mem 꼬리표는 세션 cwd 의 폴더 이름이다. 그런데 홈 폴더가 '<u>'·'/Users/<u>'·'~' 로 갈라지고
+# 같은 폴더가 경로형·대소문자·'_'/'-' 차이로 갈라져(재측정 11-16: resolve 불일치의 80.6%가 홈 표기),
+# 같은 프로젝트 기록이 '다른 프로젝트'로 취급됐다. 비교 키는 sb_scope.project_key(recalld 와 같은 함수),
+# 훅 project 는 hook_project 로 정한다. 끄기: SB_SCOPE_NORM=0 (예전처럼 cwd basename·문자열 그대로 비교).
+HOME_KEY = "~"
+
+
+def norm_project(name) -> str:
+    """project 표기 비교 키 — sb_scope.project_key 와 같다(현재 사용자 홈 표기는 '~')."""
+    try:
+        import sb_scope
+        return sb_scope.project_key(name)
+    except Exception:
+        return str(name or "").strip()
+
+
+def hook_project(cwd) -> str:
+    """훅이 회수에 넘길 project = claude-mem 꼬리표 규칙(cwd 폴더 이름). recalld·worker 가 이 값으로 정확 일치 질의를
+    하므로 sb_scope 별칭 키(다른 이름공간)로 바꾸지 않는다. 홈 폴더 자체면 홈 폴더 이름(색인에 쌓인 홈 꼬리표 표기)."""
+    c = str(cwd or "").strip()
+    if not c:
+        return ""
+    if os.environ.get("SB_SCOPE_NORM", "1") == "0":
+        return os.path.basename(os.path.normpath(c))
+    try:
+        import sb_scope
+        home = os.path.expanduser("~")
+        home_paths, _ = sb_scope.home_forms()
+        try:
+            real = os.path.realpath(os.path.expanduser(c))
+        except (OSError, ValueError):
+            real = c
+        if sb_scope.slash_key(real) in home_paths or sb_scope.slash_key(os.path.expanduser(c)) in home_paths:
+            return sb_scope.tag_base(home)
+        return sb_scope.tag_base(os.path.expanduser(c) if c.startswith("~") else c)
+    except Exception:
+        return os.path.basename(os.path.normpath(c))
+
+
 def refine(items, prompt: str, project: str):
     drop = superseded_ids()
     want_brief = bool(BRIEF_PROMPT.search(prompt))
     ptoks = _tokens(prompt)
+    pkey = norm_project(project)
     out = []
     for it in items:
         if it["id"] in drop:
             continue
         if not want_brief and BRIEF_TITLE.search(it.get("title", "")):
             continue
-        proj = it.get("project") or ""
-        if project and proj and proj != project and len(ptoks & _tokens(it.get("title", ""))) < CROSS_MIN_SHARED:
+        proj = norm_project(it.get("project") or "")
+        if pkey and proj and proj != pkey and len(ptoks & _tokens(it.get("title", ""))) < CROSS_MIN_SHARED:
             continue
         out.append(it)
     # 같은 주제면 최신판이 먼저 — 상위 N건만 요지가 붙으므로 낡은 판이 요지를 차지하지 않게(2026-10-05)
-    out.sort(key=lambda it: (bool(project) and it.get("project") == project, it.get("_d", "")), reverse=True)
+    # 같은 프로젝트 우대는 그 기록 자체가 관련도 문턱을 넘을 때만(recalld 'pass'). 문턱 밖 같은 프로젝트 기록이
+    # 관련 높은 다른 프로젝트 기록을 밀어내던 문제(11-16 검토 P1). worker 결과에는 'pass' 가 없어 예전처럼 우대한다.
+    out.sort(key=lambda it: (bool(pkey) and it.get("pass", True) is not False
+                             and norm_project(it.get("project") or "") == pkey, it.get("_d", "")),
+             reverse=True)
     return out
 
 
@@ -426,11 +590,19 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     internal = os.environ.get("CLAUDE_MEM_INTERNAL") == "1" or os.environ.get("SB_RECALL", "1") == "0"
     corr = "" if internal else correction_note(sid, prompt, str(raw.get("cwd") or ""))
+    if internal:   # 관찰기·야간 호출은 예전처럼 아무것도 쓰지 않는다(recall.jsonl 도 남기지 않음)
+        return
+    why = automation_reason(raw, prompt)
+    if why:   # M3-T3: 자동화면 회수 주입 없이 기록만(교정 알림은 이전과 같다). sb_health 는 automation 줄을 주입으로 세지 않는다
+        recall_log({"sid": hashlib_sid(sid), "project": _cwd_project(str(raw.get("cwd") or "")),
+                    "automation": True, "why": why})
+        emit(corr)
+        return
     if not gate(prompt):
         emit(corr)
         return
-    # claude-mem 의 project 는 cwd 폴더 이름이다(sb_scope id 와 다른 이름공간 — 의도된 분리).
-    project = os.path.basename(os.path.normpath(str(raw.get("cwd") or ""))) if raw.get("cwd") else ""
+    # claude-mem 의 project 는 cwd 폴더 이름이다(sb_scope id 와 다른 이름공간). 홈 표기·별칭은 hook_project 가 맞춘다.
+    project = hook_project(raw.get("cwd"))
     state_path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".json")
     if not os.path.exists(state_path):   # 새 세션일 때만: 오래된 세션 상태 파일 정리
         cutoff = time.time() - STATE_TTL_DAYS * 86400
