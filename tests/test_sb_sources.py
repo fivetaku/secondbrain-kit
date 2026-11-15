@@ -106,7 +106,7 @@ class DetectTest(Env):
         self.assertEqual((o['files'], o['cwd_count'], o['git_count']), (1, 1, 1))
         for s in got.values():
             self.assertTrue(s['location'].startswith('~'), s['location'])
-            self.assertEqual((s['mode'], s['discovered_by']), ('index', 'auto'))
+            self.assertEqual((s['mode'], s['discovered_by']), ('skip', 'auto'))   # 고르기 전에는 적재 안 함(A4)
             self.assertEqual(len(s['summary']['period']), 2)
         dumped = json.dumps(list(got.values()), ensure_ascii=False)
         self.assertNotIn(MARK, dumped)
@@ -197,10 +197,13 @@ class Stage2Test(Env):
         doc = sb_sources.load()
         self.assertEqual(doc['version'], 1)
         self.assertEqual(len(doc['sources']), 6)
-        # 다시 돌려도 같은 목록(같은 id, 중복 없음)
-        sb_sources.stage2({'sources': [str(d)]})
+        # 같은 답으로 다시 돌리면 같은 목록(같은 id, 중복 없음)
+        sb_sources.stage2({'sources': [str(d), 'https://example.com/x']})
         again = sb_sources.load()['sources']
         self.assertEqual(sorted(s['id'] for s in again), sorted(s['id'] for s in doc['sources']))
+        # 답에서 링크를 빼면 목록에서도 빠진다(답이 정본)
+        sb_sources.stage2({'sources': [str(d)]})
+        self.assertEqual(len(sb_sources.load()['sources']), 5)
 
     def test_stage2_empty_and_missing(self):
         res = sb_sources.stage2({})
@@ -303,6 +306,29 @@ class Stage3Test(Env):
         out = sb_sources.judge(str(p), {i: 'noise' for i in list(todo)[:15]})
         self.assertEqual(out['verdict'], 'stop')
 
+    def test_sample_kept_when_observations_grow(self):
+        db = self.make_db(n=200)
+        sb_sources.stage3(seed=3)
+        p = sb_sources.sample_path(3)
+        ids = json.loads(p.read_text(encoding='utf-8'))['ids']
+        sb_sources.judge(str(p), {i: 'ok' for i in ids})
+        con = sqlite3.connect(str(db))
+        con.execute('INSERT INTO observations VALUES (?,?,?,?,?,?,?)', (201, 's1', 'projb', 'decision', '새 결정 하나', '', ''))
+        con.commit()
+        con.close()
+        res = sb_sources.stage3(seed=3)
+        after = json.loads(p.read_text(encoding='utf-8'))
+        self.assertEqual(after['ids'], ids)              # 관측이 늘어도 표본·사람 판정 50건이 그대로
+        self.assertEqual(len(after['judged']), 50)
+        self.assertEqual(res['verdict'], 'pass')
+        # 표본 id 가 DB 에서 사라지면 새로 뽑는다
+        con = sqlite3.connect(str(db))
+        con.execute('DELETE FROM observations WHERE id=?', (int(ids[0]),))
+        con.commit()
+        con.close()
+        sb_sources.stage3(seed=3)
+        self.assertNotIn(ids[0], json.loads(p.read_text(encoding='utf-8'))['ids'])
+
     def test_judge_rejects_bad_input(self):
         self.make_db()
         sb_sources.stage3(seed=1)
@@ -367,6 +393,142 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(sb_sources.scope_match('My Proj', 'my proj'))
         self.assertFalse(sb_sources.scope_match(os.path.join(home, 'alpha'), 'beta'))
         self.assertFalse(sb_sources.scope_match('', 'beta'))
+
+
+
+class ReviewRegressionTest(Env):
+    """0182f9e 검토 반영 — 분류 누락·링크 비밀값·세션/회의 기본값·통계 키·권한·표본 유지."""
+
+    def test_nfd_korean_names_are_sensitive(self):
+        import unicodedata
+        nfd = lambda t: unicodedata.normalize('NFD', t)
+        for name in ('세금계산서.pdf', '연봉계약.docx'):
+            self.assertEqual(sb_sources.classify_file(nfd(name), 5000)[0], 'sensitive', name)
+        m = self.home / nfd('회의록')
+        m.mkdir()
+        (m / 'a.txt').write_bytes(b'x' * 2000)
+        self.assertEqual(sb_sources.register(str(m))['kind'], 'meeting')
+
+    def test_joined_and_plural_english_names_are_sensitive(self):
+        for name in ('passwords.txt', 'taxreturn2024.pdf', 'bankstatement.pdf', 'mycontract.pdf', 'salaryslip.pdf',
+                     'api_keys.md', 'tokens.md', 'Resume.pdf'):
+            self.assertEqual(sb_sources.classify_file(name, 5000)[0], 'sensitive', name)
+        for name in ('syntax.md', 'taxonomy.md', 'taxi.md', 'notebook.md', 'tokenizer.md', 'design.md'):
+            self.assertEqual(sb_sources.classify_file(name, 5000)[0], 'own_output', name)
+
+    def test_more_korean_signals(self):
+        for name in ('영수증.pdf', '이력서.docx', '비번.txt', '진단서.pdf'):
+            self.assertEqual(sb_sources.classify_file(name, 5000)[0], 'sensitive', name)
+
+    def test_registered_folder_name_itself_is_checked(self):
+        d = self.home / 'docs' / '세금'
+        d.mkdir(parents=True)
+        (d / '2024.pdf').write_bytes(b'x' * 5000)
+        src = sb_sources.register(str(d))
+        self.assertEqual(src['mode'], 'skip')
+        c = sb_sources.classify(src)
+        self.assertEqual((c['own_output'], c['sensitive']), (0, 1))
+        self.assertEqual(c['intake']['reasons'], {'sensitive_location': 1})
+        # 홈 위 경로(계정 이름 등)는 신호로 보지 않는다
+        ok = self.home / 'plain'
+        ok.mkdir()
+        (ok / 'a.md').write_bytes(b'x' * 2000)
+        self.assertEqual(sb_sources.register(str(ok))['mode'], 'index')
+
+    def test_link_secrets_are_not_stored_or_printed(self):
+        url = 'https://alice:s3cr3tTOKEN@example.com/doc?id=7&sig=ABCSIG&X-Amz-Signature=AMZ&access_token=TK#t=FR'
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(sb_sources.main(['add', url, '--json']), 0)
+        out = buf.getvalue()
+        raw = sb_sources.sources_path().read_text(encoding='utf-8')
+        for secret in ('alice', 's3cr3tTOKEN', 'ABCSIG', 'AMZ', '=TK', 'FR'):
+            self.assertNotIn(secret, raw)
+            self.assertNotIn(secret, out)
+        src = sb_sources.load()['sources'][0]
+        self.assertEqual(src['location'], 'https://example.com/doc?id=7')
+        self.assertEqual(src['redacted'], 5)
+        self.assertEqual(src['id'], sb_sources._sid('link', 'https://example.com/doc?id=7'))
+        res = sb_sources.stage2({'sources': [url]})
+        self.assertEqual(res['verdict'], 'pass')
+        self.assertNotIn('s3cr3t', sb_sources.sources_path().read_text(encoding='utf-8'))
+        self.assertEqual(sb_sources.redact_link('https://example.com/a?q=1'), ('https://example.com/a?q=1', 0))
+
+    def test_sessions_default_skip_until_user_selects(self):
+        self.make_sessions()
+        sb_sources.stage2({})
+        sess = [s for s in sb_sources.load()['sources'] if s['kind'] == 'claude_sessions'][0]
+        self.assertEqual((sess['mode'], sess['intake']['decision'], sess['classification']['own_output']), ('skip', 'skip', 0))
+        self.assertEqual(sess['intake']['reasons'], {'awaiting_user_choice': 4})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(sb_sources.main(['select', sess['id'], '--json']), 0)
+        sb_sources.stage2({})                       # 다시 감지해도 고른 그대로
+        sess = [s for s in sb_sources.load()['sources'] if s['kind'] == 'claude_sessions'][0]
+        self.assertEqual((sess['mode'], sess['intake']['index']), ('index', 4))
+        codex = [s for s in sb_sources.load()['sources'] if s['kind'] == 'codex_sessions'][0]
+        self.assertEqual(codex['mode'], 'skip')
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sb_sources.main(['select', sess['id'], '--off']), 0)
+        sb_sources.stage2({})
+        sess = [s for s in sb_sources.load()['sources'] if s['kind'] == 'claude_sessions'][0]
+        self.assertEqual(sess['mode'], 'skip')
+
+    def test_meeting_folder_is_not_indexed(self):
+        m = self.home / '회의록'
+        m.mkdir()
+        (m / 'a.txt').write_bytes(b'x' * 2000)
+        src = sb_sources.register(str(m))
+        self.assertEqual((src['kind'], src['mode']), ('meeting', 'skip'))
+        c = sb_sources.classify(src)
+        self.assertEqual((c['own_output'], c['intake']['decision']), (0, 'skip'))
+        self.assertEqual(c['intake']['reasons'], {'meeting_no_sensitivity': 1})
+
+    def test_ext_stats_do_not_carry_name_fragments(self):
+        d = self.home / 'notes'
+        d.mkdir()
+        (d / '2024.11.15 홍길동 면담 기록').write_bytes(b'x' * 2000)
+        (d / 'a.md').write_bytes(b'x' * 2000)
+        (d / 'archive.verylongextension').write_bytes(b'x' * 10)
+        src = sb_sources.register(str(d))
+        self.assertEqual(src['summary']['by_ext'], {'(other)': 2, '.md': 1})
+        self.assertNotIn('홍길동', json.dumps(src, ensure_ascii=False))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX 권한')
+    def test_private_files_return_to_0600_and_new_dirs_0700(self):
+        fresh = self.root / 'fresh-sb'
+        with mock.patch.dict(os.environ, {'SB_HOME': str(fresh)}):
+            d = self.make_folder()
+            sb_sources._add(str(d), None)
+            self.assertEqual(fresh.stat().st_mode & 0o777, 0o700)
+            p = sb_sources.sources_path()
+            p.chmod(0o644)
+            sb_sources._add(str(d), None)
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
+    def test_head_cwd_skips_cwd_inside_body_fields(self):
+        p = self.root / 'b.jsonl'
+        p.write_text('{"type":"tool","toolUseResult":{"stdout":"x","cwd":"/from/body"}}\n'
+                     '{"type":"user","cwd":"/real/cwd","message":{"content":"hi"}}\n', encoding='utf-8')
+        self.assertEqual(sb_sources._head_cwd(p), '/real/cwd')
+
+    def test_fixed_answer_replaces_missing_location(self):
+        docs = self.make_folder()
+        self.assertEqual(sb_sources.stage2({'sources': ['~/nope']})['verdict'], 'stop')
+        res = sb_sources.stage2({'sources': [str(docs)]})
+        self.assertEqual(res['verdict'], 'pass', res['hint'])
+        self.assertEqual([s['location'] for s in sb_sources.load()['sources']], ['~' + os.sep + 'docs'])
+
+    def test_cli_added_missing_location_can_be_removed(self):
+        gone = self.home / 'gone'
+        with redirect_stdout(io.StringIO()):
+            sb_sources.main(['add', str(gone)])
+        res = sb_sources.stage2({})
+        self.assertEqual(res['verdict'], 'stop')
+        self.assertIn('sb sources remove', res['hint'])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sb_sources.main(['remove', str(gone)]), 0)
+        self.assertEqual(sb_sources.stage2({})['verdict'], 'pass')
 
 
 if __name__ == '__main__':

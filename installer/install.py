@@ -61,7 +61,11 @@ LOG = []
 
 # ── 공통 ─────────────────────────────────────────────────────────────
 def say(msg: str) -> None:
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:   # cp949 등으로 리디렉션된 출력 — ✅·— 같은 글자 때문에 설치가 죽지 않게
+        enc = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        print(msg.encode(enc, 'replace').decode(enc, 'replace'), flush=True)
     LOG.append(msg)
 
 
@@ -946,7 +950,10 @@ def setup_stage(args) -> None:
     try:
         import sb_setup
         sb_setup.ask_first_run()
-        res = sb_setup.run(non_interactive=not _is_tty())
+        if getattr(args, 'no_vault', False):   # 11단계를 끈 사용자 — 4단계(볼트 구성) 앞에서 멈춘다
+            res = sb_setup.run(non_interactive=not _is_tty(), stop_before=4)
+        else:
+            res = sb_setup.run(non_interactive=not _is_tty())
     except BaseException as exc:  # noqa: BLE001 — 셋업이 무엇으로 끝나든 설치는 끝까지 간다
         if isinstance(exc, KeyboardInterrupt):
             say('  셋업 중단 — 나중에 `sb setup`으로 이어서')
@@ -954,6 +961,9 @@ def setup_stage(args) -> None:
         WARNINGS.append('셋업 실행 실패(%s: %s) — 나중에 `sb setup`으로 다시' % (type(exc).__name__, str(exc)[:160]))
         return
     say(textwrap.indent(sb_setup.render(res), '  '))
+    if getattr(args, 'no_vault', False) and not res.get('stopped_at'):
+        say('  ▶ --no-vault 라 4단계(볼트 구성) 앞에서 멈췄습니다 — 볼트를 쓰려면 `sb setup`')
+        return
     if not res.get('complete'):
         say('  ▶ 셋업이 %s단계에서 멈췄습니다(%s). 위 안내대로 한 뒤 `sb setup` 또는 에이전트에게 "세컨브레인 셋업 이어서 해 줘"'
             % (res.get('stopped_at') or res.get('current_stage'), res.get('verdict') or '-'))

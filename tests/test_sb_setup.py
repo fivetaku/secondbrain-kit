@@ -63,7 +63,7 @@ class SetupEnv(unittest.TestCase):
         p = mock.patch.dict(os.environ, self.env)
         p.start()
         self.addCleanup(p.stop)
-        for k in ('CI', 'SB_NO_SETUP', 'SB_STATE_PILOT_SCOPES', 'SB_LOOPS_PATH', 'SB_VAULT_LLM_URL'):
+        for k in ('CI', 'SB_NO_SETUP', 'SB_STATE_PILOT_SCOPES', 'SB_LOOPS_PATH', 'SB_VAULT_LLM_URL') + sb_setup.AGENT_ENV:
             os.environ.pop(k, None)
         self.rows = list(OK_ROWS)
         self.src = FakeSources()
@@ -515,6 +515,141 @@ class RealSourcesTests(SetupEnv):
         self.assertEqual(self.doc()['current_stage'], 4)
         s = sb_setup.run(non_interactive=True)
         self.assertEqual([(r['stage'], r['verdict']) for r in s['results']], [(4, 'pending')])
+
+
+
+class ReviewRegressionTests(SetupEnv):
+    """0182f9e 검토 반영 — 차례 검사·승인 1회·답 바뀜 반영·기록 상한·지문·묻기 조건·권한."""
+
+    def test_judge_refuses_when_earlier_stage_is_stopped(self):
+        self.src.v3 = 'pending'
+        sb_setup.run(non_interactive=True)
+        (sb_setup.logs_dir() / 'setup-3-sample-1.json').write_text('{}', encoding='utf-8')
+        self.rows = list(BAD_ROWS)
+        s = sb_setup.run(from_stage=1, non_interactive=True)
+        self.assertEqual(s['current_stage'], 1)
+        with self.assertRaises(ValueError):
+            sb_setup.judge({'11': 'ok'})
+        self.assertEqual(self.doc()['current_stage'], 1)
+        self.assertIsNone(self.src.judged)          # 표본 파일도 건드리지 않는다
+
+    def test_approval_is_used_once_rollback_is_respected(self):
+        self.make_db()
+        s = sb_setup.run(non_interactive=True)
+        sb_setup.approve(s['plan_hash'][:12])
+        s = sb_setup.run(non_interactive=True)
+        self.assertEqual(s['stages'][4], 'pass')
+        self.assertNotIn('approved_plan_hash', self.doc()['answers'])
+        applies = lambda: len(list(sb_vault.vault_dir().glob('apply-*.json')))
+        n = applies()
+        sb_vault.rollback()
+        self.assertFalse(sb_vault.status()['configured'])
+        s = sb_setup.run(from_stage=4, non_interactive=True)
+        self.assertEqual(s['stages'][4], 'pending')            # 다시 승인을 받는다
+        self.assertEqual(applies(), n)
+        self.assertFalse(sb_vault.status()['configured'])
+
+    def test_changed_sources_answer_reruns_stage2(self):
+        sb_setup.run(non_interactive=True)
+        self.assertEqual(self.doc()['current_stage'], 5)
+        sb_setup.set_answers({'sources': ['~/docs']})
+        self.assertEqual(self.doc()['current_stage'], 2)
+        s = sb_setup.run(non_interactive=True)
+        r2 = s['results'][0]
+        self.assertEqual(r2['stage'], 2)
+        self.assertEqual({m['name']: m['value'] for m in r2['metrics']}['sources'], 1)
+        sb_setup.set_answers({'sources': ['~/docs'], 'llm_route': 'x'})    # 같은 답이면 되감지 않는다
+        self.assertEqual(self.doc()['current_stage'], 5)
+
+    def test_trim_keeps_last_verdict_of_every_stage(self):
+        sb_setup.run(non_interactive=True)
+        before = sb_setup.status()
+        for _ in range(sb_setup.MAX_RUNS + 5):
+            sb_setup.run(non_interactive=True)
+        after = sb_setup.status()
+        self.assertLessEqual(len(self.doc()['stage_runs']), sb_setup.MAX_RUNS)
+        self.assertEqual(after['stages'], before['stages'])
+        self.assertEqual(after['fingerprint'], before['fingerprint'])
+
+    def test_fingerprint_ignores_hook_latency_row(self):
+        a = sb_setup.run(only=1, non_interactive=True)['fingerprint']
+        self.rows = list(OK_ROWS) + [('⚠', '회수 훅 소요 시간', '11.0초')]
+        b = sb_setup.run(only=1, non_interactive=True)['fingerprint']
+        self.assertEqual(a, b)
+
+    def test_agent_shell_does_not_ask_even_on_tty(self):
+        stdin, out = mock.Mock(), mock.Mock()
+        stdin.isatty.return_value = out.isatty.return_value = True
+        stdin.fileno.side_effect = OSError
+        for var in ('CLAUDECODE', 'CODEX_SANDBOX'):
+            with mock.patch.dict(os.environ, {var: '1'}):
+                self.assertFalse(sb_setup.can_ask(stdin, out))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX 만')
+    def test_background_process_group_does_not_ask(self):
+        stdin, out = mock.Mock(), mock.Mock()
+        stdin.isatty.return_value = out.isatty.return_value = True
+        stdin.fileno.return_value = 0
+        with mock.patch.object(os, 'tcgetpgrp', return_value=os.getpgrp() + 1):
+            self.assertFalse(sb_setup.can_ask(stdin, out))
+        with mock.patch.object(os, 'tcgetpgrp', return_value=os.getpgrp()):
+            self.assertEqual(sb_setup.can_ask(stdin, out), os.name != 'nt')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX 권한')
+    def test_new_sb_home_and_logs_are_0700_and_setup_json_back_to_0600(self):
+        fresh = self.root / 'fresh-home'
+        with mock.patch.dict(os.environ, {'SB_HOME': str(fresh)}):
+            sb_setup.run(only=1, non_interactive=True)
+            self.assertEqual(fresh.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(sb_setup.logs_dir().stat().st_mode & 0o777, 0o700)
+            sb_setup.setup_path().chmod(0o644)
+            sb_setup.run(only=1, non_interactive=True)
+            self.assertEqual(sb_setup.setup_path().stat().st_mode & 0o777, 0o600)
+
+    def test_doctor_children_get_no_stdin_and_timeouts(self):
+        spec = importlib.util.spec_from_file_location('sbkit_doctor_rt', str(ROOT / 'installer' / 'doctor.py'))
+        d = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(d)
+        self.assertIs(d.UTF8['stdin'], subprocess.DEVNULL)
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(kw)
+            return subprocess.CompletedProcess(cmd, 0, 'x', '')
+        with mock.patch.object(d.subprocess, 'run', side_effect=fake_run), \
+                mock.patch.object(d, 'VPY', Path(sys.executable)):
+            d.check_venv()
+            d.check_state_and_capture()
+        self.assertTrue(calls)
+        for kw in calls:
+            self.assertIn('timeout', kw)
+            self.assertIs(kw.get('stdin'), subprocess.DEVNULL)
+
+
+class InstallerReviewTests(InstallerSetupTests):
+    def test_no_vault_stops_before_stage4(self):
+        inst = self._inst()
+        with mock.patch.object(inst, 'say'), mock.patch.object(inst, '_is_tty', return_value=False), \
+                mock.patch.object(inst, 'link_skills'):
+            inst.setup_stage(self._args(no_vault=True))
+        self.assertEqual(sorted({r['stage'] for r in self.doc()['stage_runs']}), [1, 2, 3])
+        self.assertFalse(sb_vault.vault_json_path().exists())
+        self.assertFalse((self.sbhome / 'vault').exists())
+
+    def test_say_survives_cp949_stdout(self):
+        import io
+        inst = self._inst()
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding='cp949', errors='strict')
+        with mock.patch.object(sys, 'stdout', out):
+            inst.say('완료 — ✅ ⏸ ↷')
+        out.flush()
+        self.assertIn('완료'.encode('cp949'), raw.getvalue())
+
+    # 부모 클래스 시험을 두 번 돌리지 않는다
+    test_dry_run_does_nothing = test_no_setup_links_skill_but_skips_run = None
+    test_existing_skill_is_left_alone = test_stopped_setup_is_guidance_not_failure = None
+    test_setup_crash_is_warning = test_real_engine_on_isolated_home = None
 
 
 if __name__ == '__main__':

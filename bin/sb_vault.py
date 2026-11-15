@@ -561,8 +561,10 @@ def _bytes(data: Any) -> bytes:
     return data if isinstance(data, bytes) else data.encode('utf-8')
 
 
-def _atomic_write(p: Path, data: Any, private: bool = False, expect_sha: Any = _KEEP) -> None:
-    """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다.
+def _atomic_write(p: Path, data: Any, private: bool = False, expect_sha: Any = _KEEP,
+                  mode: Optional[int] = None) -> None:
+    """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다
+    (mode 를 주면 기존 권한과 상관없이 그 권한으로 — 본인 전용 기록이 0644 로 바뀌어 있어도 0600 으로 되돌린다).
     바이트 그대로 쓴다(윈도우 텍스트 모드의 개행 변환이 없어 기록한 해시와 실제 파일 해시가 같다).
     expect_sha 를 주면 바꿔 끼우기 바로 전에 대상의 해시를 다시 보고 다르면 Changed 로 멈춘다(None = 없어야 함).
     한계: 해시 확인과 rename 사이의 짧은 틈은 남는다. 키트 프로세스끼리는 _Lock 이 직렬화하지만, 잠금 규약을
@@ -570,10 +572,11 @@ def _atomic_write(p: Path, data: Any, private: bool = False, expect_sha: Any = _
     설정 파일이 전제다. 적용 뒤에는 쓴 파일의 해시를 다시 확인해 어긋나면 실패로 보고 되돌린다(apply_plan)."""
     p = _real(p)
     p.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        mode = p.stat().st_mode & 0o777
-    except FileNotFoundError:
-        mode = 0o600 if private else 0o644
+    if mode is None:
+        try:
+            mode = p.stat().st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o600 if private else 0o644
     fd, tmp = tempfile.mkstemp(prefix='.' + p.name + '.', suffix='.sbvault-tmp', dir=str(p.parent))
     try:
         with os.fdopen(fd, 'wb') as f:

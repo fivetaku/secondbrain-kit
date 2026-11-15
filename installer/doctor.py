@@ -39,14 +39,18 @@ def _get(url: str, timeout: float = 3):
 
 
 # 자식 파이썬 출력은 UTF-8 로 받는다 — 윈도우 cp949 파이프에서 한국어·이모지가 깨지거나 죽지 않게
-UTF8 = dict(capture_output=True, text=True, encoding='utf-8', errors='replace',
+# stdin 은 물려주지 않는다 — 설치기(12단계 셋업)가 터미널을 쥔 채 doctor 를 돌려도 자식이 입력을 기다리지 않게
+UTF8 = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL,
             env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'})
+CHILD_TIMEOUT = 120      # 자식 파이썬 점검 하나의 상한(멈춘 자식이 설치·셋업 전체를 붙잡지 않게)
+UVX_TIMEOUT = 300        # chroma-mcp 첫 기동은 패키지 내려받기로 오래 걸린다. sb setup 1단계는 더 짧게 바꿔 쓴다
 
 
 def check_venv():
     if not VPY.exists():
         return rec('❌', 'venv', '%s 없음 — install.py 재실행' % VPY)
-    r = subprocess.run([str(VPY), '-c', 'import chromadb, kiwipiepy, openai; print(chromadb.__version__)'], **UTF8)
+    r = subprocess.run([str(VPY), '-c', 'import chromadb, kiwipiepy, openai; print(chromadb.__version__)'],
+                       timeout=CHILD_TIMEOUT, **UTF8)
     rec('✅' if r.returncode == 0 else '❌', 'venv 패키지', (r.stdout or r.stderr).strip()[-120:])
 
 
@@ -179,10 +183,10 @@ def check_chroma_mcp():
     env = {k: v for k, v in UTF8['env'].items()
            if k not in ('VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV')}
     try:
-        r = subprocess.run([uvx, '--python', py] + sb_claude_mem.worker_args(withs, ver) + ['--help'], cwd=str(HOME), timeout=300,
+        r = subprocess.run([uvx, '--python', py] + sb_claude_mem.worker_args(withs, ver) + ['--help'], cwd=str(HOME), timeout=UVX_TIMEOUT,
                            **dict(UTF8, env=env))
     except subprocess.TimeoutExpired:
-        return rec('⚠', 'chroma-mcp 기동', '5분 안에 안 뜸(첫 실행은 패키지 내려받기로 오래 걸림) — 다시 확인')
+        return rec('⚠', 'chroma-mcp 기동', '%d초 안에 안 뜸(첫 실행은 패키지 내려받기로 오래 걸림) — 다시 확인' % UVX_TIMEOUT)
     out = (r.stderr or '') + (r.stdout or '')
     if r.returncode == 0:
         if not parsed:
@@ -305,7 +309,7 @@ def check_rules():
 
 def check_state_and_capture():
     r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'bin' / 'sb_search.py'),
-                        '--mode', 'current', '--scope', 'global'], **UTF8)
+                        '--mode', 'current', '--scope', 'global'], timeout=CHILD_TIMEOUT, **UTF8)
     rec('✅' if r.returncode in (0,) else '❌', '상태층(state.db)', (r.stdout or r.stderr).strip().splitlines()[0][:100]
         if (r.stdout or r.stderr).strip() else 'rc=%d' % r.returncode)
     db = Path(sb_config.claude_mem_db())

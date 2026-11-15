@@ -4,6 +4,8 @@
   sb sources detect [--json]                 과거 세션 위치 감지(작업 폴더·시각·건수만, 저장 안 함)
   sb sources add LOCATION [--kind K] [--json]  폴더·회의 폴더·링크 등록 → $SB_HOME/sources.json
   sb sources list [--json]                   등록된 자료 목록
+  sb sources remove ID|LOCATION [--json]     add 로 넣은 자료 빼기
+  sb sources select ID [--off] [--json]      감지된 세션 소스를 적재 대상으로 고르기(고르기 전에는 skip)
 
 원칙
 - 세션 파일에서는 작업 폴더(cwd)·파일 시각·건수만 읽는다. 대화 본문 필드는 해석하지 않고 저장하지 않는다.
@@ -19,6 +21,8 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
+import urllib.parse
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -43,16 +47,31 @@ JUNK_DIRS = {'node_modules', '.git', '.hg', '.svn', '__pycache__', '.cache', 'ca
 JUNK_EXT = {'.dmg', '.pkg', '.exe', '.msi', '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar', '.iso',
             '.tmp', '.temp', '.swp', '.swo', '.part', '.crdownload', '.download', '.pyc', '.o', '.class', '.lock'}
 JUNK_NAMES = {'.ds_store', 'thumbs.db', 'desktop.ini'}
-# 파일·폴더 이름의 민감 신호. 영어는 단어 경계로 본다(syntax 의 tax 같은 오탐 방지).
+# 파일·폴더 이름의 민감 신호. 이름은 NFC 로 맞춘 뒤 본다(맥 zip 해제본·옛 HFS+ 복사본은 NFD).
+# 모르면 빼는 쪽이 원칙이라 넓게 잡는다 — own_output 이 sensitive 로 잘못 빠지는 것은 손해가 작다.
 SENSITIVE_KO = ('세금', '계약', '급여', '주민', '계좌', '견적', '원천징수', '연봉', '여권', '신분증', '통장', '등본',
-                '비밀번호', '인감', '세무', '부가세', '종합소득')
-SENSITIVE_EN = re.compile(r'(?<![a-z])(invoice|contracts?|tax(es)?|salary|payroll|passport|password|passwd|'
-                          r'bank|ssn|receipt|credentials?|secrets?|private[_-]?key|id[_-]?rsa)(?![a-z])')
+                '비밀번호', '비번', '패스워드', '인감', '세무', '부가세', '종합소득', '연말정산', '영수증', '청구서',
+                '인보이스', '거래명세', '급여명세', '카드명세', '이력서', '경력증명', '재직증명', '성적증명', '졸업증명',
+                '가족관계', '혼인', '진단서', '처방', '진료', '건강검진', '의료', '보험', '대출', '신용', '면담',
+                '인사평가', '사업자등록')
+# 영어: 오탐이 드문 단어는 붙여 쓴 이름·복수형까지 부분 문자열로(mycontract·passwords·salaryslip),
+# 짧아서 다른 단어에 섞이는 것은 앞쪽 경계만(taxreturn 은 잡고 syntax·taxonomy·taxi 는 뺀다).
+SENSITIVE_EN = re.compile(
+    r'(invoice|contract|salary|salaries|payroll|payslip|passport|password|passwd|credential|secret|receipt|'
+    r'private[_-]?key|id[_-]?rsa|api[_-]?keys?|access[_-]?keys?|apikey|'
+    r'(?<![a-z])tax(?!on|i)|(?<![a-z])bank|(?<![a-z])ssn(?![a-z])|(?<![a-z])tokens?(?![a-z])|'
+    r'(?<![a-z])resume(?![a-z]))')
 SENSITIVE_EXT = {'.pem', '.key', '.p12', '.pfx', '.kdbx', '.env'}
+EXT_RE = re.compile(r'^\.[a-z0-9]{1,10}$')     # 통계에 쓰는 확장자 꼴(아니면 (other) — 파일 이름 조각이 새지 않게)
+# 링크에서 지우는 비밀값: userinfo(아이디:비밀번호@)와, 이름에 이 조각이 든 쿼리(sig·X-Amz-Signature·access_token 등)
+SECRET_PARAM = re.compile(r'(sig|token|key|secret|pass|pwd|auth|credential|session|code|x-amz-|x-goog-)', re.IGNORECASE)
 MEETING_NAMES = ('회의', '회의록', 'meeting', 'meetings', 'minutes', 'meetnote')
 BODY_KEYS = ('text', 'content', 'prompt')
 SESSION_KINDS = ('claude_sessions', 'codex_sessions', 'gemini_sessions', 'omo_sessions')
 CWD_RE = re.compile(rb'"(?:cwd|directory)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# 한 줄에서 이 키들 뒤에 나온 "cwd" 는 본문(도구 결과 안의 JSON 등)일 수 있어 쓰지 않는다
+BODY_BEFORE_RE = re.compile(rb'"(?:content|message|text|output|prompt|result|toolUseResult|tool_result|summary|'
+                            rb'base_instructions|instructions|parts)"\s*:')
 
 # 3단계 소음 휴리스틱. 근거: obs-value-triage_20261109/FINDINGS.md — 메타데이터(type·길이) 규칙은 분리력이 약하고
 # 내용 유형 transient_status(상태 확인·대기·재시도·단순 열람)만 소음 84%로 강하게 갈렸다 → 그 유형만 제목으로 잡고 나머지는 unjudged.
@@ -77,6 +96,14 @@ def sources_path() -> Path:
 
 def logs_dir() -> Path:
     return sb_config.home() / 'logs'
+
+
+def private_dir(d: Path) -> Path:
+    """본인만 여는 폴더. 새로 만들 때만 0700 으로 만든다(이미 있는 폴더 권한은 바꾸지 않는다)."""
+    for x in (sb_config.home(), d):
+        if not x.exists():
+            x.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
 
 
 def _empty() -> Dict[str, Any]:
@@ -104,7 +131,9 @@ def save(doc: Dict[str, Any]) -> Path:
         raise ValueError('sources.json 에 본문 필드를 쓰지 않습니다: %s' % ', '.join(sorted(set(bad))))
     out = {'version': SCHEMA, 'sources': list(doc.get('sources') or [])}
     p = sources_path()
-    sb_vault._atomic_write(p, json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True)
+    private_dir(p.parent)
+    sb_vault._atomic_write(p, json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True,
+                           mode=0o600)
     return p
 
 
@@ -144,14 +173,17 @@ def _head_cwd(path: Path) -> Optional[str]:
             head = f.read(HEAD_BYTES)
     except OSError:
         return None
-    m = CWD_RE.search(head)
-    if not m:
-        return None
-    try:
-        v = json.loads(b'"' + m.group(1) + b'"')
-    except ValueError:
-        return None
-    return v if isinstance(v, str) and v else None
+    for line in head.split(b'\n'):
+        m = CWD_RE.search(line)
+        if not m or BODY_BEFORE_RE.search(line, 0, m.start()):
+            continue
+        try:
+            v = json.loads(b'"' + m.group(1) + b'"')
+        except ValueError:
+            continue
+        if isinstance(v, str) and v:
+            return v
+    return None
 
 
 class _Acc:
@@ -302,8 +334,9 @@ def detect_sessions(home: Optional[str] = None) -> List[Dict[str, Any]]:
             continue
         loc = sb_vault._short(str(root))
         summary = acc.summary(git_cache)
-        out.append({'id': _sid(kind, loc), 'kind': kind, 'location': loc,
-                    'mode': 'index' if summary['files'] else 'skip', 'discovered_by': 'auto', 'summary': summary})
+        # 본문 적재는 사용자가 고른 세션만(A4) — 감지만으로는 색인 대상이 아니다
+        out.append({'id': _sid(kind, loc), 'kind': kind, 'location': loc, 'mode': 'skip', 'discovered_by': 'auto',
+                    'summary': summary})
     return out
 
 
@@ -311,6 +344,36 @@ def detect_sessions(home: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def _is_link(location: str) -> bool:
     return bool(re.match(r'^[a-z][a-z0-9+.-]*://', location.strip(), re.IGNORECASE))
+
+
+def redact_link(url: str) -> Tuple[str, int]:
+    """링크에서 비밀값을 지운다: userinfo(아이디:비밀번호@), 서명·토큰형 쿼리 값, '='가 든 조각(#access_token=…).
+    (지운 링크, 지운 개수). 서명이 빠져 열리지 않는 링크는 요청 때 사용자가 다시 인증한다."""
+    parts = urllib.parse.urlsplit(url.strip())
+    removed = 0
+    netloc = parts.netloc
+    if '@' in netloc:
+        netloc = netloc.rsplit('@', 1)[1]
+        removed += 1
+    query = []
+    for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        if SECRET_PARAM.search(k):
+            removed += 1
+            continue
+        query.append((k, v))
+    fragment = parts.fragment
+    if '=' in fragment:
+        fragment = ''
+        removed += 1
+    if not removed:
+        return url.strip(), 0
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, urllib.parse.urlencode(query), fragment)), removed
+
+
+def clean_location(location: str) -> str:
+    """저장·출력 전에 쓰는 자료 위치(링크면 비밀값을 지운 값)."""
+    location = (location or '').strip()
+    return redact_link(location)[0] if _is_link(location) else location
 
 
 def _walk(root: Path) -> Iterator[Tuple[str, int, float, bool]]:
@@ -335,16 +398,39 @@ def _walk(root: Path) -> Iterator[Tuple[str, int, float, bool]]:
             yield os.path.join(*(parts + [name])), st.st_size, st.st_mtime, in_junk
 
 
+def _nfc(s: str) -> str:
+    return unicodedata.normalize('NFC', s)
+
+
 def _sensitive(rel: str) -> bool:
+    rel = _nfc(rel)
     low = rel.lower()
     if os.path.splitext(low)[1] in SENSITIVE_EXT or os.path.basename(low).startswith('.env'):
         return True
     return any(k in rel for k in SENSITIVE_KO) or bool(SENSITIVE_EN.search(low))
 
 
+def _root_label(root: Path) -> str:
+    """등록한 위치 자체(파일이면 그 폴더)의 이름 경로. 홈 아래면 홈 뒤 부분만 본다(계정 이름은 신호가 아니다)."""
+    d = root if root.is_dir() else root.parent
+    try:
+        rel = d.resolve().relative_to(Path.home().resolve())
+        parts = rel.parts
+    except ValueError:
+        parts = d.parts[1:]
+    return os.sep.join(parts)
+
+
+def _ext_key(rel: str) -> str:
+    ext = os.path.splitext(rel)[1].lower()
+    if not ext:
+        return '(none)'
+    return ext if EXT_RE.match(ext) else '(other)'
+
+
 def classify_file(rel: str, size: int, in_junk: bool = False) -> Tuple[str, str]:
     """(분류, 이유). 분류 ∈ own_output | sensitive | junk | unknown. 모르면 unknown(제외)."""
-    name = os.path.basename(rel)
+    name = _nfc(os.path.basename(rel))
     low = name.lower()
     ext = os.path.splitext(low)[1]
     if _sensitive(rel):
@@ -360,6 +446,7 @@ def classify_file(rel: str, size: int, in_junk: bool = False) -> Tuple[str, str]
 
 def _scan(root: Path) -> Dict[str, Any]:
     by_ext: Dict[str, int] = {}
+    root_sensitive = _sensitive(_root_label(root))   # 등록 폴더 이름 자체(~/docs/세금 등)
     counts = {'own_output': 0, 'sensitive': 0, 'junk': 0, 'unknown': 0}
     reasons: Dict[str, int] = {}
     files = size = 0
@@ -373,9 +460,9 @@ def _scan(root: Path) -> Dict[str, Any]:
         size += sz
         lo = mt if lo is None else min(lo, mt)
         hi = mt if hi is None else max(hi, mt)
-        ext = os.path.splitext(rel)[1].lower() or '(none)'
+        ext = _ext_key(rel)
         by_ext[ext] = by_ext.get(ext, 0) + 1
-        cls, why = classify_file(rel, sz, in_junk)
+        cls, why = ('sensitive', 'sensitive_location') if root_sensitive else classify_file(rel, sz, in_junk)
         counts[cls] += 1
         if cls != 'own_output':
             reasons[why] = reasons.get(why, 0) + 1
@@ -390,12 +477,16 @@ def register(location: str, kind: Optional[str] = None) -> Dict[str, Any]:
         raise ValueError('자료 위치가 비었습니다')
     if _is_link(location):
         k = kind or 'link'
-        return {'id': _sid(k, location), 'kind': k, 'location': location, 'mode': 'live', 'discovered_by': 'user'}
+        clean, removed = redact_link(location)
+        src = {'id': _sid(k, clean), 'kind': k, 'location': clean, 'mode': 'live', 'discovered_by': 'user'}
+        if removed:
+            src['redacted'] = removed       # 비밀값을 지웠다(값은 어디에도 남기지 않는다)
+        return src
     p = Path(os.path.expanduser(location))
     p = Path(os.path.realpath(str(p))) if p.exists() else p
     loc = sb_vault._short(str(p))
     if kind is None:
-        names = [x.lower() for x in p.parts[-2:]]
+        names = [_nfc(x).lower() for x in p.parts[-2:]]
         kind = 'meeting' if any(m in n for n in names for m in MEETING_NAMES) else 'folder'
     src: Dict[str, Any] = {'id': _sid(kind, loc), 'kind': kind, 'location': loc, 'discovered_by': 'user'}
     if not p.exists():
@@ -407,7 +498,8 @@ def register(location: str, kind: Optional[str] = None) -> Dict[str, Any]:
                       'sensitive_hint': scan['counts']['sensitive']}
     if scan['truncated']:
         src['summary']['truncated'] = True
-    src['mode'] = 'index' if scan['counts']['own_output'] else 'skip'
+    # 회의록은 파일 이름으로 민감도를 알 수 없다 — 민감도 표기를 보는 회의 적재기(M4)가 따로 고른다(A5·A12)
+    src['mode'] = 'index' if scan['counts']['own_output'] and kind != 'meeting' else 'skip'
     return src
 
 
@@ -417,19 +509,25 @@ def classify(source: Dict[str, Any]) -> Dict[str, Any]:
     empty = {'own_output': 0, 'sensitive': 0, 'junk': 0, 'unknown': 0}
     if source.get('mode') == 'live' or kind == 'link':
         return dict(empty, intake={'decision': 'live', 'index': 0, 'skip': 0, 'live': 1, 'reasons': {}})
-    if kind in SESSION_KINDS:   # 세션은 사용자 본인 작업 기록이다. 본문 적재는 사용자가 고른 세션만(A4)
+    if kind in SESSION_KINDS:   # 본문 적재는 사용자가 고른 세션만(A4) — 고르기 전에는 모두 skip(모르면 제외)
         n = int((source.get('summary') or {}).get('files') or 0)
-        decision = source.get('mode') or ('index' if n else 'skip')
-        return dict(empty, own_output=n, intake={'decision': decision, 'index': n if decision == 'index' else 0,
-                                                 'skip': 0 if decision == 'index' else n, 'live': 0, 'reasons': {}})
+        if source.get('mode') == 'index' and source.get('selected_by') == 'user':
+            return dict(empty, own_output=n, intake={'decision': 'index', 'index': n, 'skip': 0, 'live': 0, 'reasons': {}})
+        return dict(empty, unknown=n, intake={'decision': 'skip', 'index': 0, 'skip': n, 'live': 0,
+                                              'reasons': {'awaiting_user_choice': n} if n else {}})
     p = Path(os.path.expanduser(source.get('location') or ''))
     if not source.get('location') or not p.exists():
         return dict(empty, intake={'decision': 'skip', 'index': 0, 'skip': 0, 'live': 0, 'reasons': {'missing': 1}})
     scan = _scan(p)
-    c = scan['counts']
+    c = dict(scan['counts'])
+    reasons = dict(scan['reasons'])
+    if kind == 'meeting' and c['own_output']:   # 민감도 표기 없는 회의록은 private 으로 본다(A5·A12)
+        reasons['meeting_no_sensitivity'] = c['own_output']
+        c['unknown'] += c['own_output']
+        c['own_output'] = 0
     skip = c['sensitive'] + c['junk'] + c['unknown']
     return dict(c, intake={'decision': 'index' if c['own_output'] else 'skip', 'index': c['own_output'], 'skip': skip,
-                           'live': 0, 'reasons': scan['reasons']})
+                           'live': 0, 'reasons': reasons})
 
 
 # ---------------------------------------------------------------- 2단계
@@ -460,15 +558,20 @@ def stage2(answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """세션 감지 + 답에 있는 자료 등록 → sources.json. 소스가 0이어도 pass(기본 볼트)."""
     doc = load()
     auto = detect_sessions()
-    wanted = _answer_sources(answers or {})
-    # 전에 사용자가 등록한 자료(sb sources add)도 다시 잰다. 같은 위치는 한 번만
+    chosen = {s['id'] for s in doc['sources'] if s.get('selected_by') == 'user' and s.get('mode') == 'index'}
+    for s in auto:                      # 사용자가 고른 세션(sb sources select)은 다시 감지해도 고른 그대로
+        if s['id'] in chosen:
+            s.update(mode='index', selected_by='user')
+    wanted = [(loc, kind, 'answer') for loc, kind in _answer_sources(answers or {})]
+    # sb sources add 로 넣은 자료만 다시 잰다. 답에서 온 자료는 지금 답이 정본이다(답을 고치면 옛 위치는 빠진다)
     for s in doc['sources']:
-        if s.get('discovered_by') == 'user' and s.get('location'):
-            wanted.append((s['location'], s.get('kind')))
+        if s.get('discovered_by') == 'user' and s.get('added_via') == 'cli' and s.get('location'):
+            wanted.append((s['location'], s.get('kind'), 'cli'))
     users: Dict[str, Dict[str, Any]] = {}
-    for loc, kind in wanted:
+    for loc, kind, via in wanted:
         src = register(loc, kind)
-        if src['id'] not in users:
+        src['added_via'] = via
+        if src['id'] not in users or via == 'cli':
             users[src['id']] = src
     sources = []
     for src in auto + [users[k] for k in sorted(users)]:
@@ -495,8 +598,10 @@ def stage2(answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if leaked:
         return _result(2, 'stop', metrics, 'sources.json 에 본문 필드가 있습니다 — 키트를 갱신하세요')
     if missing:
-        return _result(2, 'stop', metrics, '없는 자료 위치: %s — 경로를 고쳐 sb setup 답을 다시 준 뒤 sb setup run'
-                       % ', '.join(missing))
+        cli = [s['id'] for s in sources if s.get('missing') and s.get('added_via') == 'cli']
+        how = ('sb setup answer --sources "<고친 위치들>" 뒤 sb setup run' +
+               (' / sb sources add 로 넣은 것은 sb sources remove %s' % ' '.join(cli) if cli else ''))
+        return _result(2, 'stop', metrics, '없는 자료 위치: %s — %s' % (', '.join(missing), how))
     return _result(2, 'pass', metrics)
 
 
@@ -586,7 +691,22 @@ def evaluate(sample: Dict[str, Any]) -> Dict[str, Any]:
 
 def _write_sample(sample: Dict[str, Any], path: Path) -> None:
     body = {k: v for k, v in sample.items() if k != 'path'}
-    sb_vault._atomic_write(path, json.dumps(body, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True)
+    private_dir(path.parent)
+    sb_vault._atomic_write(path, json.dumps(body, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True,
+                           mode=0o600)
+
+
+def _prev_sample_ids(seed: int, n: int) -> Optional[List[int]]:
+    """같은 seed·n 으로 전에 뽑은 표본 id. 없거나 형식이 다르면 None."""
+    p = sample_path(seed)
+    prev = sb_vault.read_json_file(p) if p.exists() else None
+    if not isinstance(prev, dict) or prev.get('seed') != seed or prev.get('n') != n:
+        return None
+    try:
+        out = sorted(int(i) for i in prev.get('ids') or [])
+    except (TypeError, ValueError):
+        return None
+    return out if len(out) == n and len(set(out)) == n else None
 
 
 def stage3(seed: Optional[int] = None, n: int = SAMPLE_N, db: Optional[str] = None) -> Dict[str, Any]:
@@ -603,6 +723,9 @@ def stage3(seed: Optional[int] = None, n: int = SAMPLE_N, db: Optional[str] = No
                 return _result(3, 'pass', [_metric('sample_n', len(ids), '%d 이상' % n, None,
                                                    '데이터 부족: 관측 %d건 < %d (%s)' % (len(ids), n, ev))])
             picked = sorted(random.Random(seed).sample(ids, n))
+            prev_ids = _prev_sample_ids(seed, n)
+            if prev_ids is not None and set(prev_ids) <= set(ids):
+                picked = prev_ids        # 관측이 늘어도 같은 표본 — 사람이 준 판정이 사라지지 않게
             scols = {r[1] for r in con.execute('PRAGMA table_info(sdk_sessions)')}
             cwd_col = 'cwd' if 'cwd' in scols else 'NULL'
             cwd_of: Dict[str, Optional[str]] = {}
@@ -673,11 +796,52 @@ def judge(sample_path_: str, judgments: Dict[str, str]) -> Dict[str, Any]:
 
 def _add(location: str, kind: Optional[str]) -> Dict[str, Any]:
     src = register(location, kind)
+    src['added_via'] = 'cli'
     cls = classify(src)
     src['intake'] = cls.pop('intake')
     src['classification'] = cls
     doc = load()
     doc['sources'] = [s for s in doc['sources'] if s.get('id') != src['id']] + [src]
+    save(doc)
+    return src
+
+
+def _find(doc: Dict[str, Any], key: str) -> Dict[str, Any]:
+    key = (key or '').strip()
+    loc = clean_location(key)
+    hits = [s for s in doc['sources'] if s.get('id') == key or s.get('location') == loc
+            or (s.get('location') and not _is_link(loc) and s.get('kind') not in SESSION_KINDS
+                and not _is_link(s['location']) and _cmp(s['location']) == _cmp(loc))]
+    if not hits:
+        raise ValueError('등록된 자료에 없습니다: %s (sb sources list 로 id 확인)' % loc)
+    return hits[0]
+
+
+def _remove(key: str) -> Dict[str, Any]:
+    """sb sources add 로 넣은 자료를 뺀다. 답에서 온 자료는 sb setup answer --sources 로 고친다."""
+    doc = load()
+    src = _find(doc, key)
+    if src.get('discovered_by') == 'auto':
+        raise ValueError('자동 감지된 세션은 빼지 않습니다 — 고르지 않으면 그대로 skip 입니다')
+    doc['sources'] = [s for s in doc['sources'] if s.get('id') != src['id']]
+    save(doc)
+    return src
+
+
+def _select(key: str, on: bool = True) -> Dict[str, Any]:
+    """감지된 세션 소스를 사용자가 적재 대상으로 고른다(A4). 고르기 전에는 skip."""
+    doc = load()
+    src = _find(doc, key)
+    if src.get('kind') not in SESSION_KINDS:
+        raise ValueError('세션 소스만 고를 수 있습니다: %s' % src.get('kind'))
+    if on:
+        src.update(mode='index', selected_by='user')
+    else:
+        src['mode'] = 'skip'
+        src.pop('selected_by', None)
+    cls = classify(src)
+    src['intake'] = cls.pop('intake')
+    src['classification'] = cls
     save(doc)
     return src
 
@@ -714,12 +878,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     a.add_argument('--json', action='store_true')
     ls = sub.add_parser('list')
     ls.add_argument('--json', action='store_true')
+    rv = sub.add_parser('remove')
+    rv.add_argument('key', help='id 또는 위치')
+    rv.add_argument('--json', action='store_true')
+    se = sub.add_parser('select')
+    se.add_argument('key', help='세션 소스 id')
+    se.add_argument('--off', action='store_true', help='고른 것을 취소')
+    se.add_argument('--json', action='store_true')
     args = ap.parse_args(argv)
     if args.cmd == 'detect':
         out = detect_sessions()
-    elif args.cmd == 'add':
+    elif args.cmd in ('add', 'remove', 'select'):
         try:
-            out = [_add(args.location, args.kind)]
+            if args.cmd == 'add':
+                out = [_add(args.location, args.kind)]
+            elif args.cmd == 'remove':
+                out = [_remove(args.key)]
+            else:
+                out = [_select(args.key, not args.off)]
         except ValueError as e:
             sys.stderr.write('%s\n' % e)
             return 2

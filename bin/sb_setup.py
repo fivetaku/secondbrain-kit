@@ -42,7 +42,13 @@ SAMPLE_SEED = 20261116          # 3단계 표본 seed 기본값 — 같은 입�
 SAMPLE_N = 50
 VERIFY_SESSIONS = 10            # 5단계 검증 데이터가 쌓이기까지 권하는 세션 수
 MAX_RUNS = 200                  # setup.json stage_runs 보관 상한
+SETUP_UVX_TIMEOUT = 90          # 1단계에서 chroma-mcp 기동 확인 상한(초)
 ANSWER_KEYS = ('agents', 'sources', 'llm_route', 'embedding', 'lang')
+# 에이전트 셸 도구 안에서 돈다는 표시 — pty 가 붙어 있어도 사람이 질문을 볼 수 없다(--non-interactive 를 빠뜨려도 묻지 않게)
+AGENT_ENV = ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'CODEX_THREAD_ID',
+             'GEMINI_CLI', 'OPENCODE')
+# 실행할 때마다 생겼다 없어졌다 하는 점검 행(실행 시간) — 지문에서 뺀다(같은 설치면 같은 지문)
+VOLATILE_METRICS = ('회수 훅 소요 시간',)
 
 
 # ---------------------------------------------------------------- 경로·파일
@@ -57,6 +63,13 @@ def logs_dir() -> Path:
 
 def injections_log() -> Path:
     return logs_dir() / 'recall_injections.jsonl'
+
+
+def _private_dirs(*extra: Path) -> None:
+    """SB_HOME·logs 를 새로 만들 때는 본인만 열게(0700). 이미 있는 폴더의 권한은 건드리지 않는다."""
+    for d in (sb_config.home(),) + extra:
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 def _short(p: Any) -> str:
@@ -86,10 +99,30 @@ def load() -> Dict[str, Any]:
     return base
 
 
+def _trim_runs(runs: List[Any]) -> List[Any]:
+    """보관 상한을 넘으면 오래된 기록부터 버리되, 단계마다 마지막 판정은 남긴다(status·지문이 그 값을 본다)."""
+    if len(runs) <= MAX_RUNS:
+        return runs
+    last = {}
+    for i, r in enumerate(runs):
+        if isinstance(r, dict) and r.get('stage') in STAGE_NAMES:
+            last[r['stage']] = i
+    keep = set(last.values())
+    room = MAX_RUNS - len(keep)
+    for i in range(len(runs) - 1, -1, -1):
+        if room <= 0:
+            break
+        if i not in keep:
+            keep.add(i)
+            room -= 1
+    return [r for i, r in enumerate(runs) if i in keep]
+
+
 def save(doc: Dict[str, Any]) -> None:
-    doc['stage_runs'] = doc.get('stage_runs', [])[-MAX_RUNS:]
+    doc['stage_runs'] = _trim_runs(doc.get('stage_runs', []))
     doc['updated_at'] = sb_vault.now_iso()
-    sb_vault._atomic_write(setup_path(), json.dumps(doc, ensure_ascii=False, indent=1) + '\n', private=True)
+    _private_dirs()
+    sb_vault._atomic_write(setup_path(), json.dumps(doc, ensure_ascii=False, indent=1) + '\n', private=True, mode=0o600)
 
 
 class _SetupLock:
@@ -101,7 +134,7 @@ class _SetupLock:
         self.f = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _private_dirs()
         fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
         self.f = os.fdopen(fd, 'r+b')
         try:
@@ -124,14 +157,14 @@ class _SetupLock:
 
 def _write_log(stage: int, record: Dict[str, Any]) -> Path:
     d = logs_dir()
-    d.mkdir(parents=True, exist_ok=True)
+    _private_dirs(d)
     base = 'setup-%d-%s' % (stage, sb_vault.stamp())
     p = d / (base + '.json')
     n = 2
     while p.exists():           # 같은 초에 두 번 돌아도 앞 기록을 덮지 않는다
         p = d / ('%s-%d.json' % (base, n))
         n += 1
-    sb_vault._atomic_write(p, json.dumps(record, ensure_ascii=False, indent=1) + '\n', private=True)
+    sb_vault._atomic_write(p, json.dumps(record, ensure_ascii=False, indent=1) + '\n', private=True, mode=0o600)
     return p
 
 
@@ -199,16 +232,32 @@ def parse_answer(key: str, text: str, auto: Any) -> Any:
     return text
 
 
+def _foreground(stream) -> bool:
+    """제어 터미널의 포그라운드 프로세스 그룹인가. 백그라운드(`./install.sh &`)에서 터미널을 읽으면 SIGTTIN 으로
+    멈춘다. 제어 터미널이 아닌 tty(그 tty 로는 SIGTTIN 이 오지 않는다)·fileno 없는 객체는 True."""
+    try:
+        return os.tcgetpgrp(stream.fileno()) == os.getpgrp()
+    except (AttributeError, ValueError, TypeError, OSError):
+        return True
+
+
+def in_agent() -> bool:
+    return any(os.environ.get(k) for k in AGENT_ENV)
+
+
 def can_ask(stdin=None, stdout=None) -> bool:
-    """묻는 조건: stdin·stdout 모두 tty, CI·SB_NO_SETUP 없음, 윈도우 아님(select 로 시간 제한을 걸 수 없다)."""
+    """묻는 조건: stdin·stdout 모두 tty, 포그라운드, CI·SB_NO_SETUP·에이전트 셸 표시 없음,
+    윈도우 아님(select 로 시간 제한을 걸 수 없다)."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    if os.environ.get('CI') or os.environ.get('SB_NO_SETUP') or os.name == 'nt':
+    if os.environ.get('CI') or os.environ.get('SB_NO_SETUP') or os.name == 'nt' or in_agent():
         return False
     try:
-        return bool(stdin.isatty() and stdout.isatty())
+        if not (stdin.isatty() and stdout.isatty()):
+            return False
     except (AttributeError, ValueError, OSError):
         return False
+    return _foreground(stdin)
 
 
 def _read_line(stdin, timeout: float) -> Optional[str]:
@@ -218,7 +267,7 @@ def _read_line(stdin, timeout: float) -> Optional[str]:
         ready, _, _ = select.select([stdin], [], [], timeout)
     except (OSError, ValueError):
         return None
-    if not ready:
+    if not ready or not _foreground(stdin):     # 묻는 사이 백그라운드로 갔으면 읽지 않는다(SIGTTIN)
         return None
     line = stdin.readline()
     return None if line == '' else line
@@ -288,11 +337,18 @@ def set_answers(values: Dict[str, Any], source: str = 'user') -> Dict[str, Any]:
         if not doc['answers']:
             doc['answers'] = auto_answers()
             doc['answer_sources'] = {k: 'default' for k in doc['answers']}
+        changed = False
         for k, v in values.items():
             if v is None:
                 continue
+            if k == 'sources' and doc['answers'].get(k) != v:
+                changed = True
             doc['answers'][k] = v
             doc['answer_sources'][k] = source
+        cur = int(doc.get('current_stage') or 1)
+        if changed and cur > 2:
+            # 자료 답이 바뀌었다 — 이미 지난 2단계(등록)부터 다시 해야 sources.json 에 반영된다
+            doc['current_stage'] = 2
         save(doc)
         return flat_answers(doc)
 
@@ -310,6 +366,8 @@ def _load_doctor():
 def _doctor_rows() -> List[Tuple[str, str, str]]:
     """doctor 의 점검 함수들을 그대로 돌려 (수준, 이름, 내용) 목록을 얻는다(읽기 전용)."""
     d = _load_doctor()
+    if hasattr(d, 'UVX_TIMEOUT'):
+        d.UVX_TIMEOUT = min(d.UVX_TIMEOUT, SETUP_UVX_TIMEOUT)   # 설치 안에서 다시 돌 때는 짧게(⚠ 로 남고 나중에 doctor)
     del d.rows[:]
     for fn in d.CHECKS:
         try:
@@ -380,6 +438,9 @@ def stage4(answers: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(plan, dict) and plan.get('plan_hash') == doc['plan_hash']:
             rec = sb_vault.apply_plan(plan, approved, 'sb_setup_approve')
             ok = rec['verify']['ok']
+            # 승인은 한 번만 쓴다 — 남겨 두면 사용자가 되돌린(rollback) 볼트를 다음 run 이 말없이 다시 적용한다
+            doc['answers'].pop('approved_plan_hash', None)
+            doc['answer_sources'].pop('approved_plan_hash', None)
             ms = [metric('plan_hash', plan['plan_hash'][:12], '승인 해시와 같음', True, _short(saved)),
                   metric('applied', ok, 'True', ok, _short(rec.get('apply_path', '')))]
             if ok:
@@ -495,8 +556,10 @@ def _ensure_answers(doc: Dict[str, Any]) -> None:
         doc['answer_sources'] = {k: 'default' for k in auto}
 
 
-def run(from_stage: Optional[int] = None, only: Optional[int] = None, non_interactive: bool = False) -> Dict[str, Any]:
-    """current_stage(또는 from_stage)부터 순서대로. stop·pending 이면 멈춘다. 지나지 않은 단계로 건너뛸 수 없다."""
+def run(from_stage: Optional[int] = None, only: Optional[int] = None, non_interactive: bool = False,
+        stop_before: Optional[int] = None) -> Dict[str, Any]:
+    """current_stage(또는 from_stage)부터 순서대로. stop·pending 이면 멈춘다. 지나지 않은 단계로 건너뛸 수 없다.
+    stop_before 를 주면 그 단계 앞에서 멈춘다(설치기 --no-vault: 4단계 볼트를 만들지 않는다)."""
     if not non_interactive and not load()['answers']:
         ask_first_run()               # 묻지 못하는 환경이면 알아서 기본값으로 채운다
     with _SetupLock():
@@ -510,6 +573,8 @@ def run(from_stage: Optional[int] = None, only: Optional[int] = None, non_intera
             if target > cur:
                 raise SystemExit('단계 %d 는 아직 차례가 아닙니다(지금 %d단계) — 순서를 건너뛸 수 없습니다' % (target, cur))
         stages = [only] if only else list(range(from_stage or cur, LAST_STAGE + 1))
+        if stop_before is not None:
+            stages = [n for n in stages if n < stop_before]
         results = []
         for n in stages:
             started = sb_vault.now_iso()
@@ -579,12 +644,17 @@ def judge(judgments: Dict[str, str], sample_path: Optional[Path] = None) -> Dict
     mod = _sources_mod()
     if mod is None or not hasattr(mod, 'judge'):
         raise ValueError('미구현 — 자료 분류(sb_sources)가 이 키트 판에 아직 없습니다')
+    cur = int(load().get('current_stage') or 1)
+    if cur != 3:      # 앞 단계가 멈춰 있는데 3단계 판정으로 차례를 건너뛰지 않게(accept 와 같은 규칙)
+        raise ValueError('지금 차례는 %s단계입니다 — 3단계 판정은 3단계 차례에만 받습니다' % cur)
     sample_path = sample_path or latest_sample()
     if not sample_path:
         raise ValueError('3단계 표본이 없습니다 — sb setup run 으로 3단계를 먼저 돌리세요')
     res = mod.judge(str(sample_path), judgments)
     with _SetupLock():
         doc = load()
+        if int(doc.get('current_stage') or 1) != 3:
+            raise ValueError('지금 차례는 %s단계입니다 — 3단계 판정은 3단계 차례에만 받습니다' % doc.get('current_stage'))
         results = []
         if isinstance(res, dict) and res.get('verdict') in VERDICTS:
             res = _valid(res, 3)
@@ -609,7 +679,8 @@ def fingerprint(doc: Optional[Dict[str, Any]] = None) -> str:
     같은 입력이면 몇 번 돌려도 같다."""
     doc = doc if doc is not None else load()
     last = _last_runs(doc)
-    body = {'runs': [[n, last[n]['verdict'], [[m.get('name'), m.get('value')] for m in last[n].get('metrics', [])]]
+    body = {'runs': [[n, last[n]['verdict'], [[m.get('name'), m.get('value')] for m in last[n].get('metrics', [])
+                                              if m.get('name') not in VOLATILE_METRICS]]
                      for n in sorted(last)],
             'plan_hash': doc.get('plan_hash')}
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()

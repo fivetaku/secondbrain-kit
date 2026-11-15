@@ -29,6 +29,8 @@ description: 세컨브레인(secondbrain-kit) 셋업을 대화로 진행한다 �
    - 요약 LLM 경로 — 자동값을 보여 주고 바꿀지 묻는다
    - 한국어 임베딩 사용 — y/n
    받은 답만 넘겨 기록한다(답하지 않은 항목은 빼면 자동값이 남는다).
+   자료 위치 답이 바뀌면 엔진이 2단계(등록)부터 다시 돌게 되감는다 — 설치기가 이미 1~4단계를 지났어도 3에서 반영된다.
+   과거 세션은 감지만 하고 적재하지 않는다(skip). 사용자가 특정 세션 소스를 넣자고 하면 `sb sources select <id> --json`.
    ```
    sb setup answer --agents claude,codex --sources "~/meetings,~/docs" --llm-route claude --embedding y --json
    ```
