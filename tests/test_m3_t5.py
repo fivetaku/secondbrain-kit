@@ -227,3 +227,24 @@ class AuditRejectedTests(ExpireBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AcceptLatestVerificationTests(ExpireBase):
+    """11-16 M3 Pro 리뷰 P0-1: 채택은 가장 최근 검증이 confirmed 일 때만."""
+
+    def test_confirmed_then_contradicted_is_not_accepted(self):
+        cid = self.candidate('a', verification=['confirmed', 'contradicted'])
+        with self.assertRaises(sb_state.StateError) as cm:
+            sb_state.accept(cid, 0)
+        self.assertEqual(cm.exception.code if hasattr(cm.exception, 'code') else cm.exception.args[0], 'verification_failed')
+        self.assertEqual(self.status(cid), 'proposed')
+
+    def test_contradicted_then_confirmed_is_accepted(self):
+        cid = self.candidate('b', verification=['contradicted', 'confirmed'])
+        out = sb_state.accept(cid, 0)
+        self.assertEqual(out['status'], 'ok')
+
+    def test_unknown_after_confirmed_blocks(self):
+        cid = self.candidate('c', verification=['confirmed', 'unknown'])
+        with self.assertRaises(sb_state.StateError):
+            sb_state.accept(cid, 0)

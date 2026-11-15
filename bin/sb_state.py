@@ -566,10 +566,15 @@ def accept(candidate_id: int, expected_version: int, db_path: Optional[str] = No
             if cand['kind'] == 'inference':
                 raise StateError('verification_failed', 'inference candidates are never accepted into state')
             methods = DECISION_METHODS if cand['kind'] == 'user_decision' else MEASUREMENT_METHODS
+            # 가장 최근 검증(같은 종류에 허용된 방법)이 confirmed 여야 한다. confirmed 만 골라 최신을 찾으면
+            # 뒤에 contradicted 가 나온 후보도 옛 확인으로 채택된다(2026-11-16 M3 Pro 리뷰 P0-1).
             ver = db.execute(
-                'SELECT * FROM state_verification WHERE candidate_id=? AND result=? AND method IN (%s) '
+                'SELECT * FROM state_verification WHERE candidate_id=? AND method IN (%s) '
                 'ORDER BY id DESC LIMIT 1' % ','.join('?' * len(methods)),
-                (candidate_id, 'confirmed', *methods)).fetchone()
+                (candidate_id, *methods)).fetchone()
+            if ver is not None and ver['result'] != 'confirmed':
+                raise StateError('verification_failed', 'latest verification is %r, not confirmed — verify again'
+                                 % ver['result'], required_methods=list(methods))
             if not ver:
                 raise StateError('verification_failed', 'no confirmed verification of an eligible method for candidate',
                                  required_methods=list(methods))
