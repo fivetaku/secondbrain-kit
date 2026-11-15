@@ -205,10 +205,10 @@ class ProjectKeyTests(unittest.TestCase):
         self.assertEqual(sb_scope.project_key('My_App'), sb_scope.project_key('my-app'))
 
     def test_home_aliases_env(self):
-        self.assertNotEqual(sb_scope.project_key('gptaku'), '~')
-        with mock.patch.dict(os.environ, {'SB_HOME_ALIASES': 'gptaku'}):
-            self.assertEqual(sb_scope.project_key('gptaku'), '~')
-            self.assertEqual(sb_scope.project_key('/Users/gptaku'), '~')
+        self.assertNotEqual(sb_scope.project_key('laptopuser'), '~')
+        with mock.patch.dict(os.environ, {'SB_HOME_ALIASES': 'laptopuser'}):
+            self.assertEqual(sb_scope.project_key('laptopuser'), '~')
+            self.assertEqual(sb_scope.project_key('/Users/laptopuser'), '~')
 
     def test_hook_and_recalld_use_same_key(self):
         for v in ('Second_Brain', '/Users/dev', 'dev', '/x/y/Proj_A', 'my app'):
