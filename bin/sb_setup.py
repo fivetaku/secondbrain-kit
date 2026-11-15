@@ -62,7 +62,8 @@ def logs_dir() -> Path:
 
 
 def injections_log() -> Path:
-    return logs_dir() / 'recall_injections.jsonl'
+    """회수 훅(hooks/sb_recall.py recall_log)이 쓰는 기록. 주입은 ids, 자동화 건너뜀은 automation, 지연은 ms."""
+    return logs_dir() / 'recall.jsonl'
 
 
 def _private_dirs(*extra: Path) -> None:
@@ -481,6 +482,29 @@ def _p95(values: List[float]) -> float:
     return s[min(len(s) - 1, int(round(0.95 * (len(s) - 1))))]
 
 
+def _obs_projects(ids: List[int]) -> Dict[int, str]:
+    """주입된 관측 id → project 꼬리표(claude-mem DB 읽기 전용, 본문은 읽지 않음). DB 가 없거나 못 읽으면 {}."""
+    db = Path(str(sb_config.claude_mem_db()))
+    if not ids or not db.is_file():
+        return {}
+    import sqlite3
+    out: Dict[int, str] = {}
+    try:
+        con = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=5)
+        try:
+            ids = sorted(set(ids))
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                q = 'SELECT id, project FROM observations WHERE id IN (%s)' % ','.join('?' * len(chunk))
+                for oid, proj in con.execute(q, chunk):
+                    out[int(oid)] = proj or ''
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return out
+
+
 def stage5(answers: Dict[str, Any]) -> Dict[str, Any]:
     p = injections_log()
     rows = []
@@ -493,19 +517,27 @@ def stage5(answers: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 if isinstance(r, dict):
                     rows.append(r)
-    if not rows:
+    inj = [r for r in rows if isinstance(r.get('ids'), list) and r['ids']]
+    if not inj:
         return result(5, 'pending', [metric('recall_injections', 0, '> 0', None, _short(p))],
                       '검증 데이터 대기: 세션 %d회 뒤 sb setup --stage 5' % VERIFY_SESSIONS)
-    ms = [metric('recall_injections', len(rows), '> 0', True, _short(p))]
-    cross = [bool(r['cross_scope']) for r in rows if 'cross_scope' in r]
-    if cross:
-        ratio = round(sum(cross) / len(cross), 4)
-        ms.append(metric('cross_scope_ratio', ratio, '≤ 0.2', ratio <= 0.2))
-    auto = [bool(r['automation']) for r in rows if 'automation' in r]
-    if auto:
-        ms.append(metric('automation_injections', sum(auto), '= 0', sum(auto) == 0))
-    lat = [float(r.get('latency_ms', r.get('elapsed_ms'))) for r in rows
-           if isinstance(r.get('latency_ms', r.get('elapsed_ms')), (int, float))]
+    ms = [metric('recall_injections', len(inj), '> 0', True, _short(p))]
+    auto = sum(1 for r in inj if r.get('automation'))
+    ms.append(metric('automation_injections', auto, '= 0', auto == 0,
+                     '자동화 건너뜀 %d건' % sum(1 for r in rows if r.get('automation') and not r.get('ids'))))
+    projs = _obs_projects([int(i) for r in inj for i in r['ids'] if isinstance(i, int)])
+    if projs:
+        import sb_scope
+        cross = 0
+        for r in inj:
+            ev = sb_scope.project_key(r.get('project') or '')
+            keys = {sb_scope.project_key(projs[i]) for i in r['ids'] if isinstance(i, int) and projs.get(i)}
+            if ev and any(k and k != ev for k in keys):
+                cross += 1
+        ratio = round(cross / len(inj), 4)
+        ms.append(metric('cross_scope_ratio', ratio, '≤ 0.2', ratio <= 0.2,
+                         '주입 이벤트 중 다른 프로젝트 관측이 하나라도 섞인 비율'))
+    lat = [float(r['ms']) for r in rows if isinstance(r.get('ms'), (int, float)) and not isinstance(r.get('ms'), bool)]
     if lat:
         p95 = _p95(lat)
         ms.append(metric('p95_ms', p95, '≤ 3000', p95 <= 3000))

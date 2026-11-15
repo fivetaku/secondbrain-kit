@@ -202,6 +202,43 @@ class EngineTests(SetupEnv):
         self.assertTrue(json.loads(sb_vault.vault_json_path().read_text(encoding='utf-8'))['default'])
 
     def test_stage5_reads_injection_log(self):
+        """키트 회수 훅 기록(logs/recall.jsonl: ids·project·ms·automation)과 claude-mem 관측 project 로 판정."""
+        import sqlite3
+        for st in (1, 2, 3, 4):
+            sb_setup._record(sb_setup.load(), sb_setup.result(st, 'pass', []), 'x')
+        doc = sb_setup.load()
+        doc['current_stage'] = 5
+        sb_setup.save(doc)
+        db = Path(str(sb_setup.sb_config.claude_mem_db()))
+        db.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(db))
+        con.execute('CREATE TABLE observations (id INTEGER PRIMARY KEY, project TEXT, title TEXT)')
+        con.executemany('INSERT INTO observations VALUES (?,?,?)',
+                        [(i, 'alpha' if i < 100 else 'beta', 't') for i in (1, 2, 3, 101)])
+        con.commit()
+        con.close()
+        log = sb_setup.injections_log()
+        self.assertEqual(log.name, 'recall.jsonl')
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{'project': 'alpha', 'ids': [1, 2], 'ms': 100 + i} for i in range(9)]
+        rows.append({'project': 'alpha', 'ids': [3, 101], 'ms': 120})       # 다른 프로젝트 섞임 1/10
+        rows.append({'project': 'alpha', 'automation': True, 'why': 'tmp_cwd'})  # 자동화 건너뜀(주입 아님)
+        log.write_text('\n'.join(json.dumps(r) for r in rows) + '\n', encoding='utf-8')
+        s = sb_setup.run(non_interactive=True)
+        r5 = s['results'][0]
+        self.assertEqual(r5['verdict'], 'pass', r5)
+        got = {m['name']: m['value'] for m in r5['metrics']}
+        self.assertEqual((got['recall_injections'], got['automation_injections'], got['cross_scope_ratio']), (10, 0, 0.1))
+        self.assertTrue(s['complete'])
+        log.write_text('\n'.join(json.dumps(r) for r in [{'project': 'alpha', 'ids': [101], 'ms': 9000},
+                                                           {'project': 'alpha', 'ids': [1], 'automation': True}]) + '\n',
+                       encoding='utf-8')
+        s = sb_setup.run(from_stage=5, non_interactive=True)
+        self.assertEqual(s['results'][0]['verdict'], 'stop')
+        bad = {m['name'] for m in s['results'][0]['metrics'] if m['pass'] is False}
+        self.assertEqual(bad, {'automation_injections', 'cross_scope_ratio', 'p95_ms'})
+
+    def test_stage5_pending_without_injections(self):
         for st in (1, 2, 3, 4):
             sb_setup._record(sb_setup.load(), sb_setup.result(st, 'pass', []), 'x')
         doc = sb_setup.load()
@@ -209,14 +246,9 @@ class EngineTests(SetupEnv):
         sb_setup.save(doc)
         log = sb_setup.injections_log()
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text('\n'.join(json.dumps({'cross_scope': i < 1, 'automation': False, 'latency_ms': 100 + i})
-                                 for i in range(10)) + '\n', encoding='utf-8')
+        log.write_text(json.dumps({'project': 'a', 'automation': True}) + '\n', encoding='utf-8')
         s = sb_setup.run(non_interactive=True)
-        self.assertEqual(s['results'][0]['verdict'], 'pass')
-        self.assertTrue(s['complete'])
-        log.write_text(json.dumps({'cross_scope': True, 'latency_ms': 9000}) + '\n', encoding='utf-8')
-        s = sb_setup.run(from_stage=5, non_interactive=True)
-        self.assertEqual(s['results'][0]['verdict'], 'stop')
+        self.assertEqual(s['results'][0]['verdict'], 'pending')
 
     def test_stage_error_is_stop_not_crash(self):
         self.src.stage2 = mock.Mock(side_effect=RuntimeError('boom'))
