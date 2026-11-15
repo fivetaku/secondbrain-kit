@@ -336,13 +336,17 @@ def check_sb():
         rec('✅' if sh.is_file() else '❌', 'sb 명령(Git Bash)', str(sh) if sh.is_file() else '없음 — install 재실행')
 
 
+# 점검 순서 — sb setup 1단계(bin/sb_setup.py)도 이 목록을 그대로 돌린다
+CHECKS = (check_venv, check_worker, check_settings, check_embedding, check_claude_mem_version, check_chroma_mcp, check_claude,
+          check_codex, check_rules, check_state_and_capture, check_sb)
+
+
 def main() -> int:
     try:   # 파이프·리디렉션 시 cp949 콘솔에서 ✅ 출력이 UnicodeEncodeError 로 죽는다
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:  # noqa: BLE001
         pass
-    for fn in (check_venv, check_worker, check_settings, check_embedding, check_claude_mem_version, check_chroma_mcp, check_claude, check_codex,
-               check_rules, check_state_and_capture, check_sb):
+    for fn in CHECKS:
         try:
             fn()
         except Exception as exc:

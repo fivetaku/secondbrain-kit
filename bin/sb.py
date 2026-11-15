@@ -17,6 +17,8 @@
   sb rules [--dry-run] [--json]                               규칙층 갱신(feedback 자동 메모리 → rules/<scope>.md)
   sb context [--query '<작업 설명>'] [--scope S] [--project P] [--max-bytes N]
                                                               외부 작업자에게 넘길 맥락 블록(사실·다음 행동·규칙·관련 기록)
+  sb setup [run|status|accept N --reason R|approve HASH|judge|answer]  다섯 단계 셋업(설치 점검→등록→분류→레이어→검증)
+  sb sources ...                                              자료 등록·분류(세션·폴더·회의·링크)
 """
 import os
 import runpy
@@ -31,6 +33,7 @@ ROUTES = {
     'nightly': 'nightly.py', 'consolidate': 'consolidate.py', 'audit': 'sb_audit.py',
     'automemory': 'sync_automemory.py', 'timeline': 'sb_timeline.py', 'relabel': 'sb_relabel.py', 'pii-sweep': 'sb_pii_sweep.py',
     'health': 'sb_health.py', 'rules': 'sb_rules.py', 'context': 'sb_context.py', 'vault': 'sb_vault.py',
+    'setup': 'sb_setup.py', 'sources': 'sb_sources.py',
 }
 
 
@@ -109,6 +112,9 @@ def main() -> int:
         script = ROUTES.get(cmd)
     if not script:
         sys.stderr.write('unknown command: %s\n' % cmd)
+        return 2
+    if not (BIN / script).is_file():
+        sys.stderr.write('sb %s: 이 키트 판에 아직 없습니다(%s)\n' % (cmd, script))
         return 2
     sys.argv = [str(BIN / script)] + argv
     runpy.run_path(str(BIN / script), run_name='__main__')

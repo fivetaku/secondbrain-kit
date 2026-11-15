@@ -19,6 +19,8 @@
   9  sb 명령 (PATH)
   10 스케줄 (launchd / 작업 스케줄러)
   11 볼트 온보딩: 기본 볼트(vault.json) + 기록이 있으면 분석·구성안(적용은 사용자 승인 뒤 sb vault apply)
+  12 셋업: 셋업 스킬 링크(~/.claude·~/.codex skills/secondbrain-setup) + 첫 실행 질문(터미널일 때만) + sb setup 단계 실행
+     (멈춘 단계는 안내만 — 설치는 실패로 끝나지 않는다. --no-setup 으로 질문·실행 생략)
 설정 파일을 바꾸기 전에 <파일>.sbkit-bak-<시각> 백업을 남긴다.
 """
 import argparse
@@ -884,6 +886,79 @@ def vault_onboarding(args) -> None:
     say('  ▶ 위 구성안을 확인한 뒤 적용: 에이전트에게 "볼트 구성안 적용해 줘" 또는 `sb vault apply --plan <위 저장 경로>` (되돌리기 `sb vault rollback`)')
 
 
+# ── 12 셋업 ─────────────────────────────────────────────────────────
+SKILL_NAME = 'secondbrain-setup'
+
+
+def skill_targets(args=None) -> list:
+    """셋업 스킬을 둘 곳 — 그 에이전트 홈이 있을 때만."""
+    out = []
+    if (HOME / '.claude').is_dir() or which('claude'):
+        out.append(HOME / '.claude' / 'skills' / SKILL_NAME)
+    if not getattr(args, 'no_codex', False) and ((HOME / '.codex').is_dir() or which('codex')):
+        out.append(HOME / '.codex' / 'skills' / SKILL_NAME)
+    return out
+
+
+def link_skills(args=None) -> None:
+    """키트의 skills/secondbrain-setup 을 에이전트 스킬 폴더에 심볼릭 링크(윈도우는 복사). 이미 있으면 그대로 둔다."""
+    src = KIT / 'skills' / SKILL_NAME
+    if not (src / 'SKILL.md').is_file():
+        WARNINGS.append('셋업 스킬 원본이 없습니다: %s' % src)
+        return
+    for dst in skill_targets(args):
+        if dst.is_symlink() or dst.exists():
+            say('  %s 이미 있음 — 그대로 둠' % dst)
+            continue
+        if DRY:
+            say('  [dry-run] link %s → %s' % (dst, src))
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if IS_WIN:
+                shutil.copytree(str(src), str(dst))
+            else:
+                dst.symlink_to(src, target_is_directory=True)
+            say('  셋업 스킬 %s' % dst)
+        except OSError as exc:
+            WARNINGS.append('셋업 스킬 연결 실패(%s): %s' % (dst, exc))
+
+
+def _is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def setup_stage(args) -> None:
+    """첫 실행 질문(터미널이고 CI·SB_NO_SETUP 이 없을 때만) → sb setup 단계 실행. 멈춘 단계는 안내만 하고
+    설치 결과(rc)는 바꾸지 않는다 — 문턱 미달은 설치 실패가 아니라 다음에 할 일이다."""
+    say('\n[12] 셋업')
+    if DRY:
+        say('  (dry-run) 셋업 스킬 링크 / 첫 실행 질문 / sb setup run')
+        return
+    link_skills(args)
+    if getattr(args, 'no_setup', False):
+        say('  질문·단계 실행 건너뜀(--no-setup) — 나중에 `sb setup`')
+        return
+    os.environ['SB_HOME'] = str(SB_HOME)      # 설치기와 같은 데이터 루트를 본다
+    try:
+        import sb_setup
+        sb_setup.ask_first_run()
+        res = sb_setup.run(non_interactive=not _is_tty())
+    except BaseException as exc:  # noqa: BLE001 — 셋업이 무엇으로 끝나든 설치는 끝까지 간다
+        if isinstance(exc, KeyboardInterrupt):
+            say('  셋업 중단 — 나중에 `sb setup`으로 이어서')
+            return
+        WARNINGS.append('셋업 실행 실패(%s: %s) — 나중에 `sb setup`으로 다시' % (type(exc).__name__, str(exc)[:160]))
+        return
+    say(textwrap.indent(sb_setup.render(res), '  '))
+    if not res.get('complete'):
+        say('  ▶ 셋업이 %s단계에서 멈췄습니다(%s). 위 안내대로 한 뒤 `sb setup` 또는 에이전트에게 "세컨브레인 셋업 이어서 해 줘"'
+            % (res.get('stopped_at') or res.get('current_stage'), res.get('verdict') or '-'))
+
+
 def uninstall() -> None:
     say('제거: 훅·규칙 블록·스케줄·sb 명령 (데이터 ~/.secondbrain, ~/.claude-mem 은 남긴다)')
     for path in (HOME / '.claude' / 'settings.json', HOME / '.codex' / 'hooks.json'):
@@ -912,6 +987,9 @@ def uninstall() -> None:
     link = HOME / '.local' / 'bin' / 'sb'
     if link.is_symlink() and Path(os.readlink(link)) == SB_HOME / 'bin' / 'sb' and not DRY:
         link.unlink()
+    for dst in (HOME / '.claude' / 'skills' / SKILL_NAME, HOME / '.codex' / 'skills' / SKILL_NAME):
+        if dst.is_symlink() and Path(os.readlink(dst)) == KIT / 'skills' / SKILL_NAME and not DRY:
+            dst.unlink()   # 우리가 건 링크만 푼다(복사본·사용자 폴더는 남긴다)
     # 설치 때 끈 claude-mem 플러그인의 Codex 훅을 되돌린다
     codex = which('codex')
     if codex and VPY.exists() and not DRY:
@@ -938,6 +1016,7 @@ def main() -> None:
     ap.add_argument('--reinstall-claude-mem', action='store_true')
     ap.add_argument('--no-vault', action='store_true', help='볼트 온보딩(11단계) 생략')
     ap.add_argument('--no-vault-llm', action='store_true', help='볼트 분석에서 LLM 이름 다듬기를 쓰지 않음')
+    ap.add_argument('--no-setup', action='store_true', help='셋업(12단계)의 첫 실행 질문·sb setup 실행 생략(스킬 링크는 함)')
     args = ap.parse_args()
     DRY = args.dry_run
     if args.doctor:
@@ -962,6 +1041,7 @@ def main() -> None:
     schedule(args)
     if not args.no_vault:
         vault_onboarding(args)
+    setup_stage(args)
     if WARNINGS:
         say('\n완료(경고 %d건) — 아래를 처리한 뒤 --doctor 로 확인하세요:' % len(WARNINGS))
         for w in WARNINGS:

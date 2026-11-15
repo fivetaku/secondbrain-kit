@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""세컨브레인 자료 목록: 과거 에이전트 세션·사용자가 알려 준 폴더·링크를 등록하고 분류한다(셋업 2·3단계).
+
+  sb sources detect [--json]                 과거 세션 위치 감지(작업 폴더·시각·건수만, 저장 안 함)
+  sb sources add LOCATION [--kind K] [--json]  폴더·회의 폴더·링크 등록 → $SB_HOME/sources.json
+  sb sources list [--json]                   등록된 자료 목록
+
+원칙
+- 세션 파일에서는 작업 폴더(cwd)·파일 시각·건수만 읽는다. 대화 본문 필드는 해석하지 않고 저장하지 않는다.
+- 폴더는 파일 이름·확장자·크기만 본다(내용을 열지 않는다). 민감도를 모르는 자료는 기본으로 뺀다.
+- 3단계 표본은 관측 id·판정만 남긴다(제목·본문 없음).
+"""
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import sqlite3
+import sys
+import time
+from contextlib import closing
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import sb_config  # noqa: E402
+import sb_scope  # noqa: E402
+import sb_vault  # noqa: E402
+
+SCHEMA = 1
+DEFAULT_SEED = 20261116            # sb_setup.SAMPLE_SEED 와 같은 값
+SAMPLE_N = 50
+HEAD_BYTES = 65536                 # 세션 파일에서 cwd 를 찾을 때 읽는 앞부분 상한(본문 전체를 읽지 않는다)
+CLAUDE_FILES_PER_DIR = 5           # Claude 프로젝트 폴더는 cwd 하나에서 나온 슬러그라 앞 몇 개만 열어 본다
+MAX_FILES = 200000                 # 폴더 하나에서 세는 파일 상한(넘으면 truncated)
+OWN_EXT = {'.md', '.txt', '.docx', '.pptx', '.pdf', '.hwp', '.hwpx', '.html', '.htm'}
+OWN_MIN, OWN_MAX = 1024, 20 * 1024 * 1024
+JUNK_DIRS = {'node_modules', '.git', '.hg', '.svn', '__pycache__', '.cache', 'cache', 'caches', '.venv', 'venv',
+             '.tox', '.mypy_cache', '.pytest_cache', '.idea', '.vscode', '.next', '.gradle', 'tmp', 'temp', '.tmp',
+             '.trash', '$recycle.bin'}
+JUNK_EXT = {'.dmg', '.pkg', '.exe', '.msi', '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar', '.iso',
+            '.tmp', '.temp', '.swp', '.swo', '.part', '.crdownload', '.download', '.pyc', '.o', '.class', '.lock'}
+JUNK_NAMES = {'.ds_store', 'thumbs.db', 'desktop.ini'}
+# 파일·폴더 이름의 민감 신호. 영어는 단어 경계로 본다(syntax 의 tax 같은 오탐 방지).
+SENSITIVE_KO = ('세금', '계약', '급여', '주민', '계좌', '견적', '원천징수', '연봉', '여권', '신분증', '통장', '등본',
+                '비밀번호', '인감', '세무', '부가세', '종합소득')
+SENSITIVE_EN = re.compile(r'(?<![a-z])(invoice|contracts?|tax(es)?|salary|payroll|passport|password|passwd|'
+                          r'bank|ssn|receipt|credentials?|secrets?|private[_-]?key|id[_-]?rsa)(?![a-z])')
+SENSITIVE_EXT = {'.pem', '.key', '.p12', '.pfx', '.kdbx', '.env'}
+MEETING_NAMES = ('회의', '회의록', 'meeting', 'meetings', 'minutes', 'meetnote')
+BODY_KEYS = ('text', 'content', 'prompt')
+SESSION_KINDS = ('claude_sessions', 'codex_sessions', 'gemini_sessions', 'omo_sessions')
+CWD_RE = re.compile(rb'"(?:cwd|directory)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+# 3단계 소음 휴리스틱. 근거: obs-value-triage_20261109/FINDINGS.md — 메타데이터(type·길이) 규칙은 분리력이 약하고
+# 내용 유형 transient_status(상태 확인·대기·재시도·단순 열람)만 소음 84%로 강하게 갈렸다 → 그 유형만 제목으로 잡고 나머지는 unjudged.
+NOISE_TITLE = re.compile(
+    r'(상태\s*(확인|점검|조회)|대기\s*중|기다리는\s*중|재시도|다시\s*시도|진행\s*중|실행\s*중|폴링|'
+    r'파일\s*(읽기|열람)|읽어\s*봄|목록\s*(확인|조회|출력)|디렉(터|토)리\s*(목록|구조\s*확인)|출력\s*확인|'
+    r'\bstatus\s+check|\bchecking\s+status|\bwaiting\b|\bpolling\b|\bretry(ing)?\b|\bretried\b|\bstill\s+running\b|'
+    r'\bin\s+progress\b|^\s*read(ing)?\s+(the\s+)?file|\bdirectory\s+listing\b|\bfile\s+listing\b|\blisted\s+files\b)',
+    re.IGNORECASE)
+OK_TYPES = {'decision', 'bugfix', 'feature', 'refactor', 'fix', 'gotcha', 'pattern'}
+OK_TITLE = re.compile(r'(원인|해결|결정|확정|절차|규칙|교훈|해법|우회|root\s*cause|\bfixed\b|\bdecid|\bdecision\b|'
+                      r'\bprocedure\b|\bhow\s+to\b|\bworkaround\b|\bgotcha\b)', re.IGNORECASE)
+NOISE_DUP_MAX, SCOPE_MISMATCH_MAX, UNJUDGED_MAX = 0.20, 0.05, 0.30
+JUDGE_VALUES = ('ok', 'noise', 'dup')
+
+
+# ---------------------------------------------------------------- 경로·파일
+
+def sources_path() -> Path:
+    return sb_config.home() / 'sources.json'
+
+
+def logs_dir() -> Path:
+    return sb_config.home() / 'logs'
+
+
+def _empty() -> Dict[str, Any]:
+    return {'version': SCHEMA, 'sources': []}
+
+
+def load() -> Dict[str, Any]:
+    """sources.json. 없으면 빈 목록. 깨졌으면 덮어쓰지 않고 멈춘다(사용자 기록 보호)."""
+    p = sources_path()
+    if not p.exists():
+        return _empty()
+    data = sb_vault.read_json_file(p)
+    if not isinstance(data, dict) or not isinstance(data.get('sources', []), list):
+        raise SystemExit('%s 를 읽을 수 없어 멈췄습니다 — 파일을 고치거나 옮긴 뒤 다시 하세요(덮어쓰지 않았습니다)'
+                         % sb_vault._short(str(p)))
+    doc = _empty()
+    doc.update(data)
+    doc['sources'] = [s for s in doc.get('sources') or [] if isinstance(s, dict)]
+    return doc
+
+
+def save(doc: Dict[str, Any]) -> Path:
+    bad = body_keys(doc)
+    if bad:   # 본문 필드가 섞여 들어오면 쓰지 않는다
+        raise ValueError('sources.json 에 본문 필드를 쓰지 않습니다: %s' % ', '.join(sorted(set(bad))))
+    out = {'version': SCHEMA, 'sources': list(doc.get('sources') or [])}
+    p = sources_path()
+    sb_vault._atomic_write(p, json.dumps(out, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True)
+    return p
+
+
+def body_keys(obj: Any) -> List[str]:
+    """중첩된 dict 어디에든 'text'·'content'·'prompt' 키가 있으면 그 이름들."""
+    found: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in BODY_KEYS:
+                found.append(k)
+            found.extend(body_keys(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            found.extend(body_keys(v))
+    return found
+
+
+def _sid(kind: str, location: str) -> str:
+    return '%s-%s' % (kind, hashlib.sha256(('%s\0%s' % (kind, location)).encode('utf-8')).hexdigest()[:10])
+
+
+def _date(epoch: Optional[float]) -> Optional[str]:
+    return time.strftime('%Y-%m-%d', time.localtime(epoch)) if epoch else None
+
+
+def _cmp(p: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(p)))
+
+
+# ---------------------------------------------------------------- 세션 감지(작업 폴더·시각·건수만)
+
+def _head_cwd(path: Path) -> Optional[str]:
+    """파일 앞부분(최대 HEAD_BYTES)에서 "cwd"(OpenCode 는 "directory") 값만 정규식으로 뽑는다.
+    JSON 전체를 해석하지 않아 메시지 본문 필드는 객체로 만들어지지도 않는다."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(HEAD_BYTES)
+    except OSError:
+        return None
+    m = CWD_RE.search(head)
+    if not m:
+        return None
+    try:
+        v = json.loads(b'"' + m.group(1) + b'"')
+    except ValueError:
+        return None
+    return v if isinstance(v, str) and v else None
+
+
+class _Acc:
+    """한 세션 소스의 집계(파일 수·크기·기간·작업 폴더)."""
+
+    def __init__(self):
+        self.files = 0
+        self.size = 0
+        self.lo: Optional[float] = None
+        self.hi: Optional[float] = None
+        self.cwds: set = set()
+        self.compressed = 0
+
+    def add(self, p: Path, cwd: Optional[str] = None) -> None:
+        try:
+            st = p.stat()
+        except OSError:
+            return
+        self.files += 1
+        self.size += st.st_size
+        self.lo = st.st_mtime if self.lo is None else min(self.lo, st.st_mtime)
+        self.hi = st.st_mtime if self.hi is None else max(self.hi, st.st_mtime)
+        if cwd:
+            self.cwds.add(cwd)
+
+    def summary(self, git_cache: Dict[str, bool]) -> Dict[str, Any]:
+        cwds = sorted(self.cwds)
+        out = {'files': self.files, 'size': self.size, 'period': [_date(self.lo), _date(self.hi)],
+               'cwd_count': len(cwds), 'git_count': sum(1 for c in cwds if _in_git(c, git_cache))}
+        if self.compressed:
+            out['compressed'] = self.compressed
+        return out
+
+
+def _in_git(cwd: str, cache: Dict[str, bool]) -> bool:
+    """cwd 또는 그 위 폴더에 .git 이 있는가(git 을 띄우지 않는다 — 폴더가 수백 개라도 빠르게)."""
+    p = os.path.realpath(os.path.expanduser(cwd))
+    seen = []
+    hit = False
+    while True:
+        if p in cache:
+            hit = cache[p]
+            break
+        seen.append(p)
+        if os.path.exists(os.path.join(p, '.git')):
+            hit = True
+            break
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    for s in seen:
+        cache[s] = hit
+    return hit
+
+
+def _files(root: Path, pattern: str) -> List[Path]:
+    try:
+        return sorted(p for p in root.glob(pattern) if p.is_file())
+    except OSError:
+        return []
+
+
+def _claude(root: Path) -> Optional[_Acc]:
+    projects = root / 'projects'
+    if not projects.is_dir():
+        return None
+    acc = _Acc()
+    for d in sorted(p for p in projects.iterdir() if p.is_dir()):
+        cwd = None
+        for i, f in enumerate(_files(d, '*.jsonl')):
+            if cwd is None and i < CLAUDE_FILES_PER_DIR:
+                cwd = _head_cwd(f)
+            acc.add(f)
+        if cwd:
+            acc.cwds.add(cwd)
+    return acc
+
+
+def _codex(root: Path) -> Optional[_Acc]:
+    dirs = [root / 'sessions', root / 'archived_sessions']
+    if not any(d.is_dir() for d in dirs):
+        return None
+    acc = _Acc()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in _files(d, '**/*.jsonl'):
+            acc.add(f, _head_cwd(f))
+        for f in _files(d, '**/*.jsonl.zst'):   # 압축본은 개수만(풀지 않는다)
+            acc.add(f)
+            acc.compressed += 1
+    return acc
+
+
+def _gemini(root: Path) -> Optional[_Acc]:
+    tmp = root / 'tmp'
+    if not tmp.is_dir():
+        return None
+    by_name: Dict[str, str] = {}
+    projects = sb_vault.read_json_file(root / 'projects.json')
+    table = projects.get('projects') if isinstance(projects, dict) else None
+    if isinstance(table, dict):   # 폴더 이름은 projects.json 의 짧은 이름이거나 경로의 sha256
+        for path, name in table.items():
+            if isinstance(path, str):
+                by_name[hashlib.sha256(path.encode('utf-8')).hexdigest()] = path
+                if isinstance(name, str):
+                    by_name[name] = path
+    acc = _Acc()
+    for d in sorted(p for p in tmp.iterdir() if p.is_dir()):
+        chats = [f for f in _files(d / 'chats', '*') if f.suffix in ('.json', '.jsonl')]
+        for f in chats:
+            acc.add(f)
+        if chats and d.name in by_name:
+            acc.cwds.add(by_name[d.name])
+    return acc if acc.files or any(tmp.iterdir()) else None
+
+
+def _omo(roots: List[Tuple[Path, str]]) -> Tuple[Optional[_Acc], Optional[Path]]:
+    found = None
+    acc = _Acc()
+    for root, pattern in roots:
+        if not root.is_dir():
+            continue
+        found = found or root
+        for f in _files(root, pattern):
+            acc.add(f, _head_cwd(f))
+    return (acc, found) if found else (None, None)
+
+
+def detect_sessions(home: Optional[str] = None) -> List[Dict[str, Any]]:
+    """과거 에이전트 세션 위치. 있는 곳만 돌려준다. home 을 주면 그 아래만 본다(환경변수 무시)."""
+    h = Path(home).expanduser() if home else Path.home()
+    env = (lambda k: None) if home else os.environ.get
+    claude_root = Path(env('CLAUDE_CONFIG_DIR') or h / '.claude').expanduser()
+    codex_root = Path(env('CODEX_HOME') or h / '.codex').expanduser()
+    xdg = Path(env('XDG_DATA_HOME') or h / '.local' / 'share').expanduser()
+    omo_acc, omo_root = _omo([(h / '.omo' / 'agent' / 'sessions', '*/*.jsonl'),
+                              (xdg / 'opencode' / 'storage' / 'session', '**/*.json')])
+    found = [('claude_sessions', claude_root, _claude(claude_root)),
+             ('codex_sessions', codex_root, _codex(codex_root)),
+             ('gemini_sessions', h / '.gemini', _gemini(h / '.gemini')),
+             ('omo_sessions', omo_root, omo_acc)]
+    git_cache: Dict[str, bool] = {}
+    out = []
+    for kind, root, acc in found:
+        if acc is None or root is None:
+            continue
+        loc = sb_vault._short(str(root))
+        summary = acc.summary(git_cache)
+        out.append({'id': _sid(kind, loc), 'kind': kind, 'location': loc,
+                    'mode': 'index' if summary['files'] else 'skip', 'discovered_by': 'auto', 'summary': summary})
+    return out
+
+
+# ---------------------------------------------------------------- 폴더·링크 등록과 분류
+
+def _is_link(location: str) -> bool:
+    return bool(re.match(r'^[a-z][a-z0-9+.-]*://', location.strip(), re.IGNORECASE))
+
+
+def _walk(root: Path) -> Iterator[Tuple[str, int, float, bool]]:
+    """(상대 경로, 크기, 수정 시각, junk 폴더 아래인가). 심볼릭 링크는 따라가지 않는다."""
+    if root.is_file():
+        st = root.stat()
+        yield root.name, st.st_size, st.st_mtime, False
+        return
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        rel_dir = os.path.relpath(dirpath, str(root))
+        parts = [] if rel_dir == os.curdir else rel_dir.split(os.sep)
+        in_junk = any(x.lower() in JUNK_DIRS for x in parts)
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if not os.path.isfile(full) or os.path.islink(full):
+                continue
+            yield os.path.join(*(parts + [name])), st.st_size, st.st_mtime, in_junk
+
+
+def _sensitive(rel: str) -> bool:
+    low = rel.lower()
+    if os.path.splitext(low)[1] in SENSITIVE_EXT or os.path.basename(low).startswith('.env'):
+        return True
+    return any(k in rel for k in SENSITIVE_KO) or bool(SENSITIVE_EN.search(low))
+
+
+def classify_file(rel: str, size: int, in_junk: bool = False) -> Tuple[str, str]:
+    """(분류, 이유). 분류 ∈ own_output | sensitive | junk | unknown. 모르면 unknown(제외)."""
+    name = os.path.basename(rel)
+    low = name.lower()
+    ext = os.path.splitext(low)[1]
+    if _sensitive(rel):
+        return 'sensitive', 'sensitive_name'
+    if in_junk or low in JUNK_NAMES or ext in JUNK_EXT or name.startswith('~$') or low.startswith('.~lock'):
+        return 'junk', 'junk'
+    if ext in OWN_EXT:
+        if OWN_MIN <= size <= OWN_MAX:
+            return 'own_output', 'own_output'
+        return 'unknown', 'size_out_of_range'
+    return 'unknown', 'unknown_ext'
+
+
+def _scan(root: Path) -> Dict[str, Any]:
+    by_ext: Dict[str, int] = {}
+    counts = {'own_output': 0, 'sensitive': 0, 'junk': 0, 'unknown': 0}
+    reasons: Dict[str, int] = {}
+    files = size = 0
+    lo = hi = None
+    truncated = False
+    for rel, sz, mt, in_junk in _walk(root):
+        if files >= MAX_FILES:
+            truncated = True
+            break
+        files += 1
+        size += sz
+        lo = mt if lo is None else min(lo, mt)
+        hi = mt if hi is None else max(hi, mt)
+        ext = os.path.splitext(rel)[1].lower() or '(none)'
+        by_ext[ext] = by_ext.get(ext, 0) + 1
+        cls, why = classify_file(rel, sz, in_junk)
+        counts[cls] += 1
+        if cls != 'own_output':
+            reasons[why] = reasons.get(why, 0) + 1
+    return {'files': files, 'size': size, 'by_ext': by_ext, 'period': [_date(lo), _date(hi)],
+            'counts': counts, 'reasons': reasons, 'truncated': truncated}
+
+
+def register(location: str, kind: Optional[str] = None) -> Dict[str, Any]:
+    """폴더·회의 폴더·링크를 자료 항목으로 만든다(저장은 하지 않는다 — stage2·CLI add 가 저장)."""
+    location = (location or '').strip()
+    if not location:
+        raise ValueError('자료 위치가 비었습니다')
+    if _is_link(location):
+        k = kind or 'link'
+        return {'id': _sid(k, location), 'kind': k, 'location': location, 'mode': 'live', 'discovered_by': 'user'}
+    p = Path(os.path.expanduser(location))
+    p = Path(os.path.realpath(str(p))) if p.exists() else p
+    loc = sb_vault._short(str(p))
+    if kind is None:
+        names = [x.lower() for x in p.parts[-2:]]
+        kind = 'meeting' if any(m in n for n in names for m in MEETING_NAMES) else 'folder'
+    src: Dict[str, Any] = {'id': _sid(kind, loc), 'kind': kind, 'location': loc, 'discovered_by': 'user'}
+    if not p.exists():
+        src.update(mode='skip', missing=True,
+                   summary={'files': 0, 'size': 0, 'by_ext': {}, 'period': [None, None], 'sensitive_hint': 0})
+        return src
+    scan = _scan(p)
+    src['summary'] = {'files': scan['files'], 'size': scan['size'], 'by_ext': scan['by_ext'], 'period': scan['period'],
+                      'sensitive_hint': scan['counts']['sensitive']}
+    if scan['truncated']:
+        src['summary']['truncated'] = True
+    src['mode'] = 'index' if scan['counts']['own_output'] else 'skip'
+    return src
+
+
+def classify(source: Dict[str, Any]) -> Dict[str, Any]:
+    """{'own_output','sensitive','junk','unknown'} 개수와 intake(결정·제외 이유별 수)."""
+    kind = source.get('kind')
+    empty = {'own_output': 0, 'sensitive': 0, 'junk': 0, 'unknown': 0}
+    if source.get('mode') == 'live' or kind == 'link':
+        return dict(empty, intake={'decision': 'live', 'index': 0, 'skip': 0, 'live': 1, 'reasons': {}})
+    if kind in SESSION_KINDS:   # 세션은 사용자 본인 작업 기록이다. 본문 적재는 사용자가 고른 세션만(A4)
+        n = int((source.get('summary') or {}).get('files') or 0)
+        decision = source.get('mode') or ('index' if n else 'skip')
+        return dict(empty, own_output=n, intake={'decision': decision, 'index': n if decision == 'index' else 0,
+                                                 'skip': 0 if decision == 'index' else n, 'live': 0, 'reasons': {}})
+    p = Path(os.path.expanduser(source.get('location') or ''))
+    if not source.get('location') or not p.exists():
+        return dict(empty, intake={'decision': 'skip', 'index': 0, 'skip': 0, 'live': 0, 'reasons': {'missing': 1}})
+    scan = _scan(p)
+    c = scan['counts']
+    skip = c['sensitive'] + c['junk'] + c['unknown']
+    return dict(c, intake={'decision': 'index' if c['own_output'] else 'skip', 'index': c['own_output'], 'skip': skip,
+                           'live': 0, 'reasons': scan['reasons']})
+
+
+# ---------------------------------------------------------------- 2단계
+
+def _metric(name: str, value: Any, threshold: str = '', ok: Optional[bool] = None, evidence: str = '') -> Dict[str, Any]:
+    return {'name': name, 'value': value, 'threshold': threshold, 'pass': ok, 'evidence': evidence}
+
+
+def _result(stage: int, verdict: str, metrics: List[Dict[str, Any]], hint: str = '') -> Dict[str, Any]:
+    return {'stage': stage, 'name': {2: 'register', 3: 'classify'}[stage], 'verdict': verdict, 'metrics': metrics,
+            'hint': hint}
+
+
+def _answer_sources(answers: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
+    raw = (answers or {}).get('sources') or []
+    if isinstance(raw, str):
+        raw = [x for x in raw.split(',')]
+    out = []
+    for item in raw:
+        if isinstance(item, dict) and item.get('location'):
+            out.append((str(item['location']).strip(), item.get('kind')))
+        elif isinstance(item, str) and item.strip():
+            out.append((item.strip(), None))
+    return out
+
+
+def stage2(answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """세션 감지 + 답에 있는 자료 등록 → sources.json. 소스가 0이어도 pass(기본 볼트)."""
+    doc = load()
+    auto = detect_sessions()
+    wanted = _answer_sources(answers or {})
+    # 전에 사용자가 등록한 자료(sb sources add)도 다시 잰다. 같은 위치는 한 번만
+    for s in doc['sources']:
+        if s.get('discovered_by') == 'user' and s.get('location'):
+            wanted.append((s['location'], s.get('kind')))
+    users: Dict[str, Dict[str, Any]] = {}
+    for loc, kind in wanted:
+        src = register(loc, kind)
+        if src['id'] not in users:
+            users[src['id']] = src
+    sources = []
+    for src in auto + [users[k] for k in sorted(users)]:
+        cls = classify(src)
+        src['intake'] = cls.pop('intake')
+        src['classification'] = cls
+        sources.append(src)
+    path = save({'sources': sources})
+    saved = sb_vault.read_json_file(path) or {}
+    leaked = body_keys(saved)
+    sess = [s for s in sources if s['kind'] in SESSION_KINDS]
+    missing = [s['location'] for s in sources if s.get('missing')]
+    sensitive = sum(int((s.get('classification') or {}).get('sensitive') or 0) for s in sources)
+    ev = sb_vault._short(str(path))
+    metrics = [
+        _metric('sources', len(sources), '0 이상(0이면 기본 볼트)', True, ev),
+        _metric('session_files', sum(s['summary']['files'] for s in sess), '', True,
+                ', '.join('%s=%d' % (s['kind'], s['summary']['files']) for s in sess) or '세션 위치 없음'),
+        _metric('session_cwds', sum(s['summary']['cwd_count'] for s in sess), '', True, 'cwd 정규식만(본문 해석 없음)'),
+        _metric('sensitive_hints', sensitive, '보고만(민감 신호는 skip)', True, '파일 이름 기준'),
+        _metric('missing_sources', len(missing), '0', not missing, ', '.join(missing)),
+        _metric('body_fields_saved', len(leaked), '0', not leaked, "sources.json 에 'text'·'content'·'prompt' 키"),
+    ]
+    if leaked:
+        return _result(2, 'stop', metrics, 'sources.json 에 본문 필드가 있습니다 — 키트를 갱신하세요')
+    if missing:
+        return _result(2, 'stop', metrics, '없는 자료 위치: %s — 경로를 고쳐 sb setup 답을 다시 준 뒤 sb setup run'
+                       % ', '.join(missing))
+    return _result(2, 'pass', metrics)
+
+
+# ---------------------------------------------------------------- 3단계 표본 판정
+
+def _norm_title(t: Optional[str]) -> str:
+    return re.sub(r'[\W\d_]+', '', (t or '').lower())
+
+
+def heuristic(obs_type: Optional[str], title: Optional[str]) -> str:
+    """ok | noise | unjudged. 제목·type 만 본다."""
+    t = (obs_type or '').strip().lower()
+    if t in OK_TYPES:
+        return 'ok'
+    title = title or ''
+    if NOISE_TITLE.search(title):
+        return 'noise'
+    if OK_TITLE.search(title):
+        return 'ok'
+    return 'unjudged'
+
+
+def _scope_key(v: str) -> Tuple[str, str]:
+    """(비교용 전체 값, basename). 경로(~·절대)는 realpath·normcase, 이름은 소문자·공백 제거."""
+    v = (v or '').strip()
+    if v.startswith('~') or sb_config.is_abs_like(v):
+        full = _cmp(v)
+        return full, sb_scope._norm_name(os.path.basename(full.rstrip('\\/')))
+    n = sb_scope._norm_name(v)
+    return n, n
+
+
+def scope_match(scope_id: str, project: str) -> bool:
+    a, ab = _scope_key(scope_id)
+    b, bb = _scope_key(project)
+    return bool(a) and bool(b) and (a == b or ab == b or a == bb or (ab and ab == bb))
+
+
+def sample_path(seed: int) -> Path:
+    return logs_dir() / ('setup-3-sample-%s.json' % seed)
+
+
+def _ratio(a: int, b: int) -> Optional[float]:
+    return round(a / b, 4) if b else None
+
+
+def evaluate(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """표본 파일(자동 판정 + 사람 판정 + scope 비교)로 3단계 판정을 다시 계산한다(DB 를 다시 읽지 않는다)."""
+    ids = [str(i) for i in sample.get('ids') or []]
+    auto = sample.get('auto') or {}
+    judged = sample.get('judged') or {}
+    scope = sample.get('scope') or {}
+    final = {i: judged.get(i) or auto.get(i) or 'unjudged' for i in ids}
+    n = len(ids)
+    noise = sum(1 for v in final.values() if v == 'noise')
+    dup = sum(1 for v in final.values() if v == 'dup')
+    unjudged = sum(1 for v in final.values() if v == 'unjudged')
+    judged_n = n - unjudged
+    scoped = [scope.get(i) for i in ids if scope.get(i) in ('match', 'mismatch')]
+    mismatch = sum(1 for v in scoped if v == 'mismatch')
+    nd = _ratio(noise + dup, judged_n)
+    nd_floor = _ratio(noise + dup, n)           # 판정 못 한 것을 모두 ok 로 볼 때(하한)
+    sm = _ratio(mismatch, len(scoped))
+    un = _ratio(unjudged, n)
+    ev = sb_vault._short(sample.get('path') or str(sample_path(sample.get('seed'))))
+    metrics = [
+        _metric('sample_n', n, '%d' % SAMPLE_N, True, 'seed=%s, %s' % (sample.get('seed'), ev)),
+        _metric('noise_dup_ratio', nd, '≤ %d%% (판정된 표본 기준)' % (NOISE_DUP_MAX * 100),
+                None if nd is None else nd <= NOISE_DUP_MAX, 'noise=%d dup=%d judged=%d' % (noise, dup, judged_n)),
+        _metric('scope_mismatch_ratio', sm, '≤ %d%%' % (SCOPE_MISMATCH_MAX * 100),
+                None if sm is None else sm <= SCOPE_MISMATCH_MAX,
+                'mismatch=%d / cwd 있는 표본 %d (resolve_scope_id use_git=False)' % (mismatch, len(scoped))),
+        _metric('unjudged_ratio', un, '≤ %d%%' % (UNJUDGED_MAX * 100), None if un is None else un <= UNJUDGED_MAX,
+                'unjudged=%d (제목·type 휴리스틱으로 판정 못 함)' % unjudged),
+    ]
+    if sm is not None and sm > SCOPE_MISMATCH_MAX:
+        return _result(3, 'stop', metrics, 'scope 불일치 %.1f%% — sb vault analyze 로 별칭·꼬리표를 확인하세요' % (sm * 100))
+    if nd_floor is not None and nd_floor > NOISE_DUP_MAX:
+        return _result(3, 'stop', metrics, '소음+중복 %.1f%% — 수집 제외·중복 정리 뒤 sb setup run --stage 3' % (nd_floor * 100))
+    if un is not None and un > UNJUDGED_MAX:
+        return _result(3, 'pending', metrics, '표본 %d건을 판정해 주세요: sb setup judge --stage 3 --judgments ID:ok|noise|dup,…'
+                       % unjudged)
+    if nd is not None and nd > NOISE_DUP_MAX:
+        return _result(3, 'stop', metrics, '소음+중복 %.1f%% — 수집 제외·중복 정리 뒤 sb setup run --stage 3' % (nd * 100))
+    return _result(3, 'pass', metrics)
+
+
+def _write_sample(sample: Dict[str, Any], path: Path) -> None:
+    body = {k: v for k, v in sample.items() if k != 'path'}
+    sb_vault._atomic_write(path, json.dumps(body, ensure_ascii=False, indent=1, sort_keys=True) + '\n', private=True)
+
+
+def stage3(seed: Optional[int] = None, n: int = SAMPLE_N, db: Optional[str] = None) -> Dict[str, Any]:
+    """claude-mem 관측 seed 고정 무작위 n건으로 소음·중복·scope 불일치를 잰다(DB 는 읽기 전용)."""
+    seed = DEFAULT_SEED if seed is None else seed
+    db = db or sb_config.claude_mem_db()
+    ev = sb_vault._short(str(db))
+    if not Path(db).is_file():
+        return _result(3, 'pass', [_metric('sample_n', 0, '%d 이상' % n, None, '데이터 부족: claude-mem.db 없음 (%s)' % ev)])
+    try:
+        with closing(sb_vault._ro(db)) as con:
+            ids = [r[0] for r in con.execute('SELECT id FROM observations ORDER BY id')]
+            if len(ids) < n:
+                return _result(3, 'pass', [_metric('sample_n', len(ids), '%d 이상' % n, None,
+                                                   '데이터 부족: 관측 %d건 < %d (%s)' % (len(ids), n, ev))])
+            picked = sorted(random.Random(seed).sample(ids, n))
+            scols = {r[1] for r in con.execute('PRAGMA table_info(sdk_sessions)')}
+            cwd_col = 'cwd' if 'cwd' in scols else 'NULL'
+            cwd_of: Dict[str, Optional[str]] = {}
+            aliases = sb_scope._load_aliases()
+            auto: Dict[str, str] = {}
+            scope: Dict[str, str] = {}
+            for oid in picked:
+                row = con.execute('SELECT memory_session_id, project, type, title FROM observations WHERE id=?',
+                                  (oid,)).fetchone()
+                sid, project, otype, title = row
+                key = _norm_title(title)
+                dup = False
+                if key:
+                    for other_id, other_title in con.execute(
+                            'SELECT id, title FROM observations WHERE memory_session_id=? AND id<>?', (sid, oid)):
+                        if _norm_title(other_title) == key:
+                            dup = True
+                            break
+                auto[str(oid)] = 'dup' if dup else heuristic(otype, title)
+                if sid not in cwd_of:
+                    r = con.execute('SELECT %s FROM sdk_sessions WHERE memory_session_id=?' % cwd_col, (sid,)).fetchone()
+                    cwd_of[sid] = r[0] if r else None
+                cwd = cwd_of[sid]
+                if not cwd:
+                    scope[str(oid)] = 'no_cwd'
+                else:
+                    sc, _, _ = sb_scope.resolve_scope_id(cwd, aliases=aliases, use_git=False)
+                    scope[str(oid)] = 'match' if scope_match(sc, project or '') else 'mismatch'
+    except sqlite3.Error as e:
+        return _result(3, 'stop', [_metric('db_read', type(e).__name__, '읽기 성공', False, str(e)[:200])],
+                       'claude-mem.db 를 읽지 못했습니다 — sb health 로 확인하세요')
+    path = sample_path(seed)
+    prev = sb_vault.read_json_file(path) if path.exists() else None
+    keep = {}
+    if isinstance(prev, dict) and isinstance(prev.get('judged'), dict):   # 같은 표본에 준 사람 판정은 다시 돌려도 남긴다
+        keep = {k: v for k, v in prev['judged'].items() if k in auto and v in JUDGE_VALUES}
+    sample = {'seed': seed, 'n': n, 'ids': [str(i) for i in picked], 'auto': auto, 'judged': keep, 'scope': scope,
+              'db': ev}
+    _write_sample(sample, path)
+    sample['path'] = str(path)
+    return evaluate(sample)
+
+
+def judge(sample_path_: str, judgments: Dict[str, str]) -> Dict[str, Any]:
+    """사람·에이전트 판정(id → ok|noise|dup)을 표본 파일에 합치고 판정을 다시 계산한다."""
+    p = Path(sample_path_)
+    sample = sb_vault.read_json_file(p)
+    if not isinstance(sample, dict) or not isinstance(sample.get('ids'), list):
+        raise ValueError('표본 파일을 읽을 수 없습니다: %s' % sb_vault._short(str(p)))
+    ids = {str(i) for i in sample['ids']}
+    clean: Dict[str, str] = {}
+    for k, v in (judgments or {}).items():
+        k, v = str(k).strip(), str(v).strip().lower()
+        if k not in ids:
+            raise ValueError('표본에 없는 id: %s' % k)
+        if v not in JUDGE_VALUES:
+            raise ValueError('판정 값은 ok|noise|dup 중 하나: %s=%s' % (k, v))
+        clean[k] = v
+    judged = dict(sample.get('judged') or {})
+    judged.update(clean)
+    sample['judged'] = judged
+    _write_sample(sample, p)
+    sample['path'] = str(p)
+    return evaluate(sample)
+
+
+# ---------------------------------------------------------------- CLI
+
+def _add(location: str, kind: Optional[str]) -> Dict[str, Any]:
+    src = register(location, kind)
+    cls = classify(src)
+    src['intake'] = cls.pop('intake')
+    src['classification'] = cls
+    doc = load()
+    doc['sources'] = [s for s in doc['sources'] if s.get('id') != src['id']] + [src]
+    save(doc)
+    return src
+
+
+def _render(sources: List[Dict[str, Any]]) -> str:
+    if not sources:
+        return '등록된 자료가 없습니다(기본 볼트로 진행합니다)'
+    lines = []
+    for s in sources:
+        sm = s.get('summary') or {}
+        extra = ''
+        if s['kind'] in SESSION_KINDS:
+            extra = '파일 %s · 작업 폴더 %s · 기간 %s~%s' % (sm.get('files'), sm.get('cwd_count'), *(sm.get('period') or [None, None]))
+        elif s.get('mode') != 'live':
+            c = s.get('classification') or {}
+            extra = '파일 %s · 넣을 것 %s · 민감 %s · 잡동사니 %s · 모름 %s' % (
+                sm.get('files'), c.get('own_output'), c.get('sensitive'), c.get('junk'), c.get('unknown'))
+        lines.append('%-16s %-6s %s  %s' % (s['kind'], s.get('mode'), s['location'], extra))
+    return '\n'.join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:  # noqa: BLE001
+        pass
+    ap = argparse.ArgumentParser(prog='sb sources', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    d = sub.add_parser('detect')
+    d.add_argument('--json', action='store_true')
+    a = sub.add_parser('add')
+    a.add_argument('location')
+    a.add_argument('--kind', choices=('folder', 'meeting', 'link'))
+    a.add_argument('--json', action='store_true')
+    ls = sub.add_parser('list')
+    ls.add_argument('--json', action='store_true')
+    args = ap.parse_args(argv)
+    if args.cmd == 'detect':
+        out = detect_sessions()
+    elif args.cmd == 'add':
+        try:
+            out = [_add(args.location, args.kind)]
+        except ValueError as e:
+            sys.stderr.write('%s\n' % e)
+            return 2
+    else:
+        out = load()['sources']
+    print(json.dumps(out, ensure_ascii=False, indent=1) if args.json else _render(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
