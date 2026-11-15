@@ -10,11 +10,20 @@
 from_text(txt·md, front-matter 또는 같은 이름의 .meta.json).
 
 민감도 게이트: sensitivity 가 'public' 일 때만 색인한다. 없음·빈 값·그 밖의 값은 private 으로 보고 거부한다.
+민감도는 front-matter·사이드카·인자·중복 키가 말한 값 중 가장 엄격한 것을 쓴다(모두 public 일 때만 public).
 색인: 전사를 겹침 없이 500자씩 자르고 형태소(sb_fts_ko.tokenize_ko)로 FTS5 에 넣는다(index/meeting_fts.sqlite).
-원문은 색인 밖(소스 파일)에 두고 위치·sha256 만 기록한다. 검색 때 소스를 다시 읽어 구간을 잘라 돌려주며,
-소스가 바뀌었거나(sha 불일치) public 이 아니게 됐으면 그 회의를 결과에서 뺀다.
+
+색인 파일에 남는 것(전사 글자는 없다):
+- meetings: 회의 id·제목·날짜·참석자 수·소스 위치·sha256. 요약은 저장하지 않고 카드를 붙일 때 소스에서 읽는다.
+- chunks: 구간 위치(offset·length)·sha256.
+- chunk_fts: 구간 형태소를 색인별 키로 해시한 토큰(blake2b 64비트, 정렬해 어순 없음). 이메일·7자리 이상
+  숫자열(전화·계좌 꼴)은 토큰에서 뺀다. 해시는 사전 대입으로 흔한 낱말을 되돌릴 수 있으니 암호화가 아니다.
+- 지운 회의의 페이지는 secure_delete 로 덮어쓴다.
+검색 때 소스를 다시 읽어 구간을 잘라 돌려주며, 소스가 바뀌었거나(sha 불일치) public 이 아니게 됐으면 그 회의를 뺀다.
 벡터(선택): Ollama bge-m3-ko 가 응답하고 numpy 가 있고 디스크 여유가 5GB 이상일 때만
-index/meeting_vec.npy + meeting_vec_ids.json 을 만든다. 검색 때 벡터가 있으면 FTS 와 RRF 로 합친다.
+index/meeting_vec.npy + meeting_vec_ids.json 을 만든다. 벡터는 원문에서 나온 데이터다(원문 복원은 어렵지만
+내용 추정은 가능). 벡터를 못 만들면 옛 벡터 파일을 지운다. 검색 때 벡터가 있으면 벡터 순위를 쓰고
+(FTS 는 벡터가 못 채운 자리만), 없으면 FTS 순위를 쓴다. --fusion rrf 로 RRF 결합을 고를 수 있다.
 카드(회의 이름·날짜·요약)는 질문에 회의 이름이나 날짜가 나올 때만 붙인다.
 
 표준 라이브러리 + (있으면) numpy·kiwipiepy. 파이썬 3.9 호환.
@@ -42,7 +51,7 @@ import sb_fts_ko  # noqa: E402
 import sb_lock  # noqa: E402
 
 CHUNK_CHARS = 500
-SCHEMA = 'sb-meeting-1'
+SCHEMA = 'sb-meeting-2'
 FTS_NAME = 'meeting_fts.sqlite'
 VEC_NAME = 'meeting_vec.npy'
 VEC_IDS_NAME = 'meeting_vec_ids.json'
@@ -83,13 +92,46 @@ def _sensitivity(value: Any) -> Optional[str]:
     return text or None
 
 
-def _doc(meta: Dict[str, Any], text: str, source: str, fallback_id: str) -> Dict[str, Any]:
+class MetaError(ValueError):
+    """메타를 믿을 수 없어 문서를 거부한다. reason 은 거부 이유 집계 이름."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _sens_values(meta: Dict[str, Any]) -> List[Any]:
+    """키 이름 대소문자와 상관없이 sensitivity 값을 모두 모은다."""
+    return [v for k, v in meta.items() if str(k).strip().lower() == 'sensitivity']
+
+
+def strictest_sensitivity(values: List[Any]) -> Optional[str]:
+    """여러 곳(front-matter·사이드카·인자·중복 키)이 말한 민감도 중 가장 엄격한 것.
+
+    하나도 없거나 하나라도 빈 값·null 이면 None(거부). 모두 public 일 때만 public.
+    public 이 아닌 값이 섞이면 private 이 있으면 private, 없으면 처음 나온 그 값.
+    """
+    if not values:
+        return None
+    norm = [_sensitivity(v) for v in values]
+    if any(v is None for v in norm):
+        return None
+    others = [v for v in norm if v != 'public']
+    if not others:
+        return 'public'
+    return 'private' if 'private' in others else others[0]
+
+
+def _doc(meta: Dict[str, Any], text: str, source: str, fallback_id: str,
+         sens_values: Optional[List[Any]] = None) -> Dict[str, Any]:
+    if sens_values is None:
+        sens_values = _sens_values(meta)
     return {
         'id': str(meta.get('id') or meta.get('meeting_id') or meta.get('id8') or fallback_id).strip(),
         'title': str(meta.get('title') or '').strip(),
         'date': _date10(meta.get('date') or meta.get('created_at')),
         'participants_count': _count(meta.get('participants_count', meta.get('participants'))),
-        'sensitivity': _sensitivity(meta.get('sensitivity')),
+        'sensitivity': strictest_sensitivity(sens_values),
         'source': source,
         'text': text or '',
         'summary': str(meta.get('summary') or '').strip(),
@@ -102,7 +144,7 @@ def from_meetnote_json(path) -> Dict[str, Any]:
     11-04 시험 사본 꼴(date, text)도 받는다. sensitivity 필드가 없으면 None.
     """
     path = Path(path)
-    data = json.loads(path.read_text(encoding='utf-8'))
+    data = json.loads(path.read_text(encoding='utf-8-sig'))
     if not isinstance(data, dict):
         raise ValueError('meetnote json must be an object')
     text = data.get('transcription_text')
@@ -111,56 +153,108 @@ def from_meetnote_json(path) -> Dict[str, Any]:
     return _doc(data, str(text or ''), 'meetnote', path.stem)
 
 
-def _parse_kv_lines(text: str) -> Dict[str, str]:
-    out = {}
+def _parse_kv_lines(text: str) -> Tuple[Dict[str, str], List[str]]:
+    """meta.md 머리의 `- key: value` 묶음만 읽는다(키는 소문자, 같은 키는 앞의 값).
+
+    맨 앞의 빈 줄·제목(#) 줄을 건너뛴 뒤 이어지는 글머리표 묶음까지만 보고, 다른 줄(다음 제목·본문)이
+    나오면 멈춘다. 본문 글머리표의 `- sensitivity: ...` 는 메타가 아니다. 민감도 값은 모두 따로 돌려준다.
+    """
+    out: Dict[str, str] = {}
+    sens: List[str] = []
+    started = False
     for line in text.splitlines():
+        if not line.strip():
+            continue
         m = re.match(r'^\s*-\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$', line)
-        if m and m.group(1) not in out:
-            out[m.group(1)] = m.group(2)
-    return out
+        if m:
+            started = True
+            key = m.group(1).lower()
+            if key == 'sensitivity':
+                sens.append(m.group(2))
+            out.setdefault(key, m.group(2))
+            continue
+        if not started and line.lstrip().startswith('#'):
+            continue
+        break
+    return out, sens
 
 
 def from_corpus_dir(path) -> Dict[str, Any]:
     """회의 폴더 하나: transcript.txt + meta.md(`- key: value` 줄)."""
     path = Path(path)
-    text = (path / 'transcript.txt').read_text(encoding='utf-8')
+    text = (path / 'transcript.txt').read_text(encoding='utf-8-sig')
     meta_path = path / 'meta.md'
-    meta = _parse_kv_lines(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
-    return _doc(meta, text, 'corpus', path.name)
+    if meta_path.exists():
+        meta, sens = _parse_kv_lines(meta_path.read_text(encoding='utf-8-sig'))
+    else:
+        meta, sens = {}, []
+    return _doc(meta, text, 'corpus', path.name, sens)
 
 
-def _sidecar(path: Path) -> Optional[Path]:
-    for cand in (path.with_suffix('.meta.json'), path.with_name(path.name + '.meta.json')):
-        if cand.is_file():
-            return cand
-    return None
+TEXT_SUFFIXES = ('.txt', '.md')
 
 
-def _front_matter(raw: str) -> Tuple[Dict[str, str], str]:
+def _sidecars(path: Path) -> List[Path]:
+    """이 파일에 붙는 사이드카 중 있는 것 [정확한 이름(a.md.meta.json), 줄기 이름(a.meta.json)].
+
+    줄기 이름 사이드카는 같은 폴더에 줄기가 같은 다른 txt·md 가 있으면 어느 파일 것인지 알 수 없어
+    MetaError('ambiguous_meta') 로 거부한다.
+    """
+    out = []
+    exact = path.with_name(path.name + '.meta.json')
+    if exact.is_file():
+        out.append(exact)
+    stem = path.with_suffix('.meta.json')
+    if stem.is_file():
+        lower = path.stem.lower()
+        siblings = [c for c in path.parent.iterdir()
+                    if c.name != path.name and c.suffix.lower() in TEXT_SUFFIXES and c.stem.lower() == lower]
+        if siblings:
+            raise MetaError('ambiguous_meta')
+        out.append(stem)
+    return out
+
+
+def _load_json_meta(path: Path) -> Dict[str, Any]:
+    loaded = json.loads(path.read_text(encoding='utf-8-sig'))
+    if not isinstance(loaded, dict):
+        raise MetaError('invalid_meta')
+    return loaded
+
+
+def _front_matter(raw: str) -> Tuple[Dict[str, str], List[str], str]:
+    """머리 front-matter(키는 소문자, 같은 키는 앞의 값), 민감도 값 전부, 본문."""
     m = re.match(r'^﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)', raw, re.S)
     if not m:
-        return {}, raw
-    meta = {}
+        return {}, [], raw
+    meta: Dict[str, str] = {}
+    sens: List[str] = []
     for line in m.group(1).splitlines():
         kv = re.match(r'^\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$', line)
         if kv:
-            meta[kv.group(1)] = kv.group(2).strip('"\'')
-    return meta, raw[m.end():]
+            key, value = kv.group(1).lower(), kv.group(2).strip('"\'')
+            if key == 'sensitivity':
+                sens.append(value)
+            meta.setdefault(key, value)
+    return meta, sens, raw[m.end():]
 
 
 def from_text(path, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """일반 txt·md. 메타 우선순위: 인자 meta > 같은 이름의 .meta.json > 머리 front-matter."""
+    """일반 txt·md. 메타 필드 우선순위: 인자 meta > 정확한 이름 사이드카 > 줄기 이름 사이드카 > front-matter.
+
+    민감도만은 우선순위가 아니라 모든 곳의 값 중 가장 엄격한 것을 쓴다(strictest_sensitivity).
+    """
     path = Path(path)
-    head, body = _front_matter(path.read_text(encoding='utf-8'))
+    head, sens, body = _front_matter(path.read_text(encoding='utf-8-sig'))
     merged: Dict[str, Any] = dict(head)
-    side = _sidecar(path)
-    if side is not None:
-        loaded = json.loads(side.read_text(encoding='utf-8'))
-        if isinstance(loaded, dict):
-            merged.update(loaded)
+    sides = [_load_json_meta(side) for side in _sidecars(path)]
+    for loaded in reversed(sides):
+        merged.update(loaded)
+        sens.extend(_sens_values(loaded))
     if meta:
         merged.update(meta)
-    return _doc(merged, body, 'text', path.stem)
+        sens.extend(_sens_values(meta))
+    return _doc(merged, body, 'text', path.stem, sens)
 
 
 def load_doc(kind: str, path, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -235,19 +329,72 @@ def _paths(index_dir) -> Dict[str, Path]:
             'lock': base / 'meeting_index.lock'}
 
 
+def _connect(path: Path, mode: str) -> sqlite3.Connection:
+    return sqlite3.connect(path.resolve().as_uri() + '?mode=' + mode, uri=True)
+
+
+def _schema_of(path: Path) -> Optional[str]:
+    try:
+        with closing(_connect(path, 'ro')) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+OLD_SCHEMAS = ('sb-meeting-1',)
+
+
 def _open(path: Path, create: bool) -> sqlite3.Connection:
-    conn = sqlite3.connect(path.resolve().as_uri() + ('?mode=rwc' if create else '?mode=ro'), uri=True)
+    if create and path.exists():
+        found = _schema_of(path)
+        if found in OLD_SCHEMAS:
+            # 옛 꼴(형태소 평문·요약 저장)은 파생 색인이라 지우고 새로 만든다(원문은 소스에 있다).
+            for leftover in (path, path.with_name(path.name + '-wal'), path.with_name(path.name + '-shm'),
+                             path.with_name(path.name + '-journal')):
+                if leftover.exists():
+                    leftover.unlink()
+        elif found != SCHEMA:
+            raise ValueError('not a %s index: %s' % (SCHEMA, path))
+    conn = _connect(path, 'rwc' if create else 'ro')
     if create:
+        # 지운 회의의 페이지를 0 으로 덮어 파일에 남지 않게 한다.
+        conn.execute('PRAGMA secure_delete = ON')
         with conn:
             conn.execute('CREATE TABLE IF NOT EXISTS meetings (meeting_id TEXT PRIMARY KEY, title TEXT, date TEXT,'
                          ' participants_count INTEGER, source TEXT, source_kind TEXT, source_path TEXT,'
-                         ' source_root TEXT, meta_override TEXT, text_sha TEXT, summary TEXT, chunks INTEGER,'
+                         ' source_root TEXT, meta_override TEXT, text_sha TEXT, chunks INTEGER,'
                          ' indexed_at INTEGER)')
             conn.execute('CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, meeting_id TEXT, seq INTEGER,'
                          ' offset INTEGER, length INTEGER, chunk_sha TEXT, UNIQUE(meeting_id, seq))')
             conn.execute('CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(body)')
             conn.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
+            conn.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (SCHEMA,))
+            conn.execute("INSERT OR IGNORE INTO meta VALUES ('token_key', ?)", (os.urandom(16).hex(),))
     return conn
+
+
+# 이메일, 7자리 이상 숫자열(전화·계좌·주민번호 꼴, 숫자 사이 공백·점·하이픈 허용)은 색인 토큰에서 뺀다.
+_PII_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*'
+                     r'|(?<![0-9])[0-9](?:[ .\-]?[0-9]){6,}(?![0-9])')
+
+
+def _token_key(conn: sqlite3.Connection) -> bytes:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'token_key'").fetchone()
+    return bytes.fromhex(row[0]) if row else b''
+
+
+def hash_tokens(tokens: Iterable[str], key: bytes) -> List[str]:
+    """형태소 토큰을 색인별 키로 해시한다(blake2b 64비트). FTS 파일에 형태소가 평문으로 남지 않는다."""
+    return ['h' + hashlib.blake2b(t.encode('utf-8'), key=key, digest_size=8).hexdigest() for t in tokens]
+
+
+def index_body(text: str, key: bytes) -> str:
+    """FTS 에 넣는 본문: 개인정보 꼴을 지운 글의 해시 토큰을 정렬한 묶음.
+
+    정렬해 어순을 버려도 단일 토큰 OR 질의와 bm25(토큰 빈도·구간 길이)는 그대로다.
+    """
+    return ' '.join(sorted(hash_tokens(sb_fts_ko.tokenize_ko(_PII_RE.sub(' ', text)), key)))
 
 
 def _delete_meeting(conn: sqlite3.Connection, meeting_id: str) -> None:
@@ -358,12 +505,23 @@ def _build_vectors(conn: sqlite3.Connection, paths: Dict[str, Path], texts: Dict
 
 # ---------------------------------------------------------------- 색인
 
+def _same_path(a: str, b: str) -> bool:
+    """같은 파일·폴더인가. 대소문자를 가리지 않는 파일 시스템에서 대소문자만 다른 경로도 같다."""
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def index(sources: Iterable, index_dir=None, no_vector: bool = False,
           embed: Optional[Callable[[List[str]], List[List[float]]]] = None,
           text_meta: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """소스마다 그 소스에서 온 회의를 통째로 다시 만든다(다른 소스의 회의는 그대로).
 
-    거부된 회의는 이전에 색인됐더라도 지운다. text_meta: {txt 경로: meta} (from_text 의 meta 인자).
+    거부된 회의는 이전에 색인됐더라도 지운다(같은 소스 파일에서 온 것만). 다른 소스가 이미 쓰는 회의 id 는
+    덮어쓰지 않고 id_conflict 로 거부한다. text_meta: {txt 경로: meta} (from_text 의 meta 인자).
     """
     start = time.monotonic()
     paths = _paths(index_dir)
@@ -372,7 +530,7 @@ def index(sources: Iterable, index_dir=None, no_vector: bool = False,
     rejected: Dict[str, int] = {}
     seen = 0
     accepted: List[Tuple[Dict[str, Any], str, Path, Path, Optional[Dict[str, Any]]]] = []
-    reject_ids: List[str] = []
+    reject_ids: List[Tuple[str, str]] = []
     roots: List[str] = []
     for source in sources:
         root = Path(source).expanduser().resolve()
@@ -382,6 +540,9 @@ def index(sources: Iterable, index_dir=None, no_vector: bool = False,
             meta = text_meta.get(str(path.resolve())) if kind == 'text' else None
             try:
                 doc = load_doc(kind, path, meta)
+            except MetaError as exc:
+                rejected[exc.reason] = rejected.get(exc.reason, 0) + 1
+                continue
             except (OSError, ValueError, UnicodeDecodeError):
                 rejected['unreadable'] = rejected.get('unreadable', 0) + 1
                 continue
@@ -391,7 +552,7 @@ def index(sources: Iterable, index_dir=None, no_vector: bool = False,
             if reason:
                 rejected[reason] = rejected.get(reason, 0) + 1
                 if doc.get('id'):
-                    reject_ids.append(doc['id'])
+                    reject_ids.append((doc['id'], str(path.resolve())))
                 continue
             accepted.append((doc, kind, path.resolve(), root, meta))
     texts: Dict[int, str] = {}
@@ -400,27 +561,40 @@ def index(sources: Iterable, index_dir=None, no_vector: bool = False,
         sb_lock.lock_with_timeout(lock, sb_lock.LOCK_EX, 30.0)
         with closing(_open(paths['fts'], True)) as conn:
             with conn:
+                stored_roots = {r[0] for r in conn.execute('SELECT DISTINCT source_root FROM meetings')}
                 for root in roots:
-                    for (mid,) in list(conn.execute('SELECT meeting_id FROM meetings WHERE source_root = ?', (root,))):
+                    for old_root in [r for r in stored_roots if _same_path(r, root)]:
+                        for (mid,) in list(conn.execute('SELECT meeting_id FROM meetings WHERE source_root = ?',
+                                                        (old_root,))):
+                            _delete_meeting(conn, mid)
+                for mid, rpath in reject_ids:
+                    row = conn.execute('SELECT source_path FROM meetings WHERE meeting_id = ?', (mid,)).fetchone()
+                    if row is not None and _same_path(row[0], rpath):
                         _delete_meeting(conn, mid)
-                for mid in reject_ids:
-                    _delete_meeting(conn, mid)
+                key = _token_key(conn)
+                indexed = 0
                 for doc, kind, path, root, meta in accepted:
+                    owner = conn.execute('SELECT source_path FROM meetings WHERE meeting_id = ?',
+                                         (doc['id'],)).fetchone()
+                    if owner is not None and not _same_path(owner[0], str(path)):
+                        rejected['id_conflict'] = rejected.get('id_conflict', 0) + 1
+                        continue
                     _delete_meeting(conn, doc['id'])
+                    indexed += 1
                     pieces = chunk_text(doc['text'])
-                    conn.execute('INSERT INTO meetings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', (
+                    conn.execute('INSERT INTO meetings VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', (
                         doc['id'], doc['title'], doc['date'], doc['participants_count'], doc['source'], kind,
                         str(path), str(root), json.dumps(meta, ensure_ascii=False) if meta else None,
-                        _sha(doc['text']), doc['summary'][:CARD_SUMMARY_CHARS], len(pieces), int(time.time())))
+                        _sha(doc['text']), len(pieces), int(time.time())))
                     for seq, (offset, piece) in enumerate(pieces):
                         cur = conn.execute('INSERT INTO chunks(meeting_id, seq, offset, length, chunk_sha)'
                                            ' VALUES (?,?,?,?,?)', (doc['id'], seq, offset, len(piece), _sha(piece)))
                         conn.execute('INSERT INTO chunk_fts(rowid, body) VALUES (?, ?)',
-                                     (cur.lastrowid, ' '.join(sb_fts_ko.tokenize_ko(piece))))
+                                     (cur.lastrowid, index_body(piece, key)))
                         texts[cur.lastrowid] = piece
                     chunks_total += len(pieces)
                 build_id = '%d-%s' % (time.time_ns(), _sha(json.dumps(roots))[:8])
-                last = {'seen': seen, 'indexed': len(accepted), 'chunks': chunks_total, 'rejected': rejected}
+                last = {'seen': seen, 'indexed': indexed, 'chunks': chunks_total, 'rejected': rejected}
                 conn.executemany('INSERT OR REPLACE INTO meta VALUES (?, ?)', [
                     ('schema', SCHEMA), ('tokenizer', sb_fts_ko._tokenizer()), ('chunk_chars', str(CHUNK_CHARS)),
                     ('build_id', build_id), ('last_build', str(int(time.time()))),
@@ -436,8 +610,12 @@ def index(sources: Iterable, index_dir=None, no_vector: bool = False,
                     vector = {'built': True, 'skipped': None, **info}
                 except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
                     vector = {'built': False, 'skipped': 'embed_failed: %s' % type(exc).__name__}
-            # 벡터를 못 만들면 옛 meeting_vec 은 build_id 가 어긋나 검색이 쓰지 않는다.
-    return {'seen': seen, 'indexed': len(accepted), 'chunks': chunks_total, 'rejected': rejected,
+            if not vector['built']:
+                # 옛 벡터는 지금 색인과 맞지 않고(지운 회의의 구간도 들어 있을 수 있다) 검색도 쓰지 않으니 지운다.
+                for name in ('vec', 'ids'):
+                    if paths[name].exists():
+                        paths[name].unlink()
+    return {'seen': seen, 'indexed': indexed, 'chunks': chunks_total, 'rejected': rejected,
             'vector': vector, 'index': str(paths['fts']), 'took_ms': round((time.monotonic() - start) * 1000)}
 
 
@@ -488,10 +666,10 @@ def _chunk_texts(conn: sqlite3.Connection, chunk_ids: List[int], docs: Dict[str,
 
 
 def _fts_rank(conn: sqlite3.Connection, query: str, limit: int) -> List[int]:
-    tokens = sb_fts_ko.ko_query_tokens(query)
+    tokens = list(dict.fromkeys(hash_tokens(sb_fts_ko.ko_query_tokens(query), _token_key(conn))))
     if not tokens:
         return []
-    match = ' OR '.join('"' + t.replace('"', '""') + '"' for t in tokens)
+    match = ' OR '.join('"' + t + '"' for t in tokens)
     return [r[0] for r in conn.execute('SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ?'
                                        ' ORDER BY bm25(chunk_fts), rowid LIMIT ?', (match, limit))]
 
@@ -563,9 +741,19 @@ def card_matches(query: str, title: str, date: str) -> bool:
     return False
 
 
+FUSIONS = ('vector', 'rrf')
+
+
 def search(query: str, k: int = 3, index_dir=None, no_vector: bool = False,
-           embed: Optional[Callable[[List[str]], List[List[float]]]] = None) -> Dict[str, Any]:
-    """상위 구간 k개 + 각 구간의 앞뒤 구간. 벡터가 있으면 FTS 와 RRF 로 합친다."""
+           embed: Optional[Callable[[List[str]], List[List[float]]]] = None,
+           fusion: str = 'vector') -> Dict[str, Any]:
+    """상위 구간 k개 + 각 구간의 앞뒤 구간.
+
+    fusion='vector'(기본): 벡터가 있으면 벡터 순위를 쓰고 FTS 순위는 그 뒤에 잇는다(벡터가 못 채운 자리만).
+    벡터가 없으면 FTS 순위. fusion='rrf': 벡터와 FTS 를 RRF 로 합친다(파일럿에서 벡터 단독보다 낮아 실험용).
+    """
+    if fusion not in FUSIONS:
+        raise ValueError('unknown fusion: %s' % fusion)
     paths = _paths(index_dir)
     empty = {'query_mode': 'none', 'hits': [], 'cards': [], 'dropped_meetings': 0}
     if k <= 0 or not paths['fts'].exists():
@@ -574,8 +762,13 @@ def search(query: str, k: int = 3, index_dir=None, no_vector: bool = False,
         pool = max(k * 10, 50)
         fts = _fts_rank(conn, query, pool)
         vec = None if no_vector else _vec_rank(conn, paths, query, pool, embed)
-        order = rrf([fts, vec]) if vec else fts
-        mode = 'fts+vector' if vec else 'fts'
+        if not vec:
+            order, mode = fts, 'fts'
+        elif fusion == 'rrf':
+            order, mode = rrf([fts, vec]), 'fts+vector'
+        else:
+            seen_ids = set(vec)
+            order, mode = vec + [c for c in fts if c not in seen_ids], 'vector'
         docs: Dict[str, Optional[Dict[str, Any]]] = {}
         hits = []
         for cid in order:
@@ -596,10 +789,15 @@ def search(query: str, k: int = 3, index_dir=None, no_vector: bool = False,
             hits.append({'meeting_id': mid, 'date': date, 'title': title, 'seq': seq, 'seqs': seqs,
                          'text': ''.join(texts[i] for i in ids)})
         cards = []
-        for mid, title, date, summary in conn.execute(
-                'SELECT meeting_id, title, date, summary FROM meetings ORDER BY date, meeting_id').fetchall():
-            if card_matches(query, title, date) and _doc_for(conn, mid, docs) is not None:
-                cards.append({'meeting_id': mid, 'title': title, 'date': date, 'summary': summary or ''})
+        for mid, title, date in conn.execute(
+                'SELECT meeting_id, title, date FROM meetings ORDER BY date, meeting_id').fetchall():
+            if not card_matches(query, title, date):
+                continue
+            doc = _doc_for(conn, mid, docs)
+            if doc is not None:
+                # 요약은 색인에 두지 않고 소스에서 읽는다.
+                cards.append({'meeting_id': mid, 'title': title, 'date': date,
+                              'summary': doc['summary'][:CARD_SUMMARY_CHARS]})
         dropped = sum(1 for v in docs.values() if v is None)
     return {'query_mode': mode, 'hits': hits, 'cards': cards, 'dropped_meetings': dropped}
 
@@ -644,6 +842,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_search.add_argument('--k', type=int, default=3)
     p_search.add_argument('--index-dir')
     p_search.add_argument('--no-vector', action='store_true')
+    p_search.add_argument('--fusion', choices=FUSIONS, default='vector',
+                          help='벡터가 있을 때 순위 결합(기본 vector: 벡터 우선, rrf: FTS 와 RRF)')
     p_status = sub.add_parser('status', help='색인 상태(읽기 전용)')
     p_status.add_argument('--index-dir')
     args = parser.parse_args(argv)
@@ -651,7 +851,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == 'index':
             result = index(args.source, args.index_dir, no_vector=args.no_vector)
         elif args.command == 'search':
-            result = search(args.query, args.k, args.index_dir, no_vector=args.no_vector)
+            result = search(args.query, args.k, args.index_dir, no_vector=args.no_vector, fusion=args.fusion)
         else:
             result = status(args.index_dir)
     except (sqlite3.Error, OSError, ValueError, TimeoutError) as error:
