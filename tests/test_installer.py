@@ -257,13 +257,13 @@ class EmbedModelTest(unittest.TestCase):
 
 
 class ChromaPinTest(unittest.TestCase):
-    def _with_fixture(self, version):
-        """플러그인 캐시를 tests/fixtures/claude-mem/<version>.cjs 조각으로 흉내 낸다."""
+    def _with_fixture(self, version, source=None):
+        """플러그인 캐시를 tests/fixtures/claude-mem/<source or version>.cjs 조각으로 흉내 낸다."""
         tmp = Path(tempfile.mkdtemp())
         root = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / version / 'scripts'
         root.mkdir(parents=True)
         (root / 'worker-service.cjs').write_text(
-            (Path(__file__).parent / 'fixtures' / 'claude-mem' / (version + '.cjs')).read_text(encoding='utf-8'), encoding='utf-8')
+            (Path(__file__).parent / 'fixtures' / 'claude-mem' / ((source or version) + '.cjs')).read_text(encoding='utf-8'), encoding='utf-8')
         return mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)})
 
     def test_chroma_uvx_pins_pydantic(self):
@@ -290,7 +290,7 @@ class ChromaPinTest(unittest.TestCase):
 
     def test_pinned_tool_is_superset_of_worker_args(self):
         # uvx 는 도구가 워커의 --python·모든 --with 를 만족할 때만 재사용한다(2026-11-15 격리 실측)
-        for version in ('13.24.23', '13.34.2', '13.39.0'):
+        for version in ('13.24.23', '13.34.2', '13.39.0', '15.18.3'):
             with self._with_fixture(version):
                 args, ok = inst.chroma_uvx_args(settings={})
                 withs, ver, parsed = inst.sb_claude_mem.worker_chroma_spec()
@@ -372,8 +372,8 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(level, '⚠')
         self.assertIn('워커 인자', detail)
 
-    def _doctor_version(self, version, venv_chromadb):
-        with self._with_fixture(version), \
+    def _doctor_version(self, version, venv_chromadb, source=None):
+        with self._with_fixture(version, source), \
                 mock.patch.object(doctor, 'rows', []) as rows, \
                 mock.patch.object(doctor, 'venv_chromadb', return_value=venv_chromadb):
             doctor.check_claude_mem_version()
@@ -385,7 +385,7 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(r['chromadb 판 일치'][0], '✅')
 
     def test_doctor_version_out_of_range_warns_only(self):
-        r = self._doctor_version('13.39.0', '1.5.9')
+        r = self._doctor_version('15.19.0', '1.5.9', source='15.18.3')   # 상한 바로 위 판
         self.assertEqual(r['claude-mem 버전'][0], '⚠')
         self.assertNotIn('❌', [lv for lv, _ in r.values()])
 

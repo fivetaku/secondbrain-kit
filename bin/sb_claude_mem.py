@@ -24,10 +24,11 @@ from typing import List, Optional, Tuple
 
 # 설치기가 새로 깔 때 쓰는 권장판(오너 맥 실가동판). 바꾸면 TESTED·tests/fixtures/claude-mem 도 함께 본다.
 RECOMMENDED = '13.34.2'
-# 키트와 함께 돌려 본 범위(양끝 포함) — 13.24.23 은 예전 설치기 기본판, 13.34.2 는 오너 맥 실가동판.
+# 키트와 함께 돌려 본 범위(양끝 포함) — 13.24.23 은 예전 설치기 기본판, 13.34.2 는 오너 맥 실가동판,
+# 15.18.3 은 Windows 11 실가동판(2026-11-16: chroma-mcp 기동·워커 restart·기동 직후 backfill·sb recall/timeline/health 확인).
 # 밖이면 doctor·sb health 가 경고만 한다(차단 없음). 워커 인자 파서 자체는 13.24.23~15.18.3 의 npm 패키지 21개에서
-# 같은 구조로 읽혔다(2026-11-15) — 그래도 키트의 DB 읽기·재시작 경로는 이 범위에서만 확인했다.
-TESTED = ('13.24.23', '13.34.2')
+# 같은 구조로 읽혔다(2026-11-15).
+TESTED = ('13.24.23', '15.18.3')
 PYDANTIC_PIN = 'pydantic<2.14'
 # 파싱 실패 시 기본값 = 권장판의 워커 인자
 FALLBACK_WITH = ['onnxruntime>=1.20', 'protobuf<7', 'chromadb==1.5.9']

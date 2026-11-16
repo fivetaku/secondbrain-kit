@@ -147,11 +147,11 @@ class HealthTests(unittest.TestCase):
 
     def test_claude_mem_version_out_of_range_is_warning_only(self) -> None:
         import sb_claude_mem
-        with patch.object(sb_claude_mem, 'installed_version', return_value='13.39.0'):
+        with patch.object(sb_claude_mem, 'installed_version', return_value='15.19.0'):
             r = sb_health.check_claude_mem_version()
         self.assertFalse(r['ok'])
         self.assertIsNone(r['fix'])   # 고치기 없음 — 경고만
-        self.assertIn('13.39.0', sb_health.warning_line({'claude-mem-version': r}))
+        self.assertIn('15.19.0', sb_health.warning_line({'claude-mem-version': r}))
         with patch.object(sb_claude_mem, 'installed_version', return_value=sb_claude_mem.RECOMMENDED):
             self.assertTrue(sb_health.check_claude_mem_version()['ok'])
         with patch.object(sb_claude_mem, 'installed_version', return_value=None):

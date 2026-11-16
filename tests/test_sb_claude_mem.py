@@ -18,6 +18,7 @@ EXPECTED = {
     '13.24.23': ['onnxruntime>=1.20', 'protobuf<7'],
     '13.34.2': ['onnxruntime>=1.20', 'protobuf<7', 'chromadb==1.5.9'],
     '13.39.0': ['onnxruntime>=1.20', 'protobuf<7', 'chromadb==1.5.9', 'pydantic<2.14'],
+    '15.18.3': ['onnxruntime>=1.20', 'protobuf<7', 'chromadb==1.5.9', 'pydantic<2.14'],
 }
 
 
@@ -93,7 +94,8 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(cm.in_tested(cm.RECOMMENDED))
         self.assertTrue(cm.in_tested(cm.TESTED[0]))
         self.assertFalse(cm.in_tested('13.24.5'))
-        self.assertFalse(cm.in_tested('15.18.3'))
+        self.assertTrue(cm.in_tested('15.18.3'))
+        self.assertFalse(cm.in_tested('15.19.0'))
         self.assertFalse(cm.in_tested(None))
 
     def test_recommended_matches_fallback(self):
