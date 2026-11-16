@@ -37,6 +37,8 @@ SCHEMA = 1
 DEFAULT_SEED = 20261116            # sb_setup.SAMPLE_SEED 와 같은 값
 SAMPLE_N = 50
 HEAD_BYTES = 65536                 # 세션 파일에서 cwd 를 찾을 때 읽는 앞부분 상한(본문 전체를 읽지 않는다)
+# claude-mem 관측기가 남기는 자체 세션(사용자 작업이 아님). 다른 PC 보고서(11-16)에서 Claude 세션의 64% 였다
+OBSERVER_SLUG_MARKERS = ('-claude-mem-observer-sessions', '-claude-mem-work-view')
 CLAUDE_FILES_PER_DIR = 5           # Claude 프로젝트 폴더는 cwd 하나에서 나온 슬러그라 앞 몇 개만 열어 본다
 MAX_FILES = 200000                 # 폴더 하나에서 세는 파일 상한(넘으면 truncated)
 OWN_EXT = {'.md', '.txt', '.docx', '.pptx', '.pdf', '.hwp', '.hwpx', '.html', '.htm'}
@@ -199,6 +201,7 @@ class _Acc:
         self.hi: Optional[float] = None
         self.cwds: set = set()
         self.compressed = 0
+        self.excluded = 0            # 사용자 작업이 아닌 기록(관측기 세션 등)으로 뺀 파일 수
 
     def add(self, p: Path, cwd: Optional[str] = None) -> None:
         try:
@@ -218,6 +221,8 @@ class _Acc:
                'cwd_count': len(cwds), 'git_count': sum(1 for c in cwds if _in_git(c, git_cache))}
         if self.compressed:
             out['compressed'] = self.compressed
+        if self.excluded:
+            out['excluded_observer'] = self.excluded
         return out
 
 
@@ -256,6 +261,9 @@ def _claude(root: Path) -> Optional[_Acc]:
         return None
     acc = _Acc()
     for d in sorted(p for p in projects.iterdir() if p.is_dir()):
+        if d.name.lower().endswith(OBSERVER_SLUG_MARKERS):   # 관측기 자체 세션은 세지 않는다
+            acc.excluded += sum(1 for _ in _files(d, '*.jsonl'))
+            continue
         cwd = None
         for i, f in enumerate(_files(d, '*.jsonl')):
             if cwd is None and i < CLAUDE_FILES_PER_DIR:
@@ -280,6 +288,18 @@ def _codex(root: Path) -> Optional[_Acc]:
             acc.add(f)
             acc.compressed += 1
     return acc
+
+
+def _antigravity(root: Path) -> Optional[_Acc]:
+    """Antigravity(구글 IDE 에이전트) 대화: ~/.gemini/antigravity/conversations. 개수·기간만(본문·cwd 안 읽음)."""
+    conv = root / 'antigravity' / 'conversations'
+    if not conv.is_dir():
+        return None
+    acc = _Acc()
+    for f in _files(conv, '**/*'):
+        if f.is_file():
+            acc.add(f)
+    return acc if acc.files else None
 
 
 def _gemini(root: Path) -> Optional[_Acc]:
@@ -329,6 +349,7 @@ def detect_sessions(home: Optional[str] = None) -> List[Dict[str, Any]]:
     found = [('claude_sessions', claude_root, _claude(claude_root)),
              ('codex_sessions', codex_root, _codex(codex_root)),
              ('gemini_sessions', h / '.gemini', _gemini(h / '.gemini')),
+             ('antigravity_sessions', h / '.gemini' / 'antigravity', _antigravity(h / '.gemini')),
              ('omo_sessions', omo_root, omo_acc)]
     git_cache: Dict[str, bool] = {}
     out = []

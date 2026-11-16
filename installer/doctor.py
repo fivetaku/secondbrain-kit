@@ -69,6 +69,14 @@ def check_settings():
         return rec('❌', 'claude-mem 설정', '~/.claude-mem/settings.json 없음')
     rec('✅', 'claude-mem 설정', 'provider=%s model=%s mode=%s' % (
         s.get('CLAUDE_MEM_PROVIDER', 'claude'), s.get('CLAUDE_MEM_MODEL', '-'), s.get('CLAUDE_MEM_MODE', '-')))
+    # 클라우드 동기화·원격 메모리 키가 채워져 있으면 기록이 이 PC 밖으로 나갈 수 있다(키 이름만 보고 값은 출력하지 않는다).
+    remote = sorted(k for k, v in s.items() if isinstance(k, str) and k.startswith(REMOTE_KEY_PREFIXES) and str(v or '').strip())
+    if remote:
+        rec('⚠', 'claude-mem 원격 동기화', '설정 키 %d개가 채워져 있음(%s) — 키트는 기록이 이 PC 에만 있다고 가정한다. '
+            '쓰지 않으면 claude-mem 설정에서 끄세요' % (len(remote), ', '.join(k.replace('CLAUDE_MEM_', '') for k in remote[:4])))
+
+
+REMOTE_KEY_PREFIXES = ('CLAUDE_MEM_CLOUD_SYNC_', 'CLAUDE_MEM_PRO_MEMORY_')
 
 
 def parse_num_batch(parameters: str) -> int:
