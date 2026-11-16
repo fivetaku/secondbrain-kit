@@ -134,9 +134,24 @@ Codex만 쓰는 PC(Claude 구독 없음)라면 설치 전에 관측 요약 LLM�
 | `Ollama ❌` | Ollama 앱을 실행(맥: `brew services start ollama`), 설치기 재실행(4단계가 bge-m3-ko 준비) |
 | `벡터 임베딩 ⚠ default` | 원래 claude-mem을 쓰던 PC다. `docs/embedding.md` 절차로 교체 |
 | `chroma-mcp 기동 ❌` (pydantic·ImportError) | 벡터 동기화가 멈춘 상태다. `./install.sh`를 다시 실행해 고정 도구를 깔고 `--doctor`로 확인. 밀린 벡터는 claude-mem 워커가 다시 뜰 때 채워진다 |
+| `Chroma 잠금 ⚠` (로그에 `already owned by PID`·`connection in backoff`가 많음) | claude-mem 워커와 다른 프로세스가 같은 Chroma 폴더를 잡고 있어 벡터 동기화가 밀리는 상태다(윈도우에서 자주 보였다). Claude·Codex 세션을 모두 닫고 남은 chroma-mcp·uvx 프로세스를 끈 뒤(맥 `ps ax \| grep -i chroma-mcp`, 윈도우 `tasklist \| findstr /i "uvx chroma"`) `sb health --fix`나 새 세션으로 워커를 다시 띄운다. 원인 조사 상태는 `docs/windows-chroma-lock.md` |
+| `디스크 사용 ⚠` | 키트가 쌓는 실험 사본(`~/.secondbrain/local`)·벡터 스냅샷(`index/chroma-snapshot`·`chroma-recalld`)·claude-mem 백업 DB 합계가 5GB를 넘었다. 자동으로 지우지 않는다. 실험 사본과 오래된 백업은 확인 뒤 지우거나 옮기고, 스냅샷은 회수 서버를 끈 뒤 지우면 다음 검색 때 다시 만들어진다. 경고선은 `SB_DOCTOR_DISK_WARN_GB` |
+| `claude-mem 버전 ⚠` (15.x 등 검증 범위 밖) | 막지는 않는다. 키트는 13.24.23~13.34.2에서 캡처까지 확인했고, 그 밖의 판은 `docs/windows-chroma-lock.md`의 '15.x 확인 범위'를 본다. 문제가 생기면 권장판(`python bin/sb_claude_mem.py`의 `recommended`)으로 맞춘다 |
+| `캡처 codex ℹ` | 셋업에서 쓰지 않는다고 답한 에이전트의 캡처가 오래 끊긴 것은 정보로만 보여 준다. 쓰기 시작하면 `sb setup answer --agents ...`로 답을 고친다 |
 | 세션 시작 브리핑이 안 뜸 | 정상일 수 있다 — 확정 사실·미결이 하나도 없으면 아무것도 넣지 않는다 |
 | 전부 되돌리고 싶음 | `./install.sh --uninstall` (기록 데이터는 남김) |
 
 ## 업데이트
 
 1단계의 한 줄 명령을 다시 실행하면 최신 키트로 갱신(git pull)하고 재설치한다. 여러 번 돌려도 중복되지 않는다.
+
+키트를 기본 위치(`~/secondbrain-kit`)가 아닌 곳에 받아 두었다면, 한 줄 명령에 그 위치를 알려 준다. 그러지 않으면 기본 위치에 키트를 하나 더 받는다.
+
+```bash
+# 맥
+curl -fsSL https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.sh | SBKIT_DIR="$HOME/Workspace/secondbrain-kit" sh
+# 윈도우 (PowerShell)
+$env:SBKIT_DIR="$HOME\Workspace\secondbrain-kit"; irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps1 | iex
+```
+
+볼트(`sb vault`)가 없던 예전 판에서 올라왔다면, 갱신한 뒤 `sb setup`을 한 번 실행한다. 볼트 설정 파일(`~/.secondbrain/config/vault.json`)이 없으면 기본 볼트로 시작하고, 4단계에서 구성안을 보여 준다.

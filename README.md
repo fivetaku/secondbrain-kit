@@ -254,4 +254,5 @@ codex plugin remove claude-mem@claude-mem-local
 ## 검증 상태
 
 - macOS: 전체 테스트 423개 통과(스킵 4, 2026-10-30), 격리 홈에서 실제 설치·재설치(멱등)·제거·doctor 확인, 실제 Codex 세션 캡처와 exec 제외 확인.
-- Windows: 코드 경로(잠금·프로세스 종료·경로·스케줄러·Codex `commandWindows`)는 작성했지만 **실기기 미검증**. 처음 설치하는 Windows에서는 `--doctor` 결과를 꼭 확인할 것. 사용자 폴더 이름에 공백이 있으면 Codex는 2026-07 이후 버전(0.15x)이어야 훅이 돈다.
+- Windows: 코드 경로(잠금·프로세스 종료·경로·스케줄러·Codex `commandWindows`)는 작성했지만 **실기기 미검증**. 처음 설치하는 Windows에서는 `--doctor` 결과를 꼭 확인할 것. Windows에서 Chroma 잠금 충돌(`already owned by PID`)이 보이면 [docs/windows-chroma-lock.md](docs/windows-chroma-lock.md). 사용자 폴더 이름에 공백이 있으면 Codex는 2026-07 이후 버전(0.15x)이어야 훅이 돈다.
+- claude-mem 15.18.3: 키트의 DB 읽기 경로만 확인했다(캡처·벡터 동기화 미확인). 캡처까지 확인한 범위는 13.24.23~13.34.2. 자세한 내용은 [docs/windows-chroma-lock.md](docs/windows-chroma-lock.md)의 '15.x 확인 범위'.

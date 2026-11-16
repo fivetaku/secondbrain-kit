@@ -95,6 +95,10 @@
 | [7] Codex | 신뢰 등록 실패 | venv 파이썬으로 `installer/codex_trust.py trust --match "<키트 경로>"` |
 | 윈도우 전반 | PowerShell 실행 정책 | `powershell -ExecutionPolicy Bypass -File .\install.ps1` |
 | 윈도우 훅 무반응 | Git Bash 없음, node가 시스템 PATH에 없음 | Git for Windows 설치, Node를 시스템 PATH로 재설치 후 새 창 |
+| doctor `Chroma 잠금 ⚠` | 워커 말고 다른 프로세스가 Chroma 폴더를 잡음(윈도우에서 자주 보임) | 사용자에게 Claude·Codex 세션을 모두 닫게 한 뒤 남은 chroma-mcp·uvx 프로세스를 확인(`tasklist \| findstr /i "uvx chroma"`), `sb health --fix`. 잠금 파일·로그 값은 출력하지 않는다 |
+| doctor `디스크 사용 ⚠` | 실험 사본·벡터 스냅샷·claude-mem 백업 DB 누적 | 지우지 말고 큰 폴더 목록과 크기만 보고, 지울지는 사용자가 정한다 |
+| 키트가 기본 위치가 아님 | 사용자가 `~/Workspace/secondbrain-kit` 등에 받아 둠 | 업데이트·재설치 때 `SBKIT_DIR`에 실제 위치를 넣는다. 기본 위치에 두 번째 키트를 만들지 않는다 |
+| 볼트 이전 판에서 업데이트 | `~/.secondbrain/config/vault.json` 없음, `sb vault` 없음 | 갱신 뒤 `sb setup` 한 번. 4단계 구성안을 사용자에게 보여 주고 승인받는다 |
 
 되돌리기: `install.sh --uninstall` (데이터 보존). 각 설정 파일 옆 `*.sbkit-bak-<시각>`이 설치 전 원본이다.
 
