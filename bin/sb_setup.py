@@ -505,9 +505,49 @@ def _obs_projects(ids: List[int]) -> Dict[int, str]:
     return out
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, '')))
+    except ValueError:
+        return default
+
+
+def _row_time(r: Dict[str, Any]) -> Optional[float]:
+    """훅 기록의 ts(시간대 없는 로컬 시각, 시간대가 붙어 있으면 그대로) → epoch 초. 없거나 못 읽으면 None."""
+    ts = r.get('ts')
+    if not isinstance(ts, str) or not ts:
+        return None
+    from datetime import datetime
+    try:
+        d = datetime.fromisoformat(ts.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    try:
+        return d.timestamp()           # naive 면 로컬 시각으로 해석한다(훅 time.strftime 과 같은 기준)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _obs_id(v: Any) -> Optional[int]:
+    """주입 id → int. 숫자 문자열도 받는다. bool·그 밖의 형식은 None(검증 불가)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
+
+
 def stage5(answers: Dict[str, Any]) -> Dict[str, Any]:
+    """회수 품질 검증. 최근 SB_SETUP_VERIFY_DAYS 일(기본 30, 0이면 전체) 기록 중 주입이 SB_SETUP_VERIFY_MIN 건
+    (기본 VERIFY_SESSIONS) 이상 있어야 판정한다. 문턱을 어긴 지표가 있으면 표본이 적어도 stop,
+    필수 지표(주입 수·다른 프로젝트 비율·p95)를 판정할 수 없으면 pending, 모두 통과면 pass."""
     p = injections_log()
-    rows = []
+    days = _env_int('SB_SETUP_VERIFY_DAYS', 30)
+    need = _env_int('SB_SETUP_VERIFY_MIN', VERIFY_SESSIONS)
+    since = time.time() - days * 86400 if days else None
+    rows, outside = [], 0
     if p.is_file():
         with p.open(encoding='utf-8', errors='replace') as f:
             for line in f:
@@ -515,34 +555,87 @@ def stage5(answers: Dict[str, Any]) -> Dict[str, Any]:
                     r = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(r, dict):
-                    rows.append(r)
+                if not isinstance(r, dict):
+                    continue
+                if since is not None:
+                    t = _row_time(r)
+                    if t is None or t < since:      # ts 가 없거나 못 읽는 줄은 창 밖으로 본다
+                        outside += 1
+                        continue
+                rows.append(r)
+    window = ('최근 %d일' % days) if days else '전체 기간'
+    if outside:
+        window += ', 창 밖 %d줄 제외' % outside
     inj = [r for r in rows if isinstance(r.get('ids'), list) and r['ids']]
     if not inj:
-        return result(5, 'pending', [metric('recall_injections', 0, '> 0', None, _short(p))],
+        return result(5, 'pending', [metric('recall_injections', 0, '≥ %d' % need, None,
+                                            '%s (%s)' % (_short(p), window))],
                       '검증 데이터 대기: 세션 %d회 뒤 sb setup --stage 5' % VERIFY_SESSIONS)
-    ms = [metric('recall_injections', len(inj), '> 0', True, _short(p))]
-    auto = sum(1 for r in inj if r.get('automation'))
-    ms.append(metric('automation_injections', auto, '= 0', auto == 0,
-                     '자동화 건너뜀 %d건' % sum(1 for r in rows if r.get('automation') and not r.get('ids'))))
-    projs = _obs_projects([int(i) for r in inj for i in r['ids'] if isinstance(i, int)])
-    if projs:
+    required = []
+    enough = len(inj) >= need
+    ms = [metric('recall_injections', len(inj), '≥ %d' % need, True if enough else None,
+                 '%s (%s)' % (_short(p), window))]
+    required.append(ms[-1])
+    # 자동화: 훅은 자동화 세션에 ids 없이 automation 줄만 쓴다. 시도 수는 정보, ids 가 붙은 자동화 줄은 회귀(= 0)
+    auto_rows = [r for r in rows if r.get('automation') is True]
+    whys: Dict[str, int] = {}
+    for r in auto_rows:
+        k = str(r.get('why') or '?')
+        whys[k] = whys.get(k, 0) + 1
+    ms.append(metric('automation_attempts', len(auto_rows), '', None,
+                     ', '.join('%s %d' % kv for kv in sorted(whys.items())) or '자동화 표본 없음'))
+    auto = sum(1 for r in auto_rows if isinstance(r.get('ids'), list) and r['ids'])
+    if auto:
+        ms.append(metric('automation_injections', auto, '= 0', False, '자동화로 판정된 줄에 주입 id 가 있음'))
+    else:
+        ms.append(metric('automation_injections', 0, '= 0', True if auto_rows else None,
+                         '자동화 줄에 주입 없음' if auto_rows else '자동화 표본 없음 — 판정 보류'))
+    all_ids = [_obs_id(i) for r in inj for i in r['ids']]
+    good_ids = [i for i in all_ids if i is not None]
+    projs = _obs_projects(good_ids)
+    found = sum(1 for i in good_ids if i in projs)
+    if not all_ids or found * 2 < len(all_ids):
+        db = Path(str(sb_config.claude_mem_db()))
+        if not db.is_file():
+            why = 'claude-mem DB 없음(%s)' % _short(db)
+        elif not good_ids:
+            why = 'id 형식을 읽을 수 없음'
+        elif not projs:
+            why = 'claude-mem DB 를 읽지 못함 또는 id 미발견'
+        else:
+            why = 'DB 에서 찾은 id %d/%d' % (found, len(all_ids))
+        ms.append(metric('cross_scope_ratio', None, '≤ 0.2', None, '검증 불가: ' + why))
+    else:
         import sb_scope
         cross = 0
         for r in inj:
             ev = sb_scope.project_key(r.get('project') or '')
-            keys = {sb_scope.project_key(projs[i]) for i in r['ids'] if isinstance(i, int) and projs.get(i)}
+            keys = {sb_scope.project_key(projs[i]) for i in (_obs_id(x) for x in r['ids'])
+                    if i is not None and projs.get(i)}
             if ev and any(k and k != ev for k in keys):
                 cross += 1
         ratio = round(cross / len(inj), 4)
         ms.append(metric('cross_scope_ratio', ratio, '≤ 0.2', ratio <= 0.2,
-                         '주입 이벤트 중 다른 프로젝트 관측이 하나라도 섞인 비율'))
+                         '주입 이벤트 중 다른 프로젝트 관측이 하나라도 섞인 비율(DB 에서 찾은 id %d/%d)'
+                         % (found, len(all_ids))))
+    required.append(ms[-1])
     lat = [float(r['ms']) for r in rows if isinstance(r.get('ms'), (int, float)) and not isinstance(r.get('ms'), bool)]
-    if lat:
+    if len(lat) >= max(1, need):
         p95 = _p95(lat)
-        ms.append(metric('p95_ms', p95, '≤ 3000', p95 <= 3000))
+        ms.append(metric('p95_ms', p95, '≤ 3000', p95 <= 3000, '표본 %d건' % len(lat)))
+    else:                       # 소표본의 p95 는 최댓값에 가깝다 — 판정하지 않는다
+        ms.append(metric('p95_ms', _p95(lat) if lat else None, '≤ 3000', None,
+                         '검증 불가: 지연 표본 %d건 < %d' % (len(lat), max(1, need))))
+    required.append(ms[-1])
     if any(m['pass'] is False for m in ms):
         return result(5, 'stop', ms, '회수 품질 문턱 미달 — 원인을 고친 뒤 sb setup --stage 5')
+    if any(m['pass'] is None for m in required):
+        if not enough:
+            hint = '검증 데이터 대기: 주입 %d/%d건 — 세션을 더 쓴 뒤 sb setup --stage 5' % (len(inj), need)
+        else:
+            hint = '검증 불가 지표: %s — evidence 를 확인한 뒤 sb setup --stage 5 (또는 sb setup accept 5 --reason …)' % \
+                ', '.join(m['name'] for m in required if m['pass'] is None)
+        return result(5, 'pending', ms, hint)
     return result(5, 'pass', ms)
 
 

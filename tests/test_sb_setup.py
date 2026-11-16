@@ -220,9 +220,10 @@ class EngineTests(SetupEnv):
         log = sb_setup.injections_log()
         self.assertEqual(log.name, 'recall.jsonl')
         log.parent.mkdir(parents=True, exist_ok=True)
-        rows = [{'project': 'alpha', 'ids': [1, 2], 'ms': 100 + i} for i in range(9)]
-        rows.append({'project': 'alpha', 'ids': [3, 101], 'ms': 120})       # 다른 프로젝트 섞임 1/10
-        rows.append({'project': 'alpha', 'automation': True, 'why': 'tmp_cwd'})  # 자동화 건너뜀(주입 아님)
+        now = time.strftime('%Y-%m-%dT%H:%M:%S')                           # 훅은 늘 ts 를 쓴다(5단계는 최근 기록만 센다)
+        rows = [{'ts': now, 'project': 'alpha', 'ids': [1, 2], 'ms': 100 + i} for i in range(9)]
+        rows.append({'ts': now, 'project': 'alpha', 'ids': [3, 101], 'ms': 120})       # 다른 프로젝트 섞임 1/10
+        rows.append({'ts': now, 'project': 'alpha', 'automation': True, 'why': 'tmp_cwd'})  # 자동화 건너뜀(주입 아님)
         log.write_text('\n'.join(json.dumps(r) for r in rows) + '\n', encoding='utf-8')
         s = sb_setup.run(non_interactive=True)
         r5 = s['results'][0]
@@ -230,13 +231,13 @@ class EngineTests(SetupEnv):
         got = {m['name']: m['value'] for m in r5['metrics']}
         self.assertEqual((got['recall_injections'], got['automation_injections'], got['cross_scope_ratio']), (10, 0, 0.1))
         self.assertTrue(s['complete'])
-        log.write_text('\n'.join(json.dumps(r) for r in [{'project': 'alpha', 'ids': [101], 'ms': 9000},
-                                                           {'project': 'alpha', 'ids': [1], 'automation': True}]) + '\n',
+        log.write_text('\n'.join(json.dumps(r) for r in [{'ts': now, 'project': 'alpha', 'ids': [101], 'ms': 9000},
+                                                           {'ts': now, 'project': 'alpha', 'ids': [1], 'automation': True}]) + '\n',
                        encoding='utf-8')
         s = sb_setup.run(from_stage=5, non_interactive=True)
-        self.assertEqual(s['results'][0]['verdict'], 'stop')
+        self.assertEqual(s['results'][0]['verdict'], 'stop')         # 표본이 적어도 문턱을 어긴 지표가 있으면 stop
         bad = {m['name'] for m in s['results'][0]['metrics'] if m['pass'] is False}
-        self.assertEqual(bad, {'automation_injections', 'cross_scope_ratio', 'p95_ms'})
+        self.assertEqual(bad, {'automation_injections', 'cross_scope_ratio'})   # 지연 2건은 p95 판정 보류(None)
 
     def test_stage5_pending_without_injections(self):
         for st in (1, 2, 3, 4):
