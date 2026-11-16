@@ -432,7 +432,14 @@ class Engine:
         # 2026-11-16 M3-T3: 재정렬이 같은 프로젝트 우선을 깼다(같은 프로젝트 후보 3건 이상인데 다른 프로젝트 주입 31.1%).
         # 몫은 주입되는 앞쪽 구간(share_window)에서 세고, 끌어올리는 기록은 그 자체로 주입 문턱을 넘어야 한다(11-16 검토 P1).
         rows = same_project_share(pool, project, limit, same, window=share_window(limit), eligible=passes)
-        judge = next((r for r in lexical if keep(r)), None)
+        alive = [r for r in lexical if keep(r)]
+        judge = alive[0] if alive else None
+        if judge and not passes(judge) and os.environ.get('SB_RECALLD_GATE_ANY') == '1':
+            # M3 Pro 리뷰 P1-3: project 쪽 1위가 약하면 문턱을 넘는 전역 후보가 있어도 gate 가 닫혀 훅이 전부 버렸다.
+            # 켜면 실제로 반환되는 기록 중 키워드 순서로 처음 문턱을 넘는 것이 판정한다. 주입률(DOE)이 바뀌므로
+            # 기본은 끔 — 그림자 재생으로 전후 gate 통과율·다른 프로젝트 주입률을 비교한 뒤 켠다.
+            returned = {r[0] for r in rows}
+            judge = next((r for r in alive if r[0] in returned and passes(r)), judge)
         matched, cov, gate = judge_body(judge[3]) if judge else (0, 0.0, False)
         items = []
         for oid, score, proj, _body in rows:
