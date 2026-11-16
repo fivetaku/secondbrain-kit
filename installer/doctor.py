@@ -315,6 +315,18 @@ def check_rules():
         rec('✅' if ok else '❌', '규칙 블록 ' + p.parent.name + '/' + p.name, '있음' if ok else '없음')
 
 
+def _answered_agents():
+    """sb setup 첫 실행 답의 '쓰는 에이전트'(소문자 목록). 답이 없거나 못 읽으면 None — 그때는 예전처럼 모두 ⚠."""
+    try:
+        import sb_setup
+        agents = sb_setup.flat_answers(sb_setup.load()).get('agents')
+    except BaseException:  # noqa: BLE001 — 깨진 setup.json 은 load 가 SystemExit 을 던진다. 점검은 계속한다
+        return None
+    if not isinstance(agents, list):
+        return None
+    return [str(a).strip().lower() for a in agents if str(a).strip()]
+
+
 def check_state_and_capture():
     r = subprocess.run([str(VPY if VPY.exists() else sys.executable), str(KIT / 'bin' / 'sb_search.py'),
                         '--mode', 'current', '--scope', 'global'], timeout=CHILD_TIMEOUT, **UTF8)
@@ -324,14 +336,220 @@ def check_state_and_capture():
     if not db.exists():
         return rec('⚠', '캡처', 'claude-mem.db 없음(첫 세션 뒤 생성)')
     con = sqlite3.connect('file:%s?mode=ro' % db.as_posix(), uri=True)
+    used = _answered_agents()
     for src in ('claude', 'codex'):
         row = con.execute('SELECT MAX(started_at_epoch), COUNT(*) FROM sdk_sessions WHERE platform_source=?', (src,)).fetchone()
         if row and row[1]:
             age_h = (time.time() * 1000 - (row[0] or 0)) / 3.6e6
-            rec('✅' if age_h < 72 else '⚠', '캡처 %s' % src, '세션 %d개, 최근 %.0f시간 전' % (row[1], age_h))
+            detail = '세션 %d개, 최근 %.0f시간 전' % (row[1], age_h)
+            if age_h < 72:
+                rec('✅', '캡처 %s' % src, detail)
+            elif used is not None and src not in used:   # 셋업에서 안 쓴다고 답한 에이전트 — 끊김이 정상이다
+                rec(INFO, '캡처 %s' % src, detail + ' — 셋업 답에서 쓰지 않는 에이전트(정보)')
+            else:
+                rec('⚠', '캡처 %s' % src, detail)
         else:
             rec('⚠', '캡처 %s' % src, '아직 없음 — 세션을 한 번 열고 도구를 써 보세요')
     con.close()
+
+
+# Chroma 단일 쓰기 잠금 — claude-mem 워커는 Chroma 폴더에 잠금 파일을 두고, 다른 프로세스가 같은 폴더를 잡고 있으면
+# 'Chroma data dir … is already owned by PID …; refusing to start a second writer' 로 기동을 거부한다(13.34.2 worker-service.cjs).
+# 그 뒤에는 backoff·Batch add 실패가 이어지고 검색은 FTS 로 떨어진다 — 벡터 저장이 밀려 회수 품질이 떨어진다.
+CHROMA_LOCK_FILE = '.claude-mem-chroma-writer.lock'
+CHROMA_LOCK_PATTERNS = (b'is already owned by PID', b'refusing to start a second writer', b'chroma-mcp connection in backoff',
+                        b'Batch add failed', b'falling back to FTS')
+CHROMA_LOCK_DAYS = 7
+CHROMA_LOCK_STRONG = 20            # 7일 합계가 이 이상이면 강한 경고 + 확인 방법
+LOG_TAIL_BYTES = 20 * 1024 * 1024  # 파일당 끝에서 이만큼만 읽는다(큰 로그 대비)
+INFO = 'ℹ'                         # 정보 — 판정에 영향 없음(❌ 가 아니므로 sb setup 1단계도 통과)
+
+
+def _count_log_lines(data: bytes, patterns=CHROMA_LOCK_PATTERNS) -> int:
+    """patterns 중 하나라도 든 줄 수(한 줄에 둘 이상 있어도 1). 훅 줄([HOOK …])은 실행 명령이 찍혀 오탐이라 뺀다."""
+    starts = set()
+    for p in patterns:
+        i = data.find(p)
+        while i >= 0:
+            s = data.rfind(b'\n', 0, i) + 1
+            if s not in starts and b'] [HOOK' not in data[s:i]:
+                starts.add(s)
+            i = data.find(p, i + len(p))
+    return len(starts)
+
+
+def _read_tail(path: Path, limit=None) -> bytes:
+    limit = limit or LOG_TAIL_BYTES
+    with path.open('rb') as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - limit))
+        data = f.read(limit)
+    if size > limit:   # 잘린 첫 줄은 버린다
+        data = data[data.find(b'\n') + 1:]
+    return data
+
+
+def pid_alive(pid: int):
+    """프로세스가 살아 있으면 True, 없으면 False, 판정 못 하면 None. 신호는 보내지 않는다(0 신호·조회만)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if IS_WIN:
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False if k32.GetLastError() == 87 else None   # 87 = 잘못된 매개변수(그런 PID 없음)
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return None
+                return code.value == 259   # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:   # 다른 사용자의 프로세스 — 살아 있다
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _chroma_dir() -> Path:
+    return Path(os.environ.get('SB_CHROMA_PATH') or sb_config.claude_mem_dir() / 'chroma')
+
+
+def chroma_lock_owner():
+    """(잠금 파일 있음, pid, 살아 있음). 잠금 파일 JSON 에서 pid 만 읽는다 — 다른 필드는 보지도 내보내지도 않는다."""
+    p = _chroma_dir() / CHROMA_LOCK_FILE
+    if not p.is_file():
+        return False, None, None
+    try:
+        pid = json.loads(p.read_text(encoding='utf-8', errors='replace')).get('pid')
+    except (OSError, ValueError, AttributeError):
+        return True, None, None
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return True, None, None
+    return True, pid, pid_alive(pid)
+
+
+def check_chroma_lock(today=None):
+    """최근 7일 claude-mem 워커 로그의 잠금 충돌·backoff 줄 수와 잠금 파일 주인 PID 생존 여부(읽기 전용)."""
+    from datetime import date, timedelta
+    logs = sb_config.claude_mem_dir() / 'logs'
+    has, pid, alive = chroma_lock_owner()
+    owner = ''
+    if has:
+        owner = (' · 잠금 파일 주인 PID %d %s' % (pid, '살아 있음' if alive else '없음(남은 잠금)' if alive is False else '확인 못 함')
+                 if pid is not None else ' · 잠금 파일 pid 못 읽음')
+    if not logs.is_dir():
+        return rec(INFO, 'Chroma 잠금', '로그 없음(%s)%s' % (_short(logs), owner))
+    today = today or date.today()   # 로그 파일 이름은 워커가 찍은 현지 날짜다
+    total, files = 0, 0
+    for k in range(CHROMA_LOCK_DAYS):
+        p = logs / ('claude-mem-%s.log' % (today - timedelta(days=k)).isoformat())
+        try:
+            data = _read_tail(p)
+        except OSError:
+            continue
+        files += 1
+        total += _count_log_lines(data)
+    detail = '최근 %d일 로그 %d개에서 잠금 충돌·backoff 줄 %d건%s' % (CHROMA_LOCK_DAYS, files, total, owner)
+    if total == 0:
+        return rec('✅', 'Chroma 잠금', detail)
+    if total < CHROMA_LOCK_STRONG:
+        return rec('⚠', 'Chroma 잠금', detail)
+    rec('⚠', 'Chroma 잠금', detail + ' — 워커와 다른 프로세스가 같은 Chroma 폴더를 잡고 있습니다. 확인: Claude·Codex 세션을 모두 닫고 '
+        '남은 chroma-mcp/uvx 프로세스를 찾아 끄세요(%s). 그다음 `sb health --fix`(꺼진 워커를 띄움)나 새 세션으로 워커를 다시 띄웁니다'
+        % ('tasklist | findstr /i "uvx chroma"' if IS_WIN else 'ps ax | grep -i chroma-mcp'))
+
+
+def _short(p) -> str:
+    """보고용 경로 — 홈은 ~ 로 줄인다(sb_vault._short 와 같은 규칙)."""
+    h, s = os.path.expanduser('~'), str(p)
+    return '~' + s[len(h):] if s == h or s.startswith(h + os.sep) else s
+
+
+DISK_WARN_GB = 5.0   # 키트가 쌓는 사본·스냅샷·백업 합계 경고선(SB_DOCTOR_DISK_WARN_GB 로 바꿈)
+
+
+def _tree_bytes(path: Path) -> int:
+    """폴더(또는 파일) 크기 합. 심볼릭 링크는 따라가지 않는다."""
+    total, stack = 0, [path]
+    while stack:
+        p = stack.pop()
+        try:
+            if p.is_symlink():
+                continue
+            if p.is_file():
+                total += p.stat().st_size
+                continue
+            with os.scandir(p) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir():
+                            stack.append(Path(e.path))
+                        else:
+                            total += e.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _claude_mem_backups() -> list:
+    """claude-mem 폴더의 DB 백업(이름이나 담긴 폴더 이름에 backup·bak). claude-mem.db 와 그 -wal·-shm 은 뺀다."""
+    cm = sb_config.claude_mem_dir()
+    out = []
+    for p in list(cm.glob('*')) + list(cm.glob('backup*/*')) + list(cm.glob('bak*/*')):
+        name = p.name.lower()
+        if not p.is_file() or p.is_symlink() or '.db' not in name or name.startswith('claude-mem.db'):
+            continue
+        if any(t in name or t in p.parent.name.lower() for t in ('backup', 'bak')):
+            out.append(p)
+    return out
+
+
+def _gb(n: int) -> str:
+    return '%.1fGB' % (n / 1024 ** 3) if n >= 1024 ** 3 else '%dMB' % (n // 1024 ** 2)
+
+
+def check_disk_usage():
+    """키트·claude-mem 이 쌓는 사본·스냅샷·백업 크기(읽기 전용 — 자동으로 지우지 않는다)."""
+    try:
+        warn = float(os.environ.get('SB_DOCTOR_DISK_WARN_GB') or DISK_WARN_GB)
+    except ValueError:
+        warn = DISK_WARN_GB
+    sb = sb_config.home()
+    index = sb / 'index'
+    snap = [(index / n, _tree_bytes(index / n)) for n in ('chroma-snapshot', 'chroma-recalld')]
+    parts = [(_short(sb / 'local'), _tree_bytes(sb / 'local'))] + [(_short(p), n) for p, n in snap]
+    parts.append((_short(index) + ' (그 밖)', max(0, _tree_bytes(index) - sum(n for _, n in snap))))
+    backups = _claude_mem_backups()
+    if backups:
+        parts.append(('%s 백업 DB %d개' % (_short(sb_config.claude_mem_dir()), len(backups)), sum(_tree_bytes(p) for p in backups)))
+    total = sum(n for _, n in parts)
+    try:
+        free = shutil.disk_usage(str(sb if sb.exists() else HOME)).free
+    except OSError:
+        free = None
+    top = sorted((x for x in parts if x[1] > 0), key=lambda x: -x[1])[:3]
+    names = ', '.join('%s %s' % (label, _gb(n)) for label, n in top)
+    detail = '합계 %s%s%s' % (_gb(total), ', 여유 %s' % _gb(free) if free is not None else '', ' — 큰 것: ' + names if names else '')
+    limit = warn * 1024 ** 3
+    if total >= limit or (free is not None and free < limit):
+        return rec('⚠', '디스크 사용', detail + ' — 정리 안내(자동 삭제 안 함): local 의 실험 사본·오래된 claude-mem 백업 DB 는 확인 뒤 '
+                   '지우거나 옮기고, index/chroma-snapshot·chroma-recalld 는 지워도 다음 검색 때 다시 만들어집니다(회수 서버를 끈 뒤)')
+    rec('✅', '디스크 사용', detail)
 
 
 def check_sb():
@@ -350,7 +568,7 @@ def check_sb():
 
 # 점검 순서 — sb setup 1단계(bin/sb_setup.py)도 이 목록을 그대로 돌린다
 CHECKS = (check_venv, check_worker, check_settings, check_embedding, check_claude_mem_version, check_chroma_mcp, check_claude,
-          check_codex, check_rules, check_state_and_capture, check_sb)
+          check_codex, check_rules, check_state_and_capture, check_sb, check_chroma_lock, check_disk_usage)
 
 
 def main() -> int:
