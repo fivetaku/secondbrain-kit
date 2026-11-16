@@ -87,7 +87,10 @@ def _projects(kind_ids):
 # claude-mem 13.34+ 워커는 Chroma 폴더에 단일 쓰기 잠금 파일을 둔다(worker-service.cjs acquireChromaWriterLock,
 # 15.18.3 도 같은 이름·필드). 다른 워커는 이 파일의 pid 가 살아 있으면 "already owned by PID" 로 연결을 거부한다.
 WRITER_LOCK = '.claude-mem-chroma-writer.lock'
-LOCK_WAIT = float(os.environ.get('SB_PII_CHROMA_WAIT', '30'))   # 워커가 잠금을 풀 때까지 기다리는 최대 초
+try:   # 워커가 잠금을 풀 때까지 기다리는 최대 초. 잘못된 값이면 기본값 — import 가 깨지면 recalld 의 SQLite 마스킹까지 멈춘다
+    LOCK_WAIT = float(os.environ.get('SB_PII_CHROMA_WAIT', '30'))
+except ValueError:
+    LOCK_WAIT = 30.0
 
 
 class ChromaBusy(RuntimeError):
@@ -121,6 +124,44 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+def _proc_name(raw: str) -> str:
+    """claude-mem 의 프로세스 이름 정규화와 같게: 마지막 경로 조각(/·\\ 모두), .exe 제거(대소문자 무시), 소문자."""
+    base = raw.strip().replace('\\', '/').rsplit('/', 1)[-1]
+    if base.lower().endswith('.exe'):
+        base = base[:-4]
+    return base.lower()
+
+
+def _self_process_name() -> str:
+    """claude-mem 이 이 프로세스를 볼 때 얻는 이름. 잠금의 processName 이 이것과 다르면 claude-mem 이 낡은 잠금으로 보고 지운다.
+    sys.executable 의 실제 파일 이름(python3.12)은 macOS ps(python)·Linux comm(실행한 링크 이름)과 다를 수 있어
+    claude-mem 과 같은 출처를 읽는다 — Linux /proc/self/comm, macOS ps -o comm=, Windows 실행 파일 이름(Get-Process 와 같음)."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            if k32.QueryFullProcessImageNameW(k32.GetCurrentProcess(), 0, buf, ctypes.byref(size)):
+                return _proc_name(buf.value)
+        except Exception:  # noqa: BLE001
+            pass
+        return _proc_name(sys.executable)
+    try:
+        return _proc_name(Path('/proc/self/comm').read_text(encoding='utf-8'))
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(['ps', '-p', str(os.getpid()), '-o', 'comm='], capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout.strip():
+            return _proc_name(r.stdout)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _proc_name(sys.executable)
+
+
 def claim_writer_lock(chroma: Path, wait: float = None):
     """워커가 잠금을 풀(또는 죽을) 때까지 기다린 뒤, 키트가 원본을 여는 동안 같은 잠금을 쥔다.
     그동안 훅이 새 워커를 띄워도 그 워커의 chroma-mcp 가 같은 폴더를 함께 쓰지 않는다(잠금을 보고 물러나 10초마다 재시도).
@@ -132,7 +173,7 @@ def claim_writer_lock(chroma: Path, wait: float = None):
     path = Path(chroma) / WRITER_LOCK
     record = {'pid': os.getpid(), 'ownerId': 'secondbrain-kit:%d:%d' % (os.getpid(), int(time.time() * 1000)),
               'dataDir': str(Path(chroma).resolve()), 'acquiredAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-              'processName': Path(os.path.realpath(sys.executable)).name.lower().replace('.exe', '')}
+              'processName': _self_process_name()}
     deadline = time.time() + max(0.0, wait)
     owner = None
     while True:

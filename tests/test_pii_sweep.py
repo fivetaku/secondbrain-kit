@@ -149,6 +149,35 @@ class WriterLockTests(unittest.TestCase):
             path = sb_pii_sweep.claim_writer_lock(self.chroma, wait=60)
         self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['pid'], os.getpid())
 
+    def test_proc_name_normalizes_like_claude_mem(self):
+        # claude-mem ag(): 마지막 경로 조각(/·\ 모두), .exe 대소문자 무시 제거, 소문자
+        self.assertEqual(sb_pii_sweep._proc_name('C:\\Py\\Python.EXE\n'), 'python')
+        self.assertEqual(sb_pii_sweep._proc_name('/usr/bin/python3.12'), 'python3.12')
+        self.assertEqual(sb_pii_sweep._proc_name('pythonw.exe'), 'pythonw')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX 프로세스 이름 출처')
+    def test_lock_process_name_matches_what_claude_mem_sees(self):
+        # claude-mem 은 startToken 없는 잠금을 '지금 보이는 프로세스 이름 == processName' 일 때만 살아 있다고 본다.
+        # sys.executable 의 실제 파일 이름(python3.12)은 macOS ps 의 comm(python)과 달라 잠금이 낡은 것으로 지워졌다.
+        path = sb_pii_sweep.claim_writer_lock(self.chroma, wait=0)
+        self.addCleanup(sb_pii_sweep.release_writer_lock, path)
+        rec = json.loads(path.read_text(encoding='utf-8'))
+        if Path('/proc/self/comm').exists():
+            seen = Path('/proc/%d/comm' % os.getpid()).read_text(encoding='utf-8')
+            self.assertEqual(rec['processName'][:15], sb_pii_sweep._proc_name(seen)[:15])   # Linux 는 앞 15자 비교
+        else:
+            import subprocess
+            seen = subprocess.run(['ps', '-p', str(os.getpid()), '-o', 'comm='], capture_output=True, text=True).stdout
+            self.assertEqual(rec['processName'], sb_pii_sweep._proc_name(seen))
+
+    def test_bad_wait_env_falls_back(self):
+        # 잘못된 값으로 import 가 깨지면 recalld 의 SQLite 마스킹(try 안의 import)까지 조용히 멈춘다
+        import importlib
+        with patch.dict(os.environ, {'SB_PII_CHROMA_WAIT': 'abc'}):
+            mod = importlib.reload(sb_pii_sweep)
+        self.addCleanup(importlib.reload, sb_pii_sweep)
+        self.assertEqual(mod.LOCK_WAIT, 30.0)
+
     def test_pid_alive(self):
         self.assertTrue(sb_pii_sweep._pid_alive(os.getpid()))
         self.assertFalse(sb_pii_sweep._pid_alive(0))
