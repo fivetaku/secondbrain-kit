@@ -26,8 +26,15 @@ from typing import List, Optional, Tuple
 RECOMMENDED = '13.34.2'
 # 키트와 함께 돌려 본 범위(양끝 포함) — 13.24.23 은 예전 설치기 기본판, 13.34.2 는 오너 맥 실가동판.
 # 밖이면 doctor·sb health 가 경고만 한다(차단 없음). 워커 인자 파서 자체는 13.24.23~15.18.3 의 npm 패키지 21개에서
-# 같은 구조로 읽혔다(2026-11-15) — 그래도 키트의 DB 읽기·재시작 경로는 이 범위에서만 확인했다.
+# 같은 구조로 읽혔다(2026-11-15) — 그래도 캡처·관측기·벡터 동기화까지 함께 돌려 본 범위는 여기까지다.
+# 이 범위 밖에서 읽기 경로만 확인한 판은 READ_CHECKED 에 따로 적는다.
 TESTED = ('13.24.23', '13.34.2')
+# TESTED 밖이지만 키트의 '읽기 경로'만 확인한 판(정확한 판 번호만, 범위 아님). 캡처·관측기·벡터 동기화는 확인하지 않았으므로
+# TESTED 를 넓히지 않고 doctor·sb health 경고 문구만 정확하게 한다.
+#   15.18.3 (2026-11-16): npm 패키지의 SessionStore 마이그레이션으로 격리 홈에 빈 DB(schema 75)를 만들고 FTS 정의를
+#   더해 키트의 DB 읽기 25곳(sb_search·sb_health·consolidate·sb_vault·sb_sources·sb_pii_sweep·sb_fts_ko·훅·doctor 등)을
+#   돌려 모두 통과. restart 명령·/api/health pid·기동 백필·/api/memory/save 본문 형식은 정적 대조로 확인.
+READ_CHECKED = ('15.18.3',)
 PYDANTIC_PIN = 'pydantic<2.14'
 # 파싱 실패 시 기본값 = 권장판의 워커 인자
 FALLBACK_WITH = ['onnxruntime>=1.20', 'protobuf<7', 'chromadb==1.5.9']
@@ -49,6 +56,12 @@ def vkey(v: str) -> Tuple[int, ...]:
 def in_tested(v: Optional[str]) -> bool:
     k = vkey(v or '')
     return bool(k) and vkey(TESTED[0])[:-1] <= k[:-1] <= vkey(TESTED[1])[:-1]
+
+
+def read_checked(v: Optional[str]) -> bool:
+    """TESTED 밖이지만 키트 읽기 경로만 확인한 판인가(READ_CHECKED 와 같은 판 — 사전판은 따로 보지 않는다)."""
+    k = vkey(v or '')
+    return bool(k) and any(k == vkey(r) for r in READ_CHECKED)
 
 
 def plugin_base() -> Path:
@@ -240,6 +253,7 @@ def summary() -> dict:
     withs, ver, ok = worker_chroma_spec(root)
     v = installed_version(root)
     return {'installed': v, 'recommended': RECOMMENDED, 'tested': list(TESTED), 'in_tested': in_tested(v),
+            'read_checked': read_checked(v),
             'worker_with': withs, 'chroma_mcp': ver, 'parsed': ok, 'tool_requirements': tool_requirements(withs)}
 
 

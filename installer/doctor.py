@@ -161,6 +161,9 @@ def check_claude_mem_version():
     lo, hi = sb_claude_mem.TESTED
     if sb_claude_mem.in_tested(v):
         rec('✅', 'claude-mem 버전', '%s (키트 검증 %s~%s, 권장 %s)' % (v, lo, hi, sb_claude_mem.RECOMMENDED))
+    elif sb_claude_mem.read_checked(v):
+        rec('⚠', 'claude-mem 버전', '%s — 키트 검증 범위(%s~%s) 밖. 이 판은 키트의 DB 읽기 경로만 확인됨'
+                                  '(캡처·벡터 동기화는 미확인). 아래 chroma-mcp 기동 결과를 확인하세요' % (v, lo, hi))
     else:
         rec('⚠', 'claude-mem 버전', '%s — 키트 검증 범위(%s~%s) 밖. 아래 chroma-mcp 기동 결과를 확인하세요' % (v, lo, hi))
     withs, _, ok = sb_claude_mem.worker_chroma_spec(root)

@@ -1,5 +1,6 @@
 """sb_pii_sweep·sb_memory 선택형 마스킹 계약 — 마스킹 모듈이 있으면 가리고, 없으면 아무것도 하지 않는다."""
 import contextlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -92,6 +93,76 @@ class ChromaBackupRetentionTests(unittest.TestCase):
             left = sorted(p.name for p in root.iterdir())
             self.assertEqual(left, ['chroma-before-piisweep-' + s for s in stamps[2:]] + ['unrelated'])
             self.assertEqual(sb_pii_sweep.prune_chroma_backups(root, keep=0), 0)   # 0 이면 정리 안 함
+
+
+class WriterLockTests(unittest.TestCase):
+    """--chroma 는 워커가 Chroma 쓰기 잠금을 풀 때까지 원본을 열지 않고, 여는 동안 같은 잠금을 쥔다."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.chroma = Path(temp.name) / 'chroma'
+        self.chroma.mkdir()
+        self.lock = self.chroma / sb_pii_sweep.WRITER_LOCK
+
+    def _write_owner(self, pid):
+        self.lock.write_text(json.dumps({'pid': pid, 'ownerId': 'x', 'dataDir': str(self.chroma),
+                                         'acquiredAt': '2026-01-01T00:00:00Z'}), encoding='utf-8')
+
+    def test_claims_and_releases(self):
+        path = sb_pii_sweep.claim_writer_lock(self.chroma, wait=0)
+        rec = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(rec['pid'], os.getpid())
+        for key in ('ownerId', 'dataDir', 'acquiredAt'):   # claude-mem 이 읽는 필드 — 빠지면 깨진 잠금으로 본다
+            self.assertIsInstance(rec[key], str)
+        sb_pii_sweep.release_writer_lock(path)
+        self.assertFalse(self.lock.exists())
+
+    def test_stale_lock_from_dead_worker_is_replaced(self):
+        self._write_owner(999999)
+        with patch.object(sb_pii_sweep, '_pid_alive', return_value=False):
+            path = sb_pii_sweep.claim_writer_lock(self.chroma, wait=0)
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['pid'], os.getpid())
+
+    def test_live_owner_means_busy(self):
+        self._write_owner(424242)
+        with patch.object(sb_pii_sweep, '_pid_alive', return_value=True):
+            with self.assertRaises(sb_pii_sweep.ChromaBusy):
+                sb_pii_sweep.claim_writer_lock(self.chroma, wait=0)
+        self.assertEqual(json.loads(self.lock.read_text(encoding='utf-8'))['pid'], 424242)   # 남의 잠금은 그대로
+
+    def test_release_leaves_foreign_lock(self):
+        self._write_owner(424242)
+        sb_pii_sweep.release_writer_lock(self.lock)
+        self.assertTrue(self.lock.exists())
+
+    def test_waits_until_worker_releases(self):
+        self._write_owner(424242)
+        calls = []
+
+        def alive(pid):
+            calls.append(pid)
+            if len(calls) >= 2:   # 두 번째 확인 전에 워커가 정상 종료하며 잠금을 지웠다
+                self.lock.unlink()
+            return True
+        with patch.object(sb_pii_sweep, '_pid_alive', side_effect=alive), patch.object(sb_pii_sweep.time, 'sleep'):
+            path = sb_pii_sweep.claim_writer_lock(self.chroma, wait=60)
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['pid'], os.getpid())
+
+    def test_pid_alive(self):
+        self.assertTrue(sb_pii_sweep._pid_alive(os.getpid()))
+        self.assertFalse(sb_pii_sweep._pid_alive(0))
+        self.assertFalse(sb_pii_sweep._pid_alive('x'))
+
+    def test_busy_skips_vectors_but_keeps_sqlite_result(self):
+        with patch.object(sb_pii_sweep.sb_memory, '_pii_masker', return_value=lambda s: s), \
+                patch.object(sb_pii_sweep, 'sweep_sqlite', return_value={'observations': [], 'summaries': [], 'prompts': []}), \
+                patch.object(sb_pii_sweep, 'sweep_chroma', side_effect=sb_pii_sweep.ChromaBusy('PID 1')), \
+                patch('builtins.print') as out:
+            self.assertEqual(sb_pii_sweep.main(['--chroma', '--json']), 0)
+        res = json.loads(out.call_args[0][0])
+        self.assertEqual(res['status'], 'ok')
+        self.assertIn('skipped', res['chroma'])
 
 
 if __name__ == '__main__':

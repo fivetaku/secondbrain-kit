@@ -389,6 +389,13 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(r['claude-mem 버전'][0], '⚠')
         self.assertNotIn('❌', [lv for lv, _ in r.values()])
 
+    def test_doctor_version_read_checked_says_scope(self):
+        # 15.18.3 은 읽기 경로만 확인한 판 — 검증 범위는 넓히지 않고 ⚠ 문구로 범위를 밝힌다
+        r = self._doctor_version('15.18.3', '1.5.9')
+        self.assertEqual(r['claude-mem 버전'][0], '⚠')
+        self.assertIn('읽기 경로만', r['claude-mem 버전'][1])
+        self.assertEqual(r['chromadb 판 일치'][0], '✅')
+
     def test_doctor_flags_broken_plugin_cache(self):
         tmp = Path(tempfile.mkdtemp())
         (tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.34.2').mkdir(parents=True)

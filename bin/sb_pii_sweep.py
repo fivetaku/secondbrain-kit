@@ -84,12 +84,98 @@ def _projects(kind_ids):
     return out
 
 
+# claude-mem 13.34+ 워커는 Chroma 폴더에 단일 쓰기 잠금 파일을 둔다(worker-service.cjs acquireChromaWriterLock,
+# 15.18.3 도 같은 이름·필드). 다른 워커는 이 파일의 pid 가 살아 있으면 "already owned by PID" 로 연결을 거부한다.
+WRITER_LOCK = '.claude-mem-chroma-writer.lock'
+LOCK_WAIT = float(os.environ.get('SB_PII_CHROMA_WAIT', '30'))   # 워커가 잠금을 풀 때까지 기다리는 최대 초
+
+
+class ChromaBusy(RuntimeError):
+    """살아 있는 다른 프로세스가 Chroma 쓰기 잠금을 쥐고 있어 원본을 열지 않았다."""
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5   # 권한 거부 = 프로세스는 있다
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def claim_writer_lock(chroma: Path, wait: float = None):
+    """워커가 잠금을 풀(또는 죽을) 때까지 기다린 뒤, 키트가 원본을 여는 동안 같은 잠금을 쥔다.
+    그동안 훅이 새 워커를 띄워도 그 워커의 chroma-mcp 가 같은 폴더를 함께 쓰지 않는다(잠금을 보고 물러나 10초마다 재시도).
+    pid·이름만 적고 startToken 은 비워 둔다 — claude-mem 은 그때 프로세스 이름으로 살아 있는지 본다
+    (이름이 어긋나면 claude-mem 이 이 잠금을 낡은 것으로 보고 지운다 — 그때는 예전 동작과 같다).
+    키트가 도중에 죽어 잠금이 남아도 pid 가 죽었으므로 claude-mem 이 지운다.
+    반환: 잠금 파일 경로(해제는 release_writer_lock). 살아 있는 다른 프로세스가 계속 쥐고 있으면 ChromaBusy."""
+    wait = LOCK_WAIT if wait is None else wait
+    path = Path(chroma) / WRITER_LOCK
+    record = {'pid': os.getpid(), 'ownerId': 'secondbrain-kit:%d:%d' % (os.getpid(), int(time.time() * 1000)),
+              'dataDir': str(Path(chroma).resolve()), 'acquiredAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'processName': Path(os.path.realpath(sys.executable)).name.lower().replace('.exe', '')}
+    deadline = time.time() + max(0.0, wait)
+    owner = None
+    while True:
+        try:
+            with open(path, 'x', encoding='utf-8') as f:
+                json.dump(record, f)
+            return path
+        except FileExistsError:
+            pass
+        try:
+            owner = json.loads(path.read_text(encoding='utf-8')).get('pid')
+        except (OSError, ValueError, AttributeError):
+            owner = None   # 쓰는 중이거나 깨진 파일 — 잠깐 뒤 다시 본다
+        if owner is not None and not _pid_alive(owner):
+            try:   # 죽은 워커가 남긴 잠금(taskkill /F 는 정리할 틈이 없다) — claude-mem 도 같은 규칙으로 지운다
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        if time.time() >= deadline:
+            raise ChromaBusy('Chroma 쓰기 잠금을 PID %s 가 쥐고 있음 — 벡터 정리를 건너뜀' % owner)
+        time.sleep(0.5)
+
+
+def release_writer_lock(path) -> None:
+    """claim_writer_lock 이 만든 잠금만 지운다(그 사이 다른 프로세스가 바꿔 썼으면 그대로 둔다)."""
+    if not path:
+        return
+    try:
+        if json.loads(Path(path).read_text(encoding='utf-8')).get('pid') == os.getpid():
+            Path(path).unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def sweep_chroma(mask, dry_run=False):
-    """워커를 멈추고 벡터 문서를 정리한다. 반환: (삭제 문서 수, 고아 수, 보류 등록 수)."""
+    """워커를 멈추고 벡터 문서를 정리한다. 반환: (삭제 문서 수, 고아 수, 보류 등록 수).
+    워커가 쓰기 잠금을 풀지 않으면 원본을 열지 않고 ChromaBusy 를 낸다(두 프로세스가 같은 폴더에 쓰지 않게)."""
     cm = sb_config.claude_mem_dir()
     chroma = Path(os.environ.get('SB_CHROMA_PATH') or cm / 'chroma')
     with closing(sqlite3.connect('file:%s?mode=ro' % Path(_db()).as_posix(), uri=True)) as db:
         alive = {DOC_TYPE[k]: {r[0] for r in db.execute('SELECT id FROM %s' % t)} for k, (t, _) in TABLES.items()}
+    lock = None
     if not dry_run:
         stamp = time.strftime('%Y%m%d-%H%M%S')
         (cm / 'backups').mkdir(exist_ok=True)
@@ -102,9 +188,18 @@ def sweep_chroma(mask, dry_run=False):
                 subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
             else:
                 os.kill(int(pid), 15)
-            time.sleep(2)
         except Exception:  # noqa: BLE001
             pass
+        # SIGTERM 뒤 정상 종료는 chroma-mcp 를 멈추고 잠금을 푸는 데 몇 초 걸린다(15.18.3 정상 종료 기한 10초).
+        # 예전처럼 2초만 기다리고 열면 아직 살아 있는 chroma-mcp 와 함께 쓰게 된다.
+        lock = claim_writer_lock(chroma)
+    try:
+        return _sweep_open(chroma, mask, alive, dry_run, cm)
+    finally:
+        release_writer_lock(lock)
+
+
+def _sweep_open(chroma, mask, alive, dry_run, cm):
     os.environ.setdefault('CHROMA_OPENAI_API_KEY', 'ollama')
     import chromadb
     from chromadb.config import Settings
@@ -160,8 +255,11 @@ def main(argv=None):
         changed = sweep_sqlite(mask, a.dry_run)
         out = {'status': 'ok', 'sqlite': {k: len(v) for k, v in changed.items()}}
         if a.chroma:
-            deleted, orphans, pending = sweep_chroma(mask, a.dry_run)
-            out['chroma'] = {'deleted': deleted, 'orphans': orphans, 'pending': pending}
+            try:
+                deleted, orphans, pending = sweep_chroma(mask, a.dry_run)
+                out['chroma'] = {'deleted': deleted, 'orphans': orphans, 'pending': pending}
+            except ChromaBusy as e:   # SQLite 마스킹은 끝났다 — 벡터 정리만 다음 밤으로 미룬다
+                out['chroma'] = {'skipped': str(e)}
         if any(changed.values()) and not a.dry_run:
             try:   # 형태소 색인도 가려진 본문으로
                 import sb_fts_ko

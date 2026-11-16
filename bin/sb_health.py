@@ -102,8 +102,10 @@ def check_claude_mem_version() -> Dict[str, Any]:
     if not v or sb_claude_mem.in_tested(v):
         return {'ok': True, 'version': v}
     lo, hi = sb_claude_mem.TESTED
+    scope = '(DB 읽기 경로만 확인됨) ' if sb_claude_mem.read_checked(v) else ''
     return {'ok': False, 'version': v, 'fix': None,
-            'msg': 'claude-mem {}는 키트 검증 범위({}~{}) 밖 — `python installer/install.py --doctor`로 chroma-mcp 기동 확인'.format(v, lo, hi)}
+            'msg': 'claude-mem {}는 키트 검증 범위({}~{}) 밖 {}— `python installer/install.py --doctor`로 chroma-mcp 기동 확인'.format(
+                v, lo, hi, scope)}
 
 
 def ensure_worker(wait: float = 30.0) -> bool:
@@ -151,6 +153,8 @@ def worker_pid() -> Optional[int]:
 # 13.34.2 모두 ① 'restart' 명령(case"restart")이 있고 ② 워커 기동 직후 backfillAllProjects(getSessionStore()) 를
 # 부르며 ③ /api/health 가 pid:process.pid 를 돌려준다. 두 버전 모두 restart 명령이 포트가 안 풀리면
 # 'nothing spawned' 로 끝날 수 있다 — 그래서 성공은 pid 가 바뀌었는지로만 판정한다.
+# 15.18.3(2026-11-16 npm 패키지 정적 대조)도 ①②③ 이 같다. restart 는 먼저 워커 스스로 후계 워커를 띄우는 인계를 기다리고,
+# 안 되면 CLI 로 띄운다. CLAUDE_MEM_WORKER_URL 이 설정돼 있으면 exit 1 로 거부하므로 아래 ensure_worker 로 넘어간다.
 def restart_worker(wait: float = 60.0) -> str:
     """떠 있는 워커를 claude-mem 자체 restart 명령으로 다시 띄운다. 자동 기동 끔·테스트 환경(SB_MEM_BASE_URL)이면 안 한다.
     결과: 'ok'(재시작 전후 pid 가 다름 — 새 워커라 기동 백필이 돈다), 'noop'(응답은 하지만 pid 그대로 —
