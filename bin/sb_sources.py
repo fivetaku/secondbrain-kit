@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """세컨브레인 자료 목록: 과거 에이전트 세션·사용자가 알려 준 폴더·링크를 등록하고 분류한다(셋업 2·3단계).
 
-  sb sources detect [--json]                 과거 세션 위치 감지(작업 폴더·시각·건수만, 저장 안 함)
+  sb sources detect [--json]                 과거 세션 위치·MCP 커넥터 이름 감지(작업 폴더·시각·건수·이름만, 저장 안 함)
   sb sources add LOCATION [--kind K] [--json]  폴더·회의 폴더·링크 등록 → $SB_HOME/sources.json
   sb sources list [--json]                   등록된 자료 목록
   sb sources remove ID|LOCATION [--json]     add 로 넣은 자료 빼기
@@ -11,6 +11,7 @@
 - 세션 파일에서는 작업 폴더(cwd)·파일 시각·건수만 읽는다. 대화 본문 필드는 해석하지 않고 저장하지 않는다.
 - 폴더는 파일 이름·확장자·크기만 본다(내용을 열지 않는다). 민감도를 모르는 자료는 기본으로 뺀다.
 - 3단계 표본은 관측 id·판정만 남긴다(제목·본문 없음).
+- MCP 커넥터는 설정 파일의 서버 이름만 읽는다(주소·명령·인자·env·토큰은 읽지도 저장하지도 않는다). 적재하지 않는다(live).
 """
 import argparse
 import hashlib
@@ -32,6 +33,7 @@ sys.path.insert(0, str(BIN))
 import sb_config  # noqa: E402
 import sb_scope  # noqa: E402
 import sb_vault  # noqa: E402
+import sync_automemory  # noqa: E402
 
 SCHEMA = 1
 DEFAULT_SEED = 20261116            # sb_setup.SAMPLE_SEED 와 같은 값
@@ -39,6 +41,17 @@ SAMPLE_N = 50
 HEAD_BYTES = 65536                 # 세션 파일에서 cwd 를 찾을 때 읽는 앞부분 상한(본문 전체를 읽지 않는다)
 # claude-mem 관측기가 남기는 자체 세션(사용자 작업이 아님). 다른 PC 보고서(11-16)에서 Claude 세션의 64% 였다
 OBSERVER_SLUG_MARKERS = ('-claude-mem-observer-sessions', '-claude-mem-work-view')
+# 작업 폴더 나누기(보고만 — 회수·적재는 그대로). 평가 복사본: 경로에 이 조각이 든 폴더, 또는 같은 이름 원본이 따로 있는 폴더
+EVAL_MARKERS = ('sbeval', 'smoketest')
+WIN_TEMP_PARTS = ('appdata', 'local', 'temp')   # 다른 OS 에서 읽은 윈도우 경로(C:\…\AppData\Local\Temp)도 임시로
+# MCP 커넥터 이름 → 알려진 종류(앞에서부터 처음 맞는 것). 이름만 보고 정한다
+MCP_CATEGORIES = (('slack', ('slack',)), ('atlassian', ('atlassian', 'confluence', 'jira')),
+                  ('google_drive', ('google-drive', 'google_drive', 'googledrive', 'gdrive', 'drive')),
+                  ('notion', ('notion',)), ('github', ('github',)), ('gitlab', ('gitlab',)), ('linear', ('linear',)),
+                  ('figma', ('figma',)), ('gmail', ('gmail',)), ('calendar', ('calendar', 'gcal')),
+                  ('microsoft', ('outlook', 'teams', 'sharepoint', 'onedrive')))
+MCP_NAME_MAX = 80
+CODEX_MCP_RE = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"\n]+)"|\'([^\'\n]+)\'|([A-Za-z0-9_-]+))', re.MULTILINE)
 CLAUDE_FILES_PER_DIR = 5           # Claude 프로젝트 폴더는 cwd 하나에서 나온 슬러그라 앞 몇 개만 열어 본다
 MAX_FILES = 200000                 # 폴더 하나에서 세는 파일 상한(넘으면 truncated)
 OWN_EXT = {'.md', '.txt', '.docx', '.pptx', '.pdf', '.hwp', '.hwpx', '.html', '.htm'}
@@ -200,6 +213,7 @@ class _Acc:
         self.lo: Optional[float] = None
         self.hi: Optional[float] = None
         self.cwds: set = set()
+        self.sessions: Dict[str, int] = {}   # 작업 폴더별 세션 파일 수(같은 이름 폴더 중 원본 고르기에 쓴다)
         self.compressed = 0
         self.excluded = 0            # 사용자 작업이 아닌 기록(관측기 세션 등)으로 뺀 파일 수
 
@@ -213,17 +227,83 @@ class _Acc:
         self.lo = st.st_mtime if self.lo is None else min(self.lo, st.st_mtime)
         self.hi = st.st_mtime if self.hi is None else max(self.hi, st.st_mtime)
         if cwd:
-            self.cwds.add(cwd)
+            self.note(cwd)
 
-    def summary(self, git_cache: Dict[str, bool]) -> Dict[str, Any]:
-        cwds = sorted(self.cwds)
+    def note(self, cwd: str, n: int = 1) -> None:
+        self.cwds.add(cwd)
+        self.sessions[cwd] = self.sessions.get(cwd, 0) + n
+
+    def summary(self, git_cache: Dict[str, bool], classes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """cwd_count·git_count 는 원본 작업 폴더만 센다. 평가 복사본·임시는 따로(있을 때만) 남긴다."""
+        classes = classes or {}
+        kinds = {c: classes.get(c, 'original') for c in self.cwds}
+        cwds = sorted(c for c, k in kinds.items() if k == 'original')
         out = {'files': self.files, 'size': self.size, 'period': [_date(self.lo), _date(self.hi)],
                'cwd_count': len(cwds), 'git_count': sum(1 for c in cwds if _in_git(c, git_cache))}
         if self.compressed:
             out['compressed'] = self.compressed
         if self.excluded:
             out['excluded_observer'] = self.excluded
+        for k, key in (('eval_copy', 'cwd_eval_copy'), ('temp', 'cwd_temp')):
+            n = sum(1 for v in kinds.values() if v == k)
+            if n:
+                out[key] = n
         return out
+
+
+def _parts(cwd: str) -> List[str]:
+    """경로 구성요소(소문자·NFC). 윈도우 경로를 다른 OS 에서 읽어도 나뉘게 / 와 \\ 둘 다로 자른다."""
+    return [_nfc(x).lower() for x in re.split(r'[\\/]+', cwd or '') if x and not x.endswith(':')]
+
+
+def _is_temp_cwd(cwd: str, home_n: str, roots: List[str]) -> bool:
+    """시스템 임시 폴더 아래인가. 홈이 임시 폴더 아래인 경우(격리 시험·일회용 계정) 그 홈 아래는 임시로 보지 않는다
+    — sb_vault.classify_path 와 같은 규칙."""
+    parts = _parts(cwd)
+    n = len(WIN_TEMP_PARTS)
+    if any(tuple(parts[i:i + n]) == WIN_TEMP_PARTS for i in range(len(parts) - n + 1)):
+        return True
+    raw = os.path.expanduser(cwd)
+    if not os.path.isabs(raw):     # 다른 OS 경로를 지금 폴더 기준으로 풀면 엉뚱한 판정이 난다
+        return False
+    real = _cmp(raw)
+    return any(sb_scope.path_within(real, r) and not (sb_scope.path_within(home_n, r) and sb_scope.path_within(real, home_n))
+               for r in roots)
+
+
+def _is_git_root(cwd: str) -> bool:
+    raw = os.path.expanduser(cwd)
+    return os.path.isabs(raw) and os.path.exists(os.path.join(raw, '.git'))
+
+
+def classify_cwds(sessions: Dict[str, int], home: str) -> Dict[str, str]:
+    """작업 폴더 → 'original' | 'eval_copy' | 'temp'. 경로 문자열·.git 존재·세션 수만 본다(폴더 내용은 열지 않는다).
+    - temp: 시스템 임시 폴더(gettempdir·/tmp·/private/tmp·/var/folders·AppData/Local/Temp) 아래
+    - eval_copy: 경로 구성요소에 'sbeval'('_sbeval')·'smoketest' 가 있거나, 같은 마지막 폴더 이름이 다른 부모 아래에도
+      있을 때 원본(git 루트, 없으면 세션이 가장 많은 쪽)이 아닌 나머지. src·app 같은 흔한 이름은 묶지 않는다."""
+    home_n = _cmp(home)
+    roots = sorted({_cmp(r) for r in sync_automemory.temp_roots()})
+    out: Dict[str, str] = {}
+    groups: Dict[str, List[str]] = {}
+    for cwd in sorted(sessions):
+        parts = _parts(cwd)
+        if _is_temp_cwd(cwd, home_n, roots):
+            out[cwd] = 'temp'
+        elif any(m in x for x in parts for m in EVAL_MARKERS):
+            out[cwd] = 'eval_copy'
+        else:
+            out[cwd] = 'original'
+            if parts and parts[-1] not in sb_vault.GENERIC_NAMES:
+                groups.setdefault(parts[-1], []).append(cwd)
+    for members in groups.values():
+        if len({_cmp(c) if os.path.isabs(os.path.expanduser(c)) else c for c in members}) < 2:
+            continue
+        gits = [c for c in members if _is_git_root(c)]
+        keep = set(gits) if gits else {min(members, key=lambda c: (-sessions.get(c, 0), len(c), c))}
+        for c in members:
+            if c not in keep:
+                out[c] = 'eval_copy'
+    return out
 
 
 def _in_git(cwd: str, cache: Dict[str, bool]) -> bool:
@@ -265,12 +345,13 @@ def _claude(root: Path) -> Optional[_Acc]:
             acc.excluded += sum(1 for _ in _files(d, '*.jsonl'))
             continue
         cwd = None
-        for i, f in enumerate(_files(d, '*.jsonl')):
+        files = _files(d, '*.jsonl')
+        for i, f in enumerate(files):
             if cwd is None and i < CLAUDE_FILES_PER_DIR:
                 cwd = _head_cwd(f)
             acc.add(f)
         if cwd:
-            acc.cwds.add(cwd)
+            acc.note(cwd, len(files))
     return acc
 
 
@@ -321,7 +402,7 @@ def _gemini(root: Path) -> Optional[_Acc]:
         for f in chats:
             acc.add(f)
         if chats and d.name in by_name:
-            acc.cwds.add(by_name[d.name])
+            acc.note(by_name[d.name], len(chats))
     return acc if acc.files or any(tmp.iterdir()) else None
 
 
@@ -352,16 +433,145 @@ def detect_sessions(home: Optional[str] = None) -> List[Dict[str, Any]]:
              ('antigravity_sessions', h / '.gemini' / 'antigravity', _antigravity(h / '.gemini')),
              ('omo_sessions', omo_root, omo_acc)]
     git_cache: Dict[str, bool] = {}
+    sessions: Dict[str, int] = {}     # 원본·복사본은 모든 에이전트 세션을 합쳐서 가른다
+    for _, root, acc in found:
+        if acc is not None and root is not None:
+            for c, n in acc.sessions.items():
+                sessions[c] = sessions.get(c, 0) + n
+    classes = classify_cwds(sessions, str(h))
     out = []
     for kind, root, acc in found:
         if acc is None or root is None:
             continue
         loc = sb_vault._short(str(root))
-        summary = acc.summary(git_cache)
+        summary = acc.summary(git_cache, classes)
         # 본문 적재는 사용자가 고른 세션만(A4) — 감지만으로는 색인 대상이 아니다
         out.append({'id': _sid(kind, loc), 'kind': kind, 'location': loc, 'mode': 'skip', 'discovered_by': 'auto',
                     'summary': summary})
     return out
+
+
+# ---------------------------------------------------------------- MCP 커넥터 감지(이름만)
+
+def _server_names(table: Any) -> List[str]:
+    """mcpServers 표의 하위 키 이름만. 값(주소·명령·env·토큰)은 보지 않는다."""
+    return [k for k in table if isinstance(k, str) and k.strip()] if isinstance(table, dict) else []
+
+
+def _json_mcp(path: Path, label: str, found: Dict[str, set], unreadable: List[str], flat_ok: bool = False) -> None:
+    """JSON 설정의 mcpServers 이름. 파일이 없으면 조용히 넘어가고, 있는데 못 읽으면(주석 섞인 JSON 등) '확인 못 함'.
+    flat_ok: 플러그인 .mcp.json 처럼 mcpServers 없이 서버 표가 맨 위에 있는 꼴도 받는다."""
+    if not path.is_file():
+        return
+    data = sb_vault.read_json_file(path)
+    if not isinstance(data, dict):
+        unreadable.append(label)
+        return
+    names = _server_names(data.get('mcpServers'))
+    if not names and flat_ok and 'mcpServers' not in data:
+        names = [k for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)]
+    for n in names:
+        found.setdefault(n, set()).add(label)
+
+
+def _plugin_mcp(claude_root: Path, settings: Any, found: Dict[str, set], unreadable: List[str]) -> None:
+    """켜진 플러그인의 .mcp.json. installed_plugins.json 의 installPath(플러그인 캐시 안만 믿는다)를 보고,
+    settings.json enabledPlugins 에서 false 인 플러그인은 뺀다."""
+    reg = sb_vault.read_json_file(claude_root / 'plugins' / 'installed_plugins.json')
+    plugins = reg.get('plugins') if isinstance(reg, dict) else None
+    if not isinstance(plugins, dict):
+        return
+    enabled = settings.get('enabledPlugins') if isinstance(settings, dict) else None
+    enabled = enabled if isinstance(enabled, dict) else {}
+    cache = _cmp(str(claude_root / 'plugins' / 'cache'))
+    for key in sorted(k for k in plugins if isinstance(k, str)):
+        if enabled.get(key) is False:
+            continue
+        entries = plugins[key] if isinstance(plugins[key], list) else [plugins[key]]
+        for e in entries:
+            if not isinstance(e, dict) or not isinstance(e.get('installPath'), str) or not e['installPath']:
+                continue
+            ip = os.path.expanduser(e['installPath'])
+            if not sb_scope.path_within(_cmp(ip), cache):
+                continue
+            _json_mcp(Path(ip) / '.mcp.json', 'claude_plugin', found, unreadable, flat_ok=True)
+
+
+def _codex_mcp(path: Path, found: Dict[str, set], unreadable: List[str]) -> None:
+    """config.toml 의 [mcp_servers.<이름>] 머리글만 정규식으로(표 안의 값은 읽지 않는다)."""
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        unreadable.append('codex')
+        return
+    for m in CODEX_MCP_RE.finditer(text):
+        n = next(g for g in m.groups() if g)
+        found.setdefault(n, set()).add('codex')
+
+
+def mcp_category(name: str) -> str:
+    low = _nfc(name).lower()
+    for cat, keys in MCP_CATEGORIES:
+        if any(k in low for k in keys):
+            return cat
+    return 'other'
+
+
+def _mcp_name(name: str) -> str:
+    """저장용 이름: 줄바꿈·제어문자를 빼고 길이를 자른다. 이름이 링크 꼴이면 비밀값을 지운다."""
+    n = ''.join(ch for ch in _nfc(name).strip() if ch.isprintable())
+    if _is_link(n):
+        n = redact_link(n)[0]
+    return n[:MCP_NAME_MAX]
+
+
+def detect_mcp(home: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """설정에 등록된 MCP 서버 이름 → (자료 항목 목록, 확인 못 한 설정 이름 목록). 적재하지 않는다(mode=live —
+    필요할 때 에이전트가 직접 조회). home 을 주면 그 아래만 본다(환경변수 무시)."""
+    h = Path(home).expanduser() if home else Path.home()
+    env = (lambda k: None) if home else os.environ.get
+    claude_root = Path(env('CLAUDE_CONFIG_DIR') or h / '.claude').expanduser()
+    codex_root = Path(env('CODEX_HOME') or h / '.codex').expanduser()
+    found: Dict[str, set] = {}
+    unreadable: List[str] = []
+    seen = set()
+    for cj in (h / '.claude.json', claude_root / '.claude.json'):   # CLAUDE_CONFIG_DIR 를 쓰면 그 안에 생긴다
+        if _cmp(str(cj)) in seen or not cj.is_file():
+            continue
+        seen.add(_cmp(str(cj)))
+        data = sb_vault.read_json_file(cj)
+        if not isinstance(data, dict):
+            unreadable.append('claude')
+            continue
+        for n in _server_names(data.get('mcpServers')):
+            found.setdefault(n, set()).add('claude')
+        projects = data.get('projects')
+        for proj in (projects.values() if isinstance(projects, dict) else []):
+            for n in _server_names(proj.get('mcpServers') if isinstance(proj, dict) else None):
+                found.setdefault(n, set()).add('claude')
+    settings_path = claude_root / 'settings.json'
+    settings = sb_vault.read_json_file(settings_path) if settings_path.is_file() else None
+    if settings_path.is_file() and not isinstance(settings, dict):
+        unreadable.append('claude_settings')
+    for n in _server_names(settings.get('mcpServers') if isinstance(settings, dict) else None):
+        found.setdefault(n, set()).add('claude')
+    _plugin_mcp(claude_root, settings, found, unreadable)
+    _codex_mcp(codex_root / 'config.toml', found, unreadable)
+    _json_mcp(h / '.gemini' / 'settings.json', 'gemini', found, unreadable)
+    _json_mcp(h / '.gemini' / 'antigravity' / 'mcp_config.json', 'antigravity', found, unreadable)
+    merged: Dict[str, Dict[str, Any]] = {}
+    for raw in sorted(found):
+        name = _mcp_name(raw)
+        if not name:
+            continue
+        loc = 'mcp:%s' % name
+        src = merged.setdefault(loc, {'id': _sid('mcp', loc), 'kind': 'mcp', 'location': loc, 'mode': 'live',
+                                      'discovered_by': 'auto', 'category': mcp_category(name),
+                                      'summary': {'found_in': []}})
+        src['summary']['found_in'] = sorted(set(src['summary']['found_in']) | found[raw])
+    return [merged[k] for k in sorted(merged)], sorted(set(unreadable))
 
 
 # ---------------------------------------------------------------- 폴더·링크 등록과 분류
@@ -578,10 +788,23 @@ def _answer_sources(answers: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
     return out
 
 
+def _mcp_evidence(mcp: List[Dict[str, Any]], unreadable: List[str]) -> str:
+    cats: Dict[str, int] = {}
+    for s in mcp:
+        cats[s.get('category') or 'other'] = cats.get(s.get('category') or 'other', 0) + 1
+    out = 'MCP 커넥터 %d개(적재 안 함, 필요할 때 에이전트가 직접 조회)' % len(mcp)
+    if cats:
+        out += ' — ' + ', '.join('%s=%d' % kv for kv in sorted(cats.items()))
+    if unreadable:
+        out += ' / 확인 못 함: ' + ', '.join(unreadable)
+    return out
+
+
 def stage2(answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """세션 감지 + 답에 있는 자료 등록 → sources.json. 소스가 0이어도 pass(기본 볼트)."""
     doc = load()
-    auto = detect_sessions()
+    mcp, mcp_unreadable = detect_mcp()
+    auto = detect_sessions() + mcp
     chosen = {s['id'] for s in doc['sources'] if s.get('selected_by') == 'user' and s.get('mode') == 'index'}
     for s in auto:                      # 사용자가 고른 세션(sb sources select)은 다시 감지해도 고른 그대로
         if s['id'] in chosen:
@@ -614,7 +837,13 @@ def stage2(answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         _metric('sources', len(sources), '0 이상(0이면 기본 볼트)', True, ev),
         _metric('session_files', sum(s['summary']['files'] for s in sess), '', True,
                 ', '.join('%s=%d' % (s['kind'], s['summary']['files']) for s in sess) or '세션 위치 없음'),
-        _metric('session_cwds', sum(s['summary']['cwd_count'] for s in sess), '', True, 'cwd 정규식만(본문 해석 없음)'),
+        _metric('session_cwds', sum(s['summary']['cwd_count'] for s in sess), '', True,
+                'cwd 정규식만(본문 해석 없음) — 원본 작업 폴더만(평가 복사본·임시 제외)'),
+        _metric('session_cwds_eval_copy', sum(int(s['summary'].get('cwd_eval_copy') or 0) for s in sess),
+                '보고만(판정에 안 씀)', True, "평가 복사본('sbeval'·'smoketest'·같은 이름 원본이 따로 있는 폴더)"),
+        _metric('session_cwds_temp', sum(int(s['summary'].get('cwd_temp') or 0) for s in sess),
+                '보고만(판정에 안 씀)', True, '시스템 임시 폴더 아래'),
+        _metric('mcp_connectors', len(mcp), '보고만(적재 안 함)', True, _mcp_evidence(mcp, mcp_unreadable)),
         _metric('sensitive_hints', sensitive, '보고만(민감 신호는 skip)', True, '파일 이름 기준'),
         _metric('missing_sources', len(missing), '0', not missing, ', '.join(missing)),
         _metric('body_fields_saved', len(leaked), '0', not leaked, "sources.json 에 'text'·'content'·'prompt' 키"),
@@ -879,6 +1108,11 @@ def _render(sources: List[Dict[str, Any]]) -> str:
         extra = ''
         if s['kind'] in SESSION_KINDS:
             extra = '파일 %s · 작업 폴더 %s · 기간 %s~%s' % (sm.get('files'), sm.get('cwd_count'), *(sm.get('period') or [None, None]))
+            more = [('평가 복사본', sm.get('cwd_eval_copy')), ('임시', sm.get('cwd_temp')),
+                    ('관측기 제외', sm.get('excluded_observer'))]
+            extra += ''.join(' · %s %s' % (k, v) for k, v in more if v)
+        elif s['kind'] == 'mcp':
+            extra = '%s · %s(적재 안 함)' % (s.get('category'), ','.join(sm.get('found_in') or []))
         elif s.get('mode') != 'live':
             c = s.get('classification') or {}
             extra = '파일 %s · 넣을 것 %s · 민감 %s · 잡동사니 %s · 모름 %s' % (
@@ -911,7 +1145,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     se.add_argument('--json', action='store_true')
     args = ap.parse_args(argv)
     if args.cmd == 'detect':
-        out = detect_sessions()
+        out = detect_sessions() + detect_mcp()[0]
     elif args.cmd in ('add', 'remove', 'select'):
         try:
             if args.cmd == 'add':
