@@ -200,3 +200,26 @@ class McpTests(Home):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SameNameInsideGitTests(unittest.TestCase):
+    """서로 다른 git 저장소 안의 같은 이름 하위 폴더는 복사본이 아니다(같은 이름 규칙은 저장소 밖·루트끼리만)."""
+
+    def test_subfolders_in_different_repos_stay_original(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, 'home')
+            a = os.path.join(home, 'repo-a', 'bridge')
+            b = os.path.join(home, 'repo-b', 'bridge')
+            plain = os.path.join(home, 'copies', 'proj')
+            orig = os.path.join(home, 'work', 'proj')
+            for p in (a, b, plain, orig):
+                os.makedirs(p)
+            for r in ('repo-a', 'repo-b'):
+                os.makedirs(os.path.join(home, r, '.git'))
+            os.makedirs(os.path.join(orig, '.git'))
+            with mock.patch.object(sb_sources.sync_automemory, 'temp_roots', return_value=[]):
+                out = sb_sources.classify_cwds({a: 5, b: 50, plain: 9, orig: 1}, home)
+            self.assertEqual(out[a], 'original')
+            self.assertEqual(out[b], 'original')
+            self.assertEqual(out[orig], 'original')     # git 루트 원본
+            self.assertEqual(out[plain], 'eval_copy')   # 저장소 밖 같은 이름 사본은 그대로 복사본

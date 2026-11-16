@@ -281,11 +281,14 @@ def classify_cwds(sessions: Dict[str, int], home: str) -> Dict[str, str]:
     """작업 폴더 → 'original' | 'eval_copy' | 'temp'. 경로 문자열·.git 존재·세션 수만 본다(폴더 내용은 열지 않는다).
     - temp: 시스템 임시 폴더(gettempdir·/tmp·/private/tmp·/var/folders·AppData/Local/Temp) 아래
     - eval_copy: 경로 구성요소에 'sbeval'('_sbeval')·'smoketest' 가 있거나, 같은 마지막 폴더 이름이 다른 부모 아래에도
-      있을 때 원본(git 루트, 없으면 세션이 가장 많은 쪽)이 아닌 나머지. src·app 같은 흔한 이름은 묶지 않는다."""
+      있을 때 원본(git 루트, 없으면 세션이 가장 많은 쪽)이 아닌 나머지. src·app 같은 흔한 이름은 묶지 않는다.
+      git 저장소 안의 하위 폴더(루트가 아님)는 같은 이름 규칙에 넣지 않는다 — 서로 다른 저장소의 같은 이름 하위 폴더는
+      복사본이 아니라 각자의 프로젝트다(2026-11-16 실측: 같은 이름으로 복사본이 된 26개 중 19개가 이 경우)."""
     home_n = _cmp(home)
     roots = sorted({_cmp(r) for r in sync_automemory.temp_roots()})
     out: Dict[str, str] = {}
     groups: Dict[str, List[str]] = {}
+    git_cache: Dict[str, bool] = {}
     for cwd in sorted(sessions):
         parts = _parts(cwd)
         if _is_temp_cwd(cwd, home_n, roots):
@@ -294,7 +297,9 @@ def classify_cwds(sessions: Dict[str, int], home: str) -> Dict[str, str]:
             out[cwd] = 'eval_copy'
         else:
             out[cwd] = 'original'
-            if parts and parts[-1] not in sb_vault.GENERIC_NAMES:
+            inner = (os.path.isabs(os.path.expanduser(cwd)) and not _is_git_root(cwd)
+                     and _in_git(cwd, git_cache))   # 저장소 안 하위 폴더 — 같은 이름 규칙에서 뺀다
+            if parts and parts[-1] not in sb_vault.GENERIC_NAMES and not inner:
                 groups.setdefault(parts[-1], []).append(cwd)
     def real(c: str) -> str:   # 같은 폴더의 다른 표기(심볼릭 링크·윈도우 대소문자)는 한 폴더로 본다
         return _cmp(c) if os.path.isabs(os.path.expanduser(c)) else c
