@@ -273,3 +273,19 @@ class LockAndAtomicWriteTests(_Env):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LockUnsupportedTests(unittest.TestCase):
+    """잠금이 지원 안 되는 파일시스템이면 회수를 영구히 건너뛰지 않는다(재검토 회귀)."""
+
+    def test_detects_unsupported_vs_contention(self):
+        import errno
+        import tempfile
+        import sb_lock
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 's.json')
+            with patch.object(sb_lock, 'lock', side_effect=OSError(errno.ENOLCK, 'no locks')):
+                self.assertTrue(sb_recall._lock_unsupported(p))
+            with patch.object(sb_lock, 'lock', side_effect=BlockingIOError()):
+                self.assertFalse(sb_recall._lock_unsupported(p))
+            self.assertFalse(sb_recall._lock_unsupported(p))   # 실제 잠금이 되는 파일시스템

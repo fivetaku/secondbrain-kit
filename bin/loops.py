@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sb_store import atomic_write_text, load_loops, locked_loops, loops_path, new_loop_id, validate_loop
 
 BACKOFF = [1, 2, 3, 5, 8, 13]
+EXPOSE_COUNT_MAX = 64            # 형식 검사 상한 — 6회 stale 뒤 snooze·재노출이 되풀이돼도 넘지 않는 값
 OPEN_CAP = 40
 
 def today(): return datetime.date.today()
@@ -108,8 +109,10 @@ def check_expose_count(item: Dict) -> int:
     """expose_count 는 0..6 정수(없으면 0). 손상값('3'·null·2.5·[]·-1·100·true)은 백오프를 조용히 틀리게 하거나
     트레이스백을 내므로 ValueError 로 거부한다 — 호출자는 원장을 바꾸지 않는다(M3 Pro 리뷰 P2-4)."""
     v = item.get('expose_count', 0)
-    if type(v) is not int or not 0 <= v <= len(BACKOFF):
-        raise ValueError(f"{item.get('id')} 의 expose_count 가 손상됨({v!r}) — 0..{len(BACKOFF)} 정수여야 함")
+    # 6회에 stale 이 된 뒤 snooze 로 다시 열리면 count 를 둔 채 또 노출되므로 6 을 넘는 값은 정상이다(재검토 회귀).
+    # 거부하는 것은 형식이 틀린 값(정수가 아님·bool·음수)과 터무니없이 큰 값뿐이다.
+    if type(v) is not int or not 0 <= v <= EXPOSE_COUNT_MAX:
+        raise ValueError(f"{item.get('id')} 의 expose_count 가 손상됨({v!r}) — 0..{EXPOSE_COUNT_MAX} 정수여야 함")
     return v
 
 
@@ -123,7 +126,7 @@ def apply_exposure(selected: List[Dict], t: str) -> None:
             i['status'] = 'stale'
             i['stale_at'] = t
         else:
-            i['next_review'] = iso(today() + datetime.timedelta(days=BACKOFF[i['expose_count'] - 1]))
+            i['next_review'] = iso(today() + datetime.timedelta(days=BACKOFF[min(i['expose_count'], len(BACKOFF)) - 1]))
 
 
 def record_shown(ids, timeout: float = 1.0) -> List[str]:

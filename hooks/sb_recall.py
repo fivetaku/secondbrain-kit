@@ -502,6 +502,28 @@ def write_json_atomic(path: str, obj) -> None:
         raise
 
 
+def _lock_unsupported(state_path: str) -> bool:
+    """이 파일시스템이 잠금 자체를 지원하지 않는가(경합이 아니라). 잠금을 한 번 비차단으로 걸어 오류 종류를 본다."""
+    import errno
+    try:
+        import sb_lock
+        with open(state_path + ".lock", "a") as f:
+            try:
+                sb_lock.lock(f, sb_lock.LOCK_EX | sb_lock.LOCK_NB)
+            except BlockingIOError:
+                return False          # 누가 쥐고 있다 = 경합
+            except OSError as exc:
+                return exc.errno in (errno.ENOLCK, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", -1)) \
+                    or getattr(exc, "winerror", None) not in (None, 33)   # 33 = ERROR_LOCK_VIOLATION(경합)
+            try:
+                sb_lock.lock(f, sb_lock.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class _Locked:
     """세션 원장 파일 하나에 대한 잠금 — 동시 훅 실행이 원장을 덮어쓰지 않게."""
 
@@ -656,10 +678,14 @@ def main():
     except TimeoutError:
         # 같은 세션의 다른 훅이 원장을 쥐고 있다 — 잠금 없이 돌면 원장이 엇갈려 같은 기록이 다시 주입된다.
         # 이번 회수는 건너뛰고 교정 알림만 낸다(M3 Pro 리뷰 P1-12). 잠금 파일 자체를 못 여는 경우는 예전처럼 진행한다.
+        # 다만 잠금이 '경합'이 아니라 '지원 안 됨'(SMB·NFS·동기화 폴더의 ENOLCK·EOPNOTSUPP)이면 매번 건너뛰게 되므로
+        # 그때는 예전처럼 무잠금으로 진행한다(재검토 회귀).
         if lk.f:
             lk.f.close()
-        emit(corr)
-        return
+        if not _lock_unsupported(state_path):
+            emit(corr)
+            return
+        lk = None
     except Exception:
         lk = None
     try:

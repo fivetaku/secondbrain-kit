@@ -235,3 +235,20 @@ class AliasFileShapeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReReviewRegressionTests(unittest.TestCase):
+    """적대적 재검토(11-16)가 찾은 회귀: snooze 로 다시 열린 stale 미결은 6 을 넘는 노출 수를 가진다."""
+
+    def test_count_above_six_is_valid_and_goes_stale_again(self):
+        import datetime
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'bin'))
+        import loops
+        item = {'id': 'L0001', 'status': 'open', 'expose_count': 6}
+        loops.apply_exposure([item], '2026-11-16')
+        self.assertEqual((item['expose_count'], item['status']), (7, 'stale'))
+        item2 = {'id': 'L0002', 'status': 'open', 'expose_count': 9}
+        self.assertEqual(loops.check_expose_count(item2), 9)
+        for bad in ("3", None, 2.5, [], -1, True, 100):
+            with self.assertRaises(ValueError):
+                loops.check_expose_count({'id': 'Lx', 'expose_count': bad})
