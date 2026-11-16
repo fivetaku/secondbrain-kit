@@ -148,7 +148,7 @@ class BuildTests(unittest.TestCase):
         with patch.object(sb_context, 'mode', side_effect=self.layers), patch.object(sb_context, 'recall', return_value=[]):
             block = sb_context.build('', 'work', 300, '')
         self.assertTrue(block.endswith('(용량 한도로 이하 생략)'))
-        self.assertLessEqual(len(block.rsplit('\n', 1)[0].encode('utf-8')), 300)
+        self.assertLessEqual(len(block.encode('utf-8')), 300)
 
     def test_recall_server_down_still_builds_block(self) -> None:
         refused = urllib.error.URLError(ConnectionRefusedError(61, 'refused'))

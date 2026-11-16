@@ -164,9 +164,26 @@ def build(query: str, scope: str, max_bytes: int, project: str = '') -> str:
     return _fit(list(map(mask, lines)), max_bytes, reserved)
 
 
+CUT_NOTE = '(용량 한도로 이하 생략)'
+
+
 def _fit(lines: List[str], max_bytes: int, reserved: Any = 0) -> str:
     """max_bytes 안에서 앞줄부터 싣는다. reserved=(시작 줄, 줄 수)면 그 줄들(규칙 머리·제목 최소 몫)의 자리를 먼저 떼어 두고,
-    앞 층이 넘쳐도 그 줄들은 싣는다. 머리 두 줄(안내문)은 최소 몫보다 앞선다 — 남는 자리만큼만 최소 몫을 둔다."""
+    앞 층이 넘쳐도 그 줄들은 싣는다. 머리 두 줄(안내문)은 최소 몫보다 앞선다 — 남는 자리만큼만 최소 몫을 둔다.
+    잘리면 생략 안내문 자리까지 떼고 다시 채운다 — 안내문을 포함한 출력 전체가 max_bytes 이하다(M3 Pro P2-3).
+    안내문조차 안 들어가는 아주 작은 한도면 안내문을 뺀다."""
+    out, cut = _pack(lines, max_bytes, reserved)
+    if not cut:
+        return '\n'.join(out)
+    out, _ = _pack(lines, max_bytes - (len(CUT_NOTE.encode('utf-8')) + 1), reserved)
+    block = '\n'.join(out + [CUT_NOTE])
+    if len(block.encode('utf-8')) <= max_bytes:
+        return block
+    body = '\n'.join(out)   # 남은 자리가 음수라 본문이 비었을 때만 온다
+    return body if len(body.encode('utf-8')) <= max_bytes else ''
+
+
+def _pack(lines: List[str], max_bytes: int, reserved: Any = 0):
     cost = [len(line.encode('utf-8')) + 1 for line in lines]
     keep = set()
     if reserved:
@@ -189,9 +206,7 @@ def _fit(lines: List[str], max_bytes: int, reserved: Any = 0) -> str:
             continue
         out.append(line)
         size += cost[i]
-    if cut:
-        out.append('(용량 한도로 이하 생략)')
-    return '\n'.join(out)
+    return out, cut
 
 
 def main(argv: Optional[List[str]] = None) -> int:

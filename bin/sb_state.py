@@ -345,12 +345,40 @@ def _check_path(target: str) -> Tuple[Path, Optional[Tuple[int, int]]]:
     return path, lines
 
 
-def _read_region(path: Path, lines: Optional[Tuple[int, int]], limit: int = 200_000) -> str:
-    data = path.read_bytes()[:limit].decode('utf-8', errors='replace')
+READ_LIMIT = 200_000
+
+
+def _read_region(path: Path, lines: Optional[Tuple[int, int]], limit: int = READ_LIMIT) -> Tuple[str, str]:
+    """(비교할 글, 상태). 상태 '' = 정상, 'out_of_range' = 시작 줄이 파일 끝 뒤, 'truncated' = limit 바이트에서 잘린 부분이 비교 구간에 걸침.
+    끝 줄만 파일 끝을 넘는 범위(#L2-L50)는 있는 줄까지만 비교한다(기존 동작)."""
+    raw = path.read_bytes()
+    truncated = len(raw) > limit
+    data = raw[:limit].decode('utf-8', errors='replace')
     if lines:
         rows = data.splitlines()
+        if lines[0] > len(rows):
+            return '', ('truncated' if truncated else 'out_of_range')
         data = '\n'.join(rows[lines[0] - 1:lines[1]])
-    return data
+        truncated = truncated and lines[1] >= len(rows)   # 마지막(잘렸을 수 있는) 줄을 안 건드리면 잘림 무관
+    return data, ('truncated' if truncated else '')
+
+
+def _range_unknown_on() -> bool:
+    """근거 없음(줄 범위 밖·잘림)을 unknown 으로 본다. SB_VERIFY_RANGE_UNKNOWN=0 이면 예전처럼 contradicted(2026-11-16 M3 Pro P1-10)."""
+    return os.environ.get('SB_VERIFY_RANGE_UNKNOWN', '1').strip() != '0'
+
+
+def _region_verdict(expected: str, path: Path, lines: Optional[Tuple[int, int]], detail: str) -> Tuple[str, str, str]:
+    text, status = _read_region(path, lines)
+    h = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    if expected in text:
+        return 'confirmed', h, detail
+    if status and _range_unknown_on():
+        if status == 'out_of_range':
+            n = len(path.read_bytes().decode('utf-8', errors='replace').splitlines())
+            return 'unknown', '', 'line span out of range (file has %d lines)' % n
+        return 'unknown', h, 'region truncated at %d bytes' % READ_LIMIT
+    return 'contradicted', h, detail
 
 
 # 업무 폴더 세션에서 말한 도구 결정(예: "임베딩 서버 자동 시작 켜줘")을 도구 scope 에 남길 때만 켠다.
@@ -387,9 +415,7 @@ def check_file_contains(cand: sqlite3.Row, target: str) -> Tuple[str, str, str]:
     path, lines = _check_path(target)
     if not path.is_file():
         return 'unknown', '', 'target file missing'
-    region = _read_region(path, lines)
-    h = hashlib.sha256(region.encode('utf-8')).hexdigest()
-    return ('confirmed' if _expected_text(cand) in region else 'contradicted'), h, 'file region compared'
+    return _region_verdict(_expected_text(cand), path, lines, 'file region compared')
 
 
 def check_json_file_value(cand: sqlite3.Row, target: str) -> Tuple[str, str, str]:
@@ -475,7 +501,7 @@ def check_user_utterance(cand: sqlite3.Row, target: str) -> Tuple[str, str, str]
             return 'rejected', '', 'utterance file outside scope paths'
         if not path.is_file():
             return 'unknown', '', 'record file missing'
-        text = _read_region(path, lines)
+        return _region_verdict(_expected_text(cand), path, lines, 'user utterance compared')
     h = hashlib.sha256(text.encode('utf-8')).hexdigest()
     return ('confirmed' if _expected_text(cand) in text else 'contradicted'), h, 'user utterance compared'
 

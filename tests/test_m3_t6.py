@@ -129,7 +129,7 @@ class ContextRulesShareTests(unittest.TestCase):
         self.assertIn('- 규칙 0', block)
         self.assertIn('- 규칙 1', block)
         self.assertIn('(용량 한도로 이하 생략)', block)
-        self.assertLessEqual(len(block.rsplit('\n', 1)[0].encode('utf-8')), 3000)
+        self.assertLessEqual(len(block.encode('utf-8')), 3000)
         self.assertLess(block.index('## 확정 사실(L2)'), block.index('## 규칙(L3, 제목만)'))
 
     def test_min_share_env_and_baseline(self) -> None:
@@ -146,7 +146,7 @@ class ContextRulesShareTests(unittest.TestCase):
 
     def test_tiny_budget_still_bounded(self) -> None:
         block = self.build(250)
-        self.assertLessEqual(len(block.rsplit('\n', 1)[0].encode('utf-8')), 250)
+        self.assertLessEqual(len(block.encode('utf-8')), 250)
 
     def test_fake_headings_not_titles(self) -> None:
         rules = [{'body': big_rules_file(3)}]
