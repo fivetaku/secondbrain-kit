@@ -45,11 +45,12 @@ OBSERVER_SLUG_MARKERS = ('-claude-mem-observer-sessions', '-claude-mem-work-view
 EVAL_MARKERS = ('sbeval', 'smoketest')
 WIN_TEMP_PARTS = ('appdata', 'local', 'temp')   # 다른 OS 에서 읽은 윈도우 경로(C:\…\AppData\Local\Temp)도 임시로
 # MCP 커넥터 이름 → 알려진 종류(앞에서부터 처음 맞는 것). 이름만 보고 정한다
+# microsoft 를 google_drive 앞에 둔다 — 'onedrive' 에도 'drive' 가 들어 있다
 MCP_CATEGORIES = (('slack', ('slack',)), ('atlassian', ('atlassian', 'confluence', 'jira')),
+                  ('microsoft', ('outlook', 'teams', 'sharepoint', 'onedrive')),
                   ('google_drive', ('google-drive', 'google_drive', 'googledrive', 'gdrive', 'drive')),
                   ('notion', ('notion',)), ('github', ('github',)), ('gitlab', ('gitlab',)), ('linear', ('linear',)),
-                  ('figma', ('figma',)), ('gmail', ('gmail',)), ('calendar', ('calendar', 'gcal')),
-                  ('microsoft', ('outlook', 'teams', 'sharepoint', 'onedrive')))
+                  ('figma', ('figma',)), ('gmail', ('gmail',)), ('calendar', ('calendar', 'gcal')))
 MCP_NAME_MAX = 80
 CODEX_MCP_RE = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"\n]+)"|\'([^\'\n]+)\'|([A-Za-z0-9_-]+))', re.MULTILINE)
 CLAUDE_FILES_PER_DIR = 5           # Claude 프로젝트 폴더는 cwd 하나에서 나온 슬러그라 앞 몇 개만 열어 본다
@@ -295,13 +296,17 @@ def classify_cwds(sessions: Dict[str, int], home: str) -> Dict[str, str]:
             out[cwd] = 'original'
             if parts and parts[-1] not in sb_vault.GENERIC_NAMES:
                 groups.setdefault(parts[-1], []).append(cwd)
+    def real(c: str) -> str:   # 같은 폴더의 다른 표기(심볼릭 링크·윈도우 대소문자)는 한 폴더로 본다
+        return _cmp(c) if os.path.isabs(os.path.expanduser(c)) else c
+
     for members in groups.values():
-        if len({_cmp(c) if os.path.isabs(os.path.expanduser(c)) else c for c in members}) < 2:
+        if len({real(c) for c in members}) < 2:
             continue
         gits = [c for c in members if _is_git_root(c)]
         keep = set(gits) if gits else {min(members, key=lambda c: (-sessions.get(c, 0), len(c), c))}
+        kept = {real(c) for c in keep}
         for c in members:
-            if c not in keep:
+            if real(c) not in kept:
                 out[c] = 'eval_copy'
     return out
 
@@ -502,7 +507,8 @@ def _codex_mcp(path: Path, found: Dict[str, set], unreadable: List[str]) -> None
     if not path.is_file():
         return
     try:
-        text = path.read_text(encoding='utf-8', errors='replace')
+        # utf-8-sig: 윈도우 메모장·PowerShell 이 앞에 붙이는 BOM 이 있으면 첫 머리글이 조용히 빠진다
+        text = path.read_text(encoding='utf-8-sig', errors='replace')
     except OSError:
         unreadable.append('codex')
         return

@@ -63,6 +63,20 @@ class CwdClassTests(Home):
         c = sb_sources.classify_cwds({'/a/proj': 3, '/b/proj': 9, '/c/src': 1, '/d/src': 1}, '/nohome')
         self.assertEqual(c, {'/a/proj': 'eval_copy', '/b/proj': 'original', '/c/src': 'original', '/d/src': 'original'})
 
+    def test_symlink_alias_of_original_stays_original(self):
+        work = self.h / 'work' / 'proj'
+        work.mkdir(parents=True)
+        (self.h / 'copy' / 'proj').mkdir(parents=True)
+        try:
+            os.symlink(self.h / 'work', self.h / 'alias')
+        except (OSError, NotImplementedError):
+            self.skipTest('심볼릭 링크를 만들 수 없는 환경')
+        c = sb_sources.classify_cwds({str(work): 5, str(self.h / 'alias' / 'proj'): 1,
+                                      str(self.h / 'copy' / 'proj'): 2}, str(self.h))
+        self.assertEqual(c[str(work)], 'original')
+        self.assertEqual(c[str(self.h / 'alias' / 'proj')], 'original')   # 같은 폴더의 다른 표기 — 복사본 아님
+        self.assertEqual(c[str(self.h / 'copy' / 'proj')], 'eval_copy')
+
     def test_home_under_temp_is_not_temp(self):
         tmp_home = self.root / 'h2'
         (tmp_home / 'proj').mkdir(parents=True)
@@ -163,10 +177,21 @@ class McpTests(Home):
         self.assertIn('"kind": "mcp"', out)
         self.assertEqual(out.count(SECRET), 0)
 
+    def test_codex_toml_with_bom_keeps_first_server(self):
+        write(self.h / '.codex' / 'config.toml', '﻿[mcp_servers.jira]\ncommand = "x"\n[mcp_servers.slack]\n')
+        mcp, bad = sb_sources.detect_mcp(str(self.h))
+        self.assertEqual([s['location'] for s in mcp], ['mcp:jira', 'mcp:slack'])
+        self.assertEqual(bad, [])
+
     def test_no_configs_no_mcp(self):
         self.assertEqual(sb_sources.detect_mcp(str(self.h)), ([], []))
         m = {x['name']: x for x in sb_sources.stage2({})['metrics']}
         self.assertEqual(m['mcp_connectors']['value'], 0)
+
+    def test_category_onedrive_is_microsoft(self):
+        self.assertEqual(sb_sources.mcp_category('ms-onedrive'), 'microsoft')   # 'drive' 가 들어 있어도
+        self.assertEqual(sb_sources.mcp_category('google-drive'), 'google_drive')
+        self.assertEqual(sb_sources.mcp_category('team drive'), 'google_drive')
 
     def test_link_like_name_redacted(self):
         self.assertNotIn(SECRET, sb_sources._mcp_name(URL))
