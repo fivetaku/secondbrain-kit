@@ -104,7 +104,18 @@ def exposed_ids(text: str) -> str:
     return ' '.join(lid for lid in dict.fromkeys(LOOP_ID_RE.findall(text)) if lid in live)
 
 
+def check_expose_count(item: Dict) -> int:
+    """expose_count 는 0..6 정수(없으면 0). 손상값('3'·null·2.5·[]·-1·100·true)은 백오프를 조용히 틀리게 하거나
+    트레이스백을 내므로 ValueError 로 거부한다 — 호출자는 원장을 바꾸지 않는다(M3 Pro 리뷰 P2-4)."""
+    v = item.get('expose_count', 0)
+    if type(v) is not int or not 0 <= v <= len(BACKOFF):
+        raise ValueError(f"{item.get('id')} 의 expose_count 가 손상됨({v!r}) — 0..{len(BACKOFF)} 정수여야 함")
+    return v
+
+
 def apply_exposure(selected: List[Dict], t: str) -> None:
+    for i in selected:   # 하나라도 손상이면 아무것도 바꾸지 않는다
+        check_expose_count(i)
     for i in selected:
         i['expose_count'] = i.get('expose_count', 0) + 1
         i['last_exposed'] = t
@@ -183,9 +194,20 @@ def mutate(items: List[Dict], args: argparse.Namespace) -> str:
         items.append(it)
         return f"추가: {it['id']}"
     if cmd == 'record-exposure':
-        selected = [find(items, lid) for lid in dict.fromkeys(args.ids)]
+        found = [find(items, lid) for lid in dict.fromkeys(args.ids)]
+        # M3 Pro 리뷰 P1-4: exposed-ids·record_shown 과 같은 판정(열린 미결·재노출일 도래·오늘 미노출)만 센다.
+        # 같은 날 재실행·닫힌 미결·재노출일 전 미결은 건너뛴다(rc 0 — 아침 문자 스크립트가 FAILED 를 남기지 않게).
+        # 끄기: SB_LOOPS_EXPOSURE_STRICT=0 (예전처럼 넘긴 ID를 모두 센다).
+        if os.environ.get('SB_LOOPS_EXPOSURE_STRICT', '1') == '0':
+            selected = found
+        else:
+            selected = [i for i in found if exposable(i, t)]
         apply_exposure(selected, t)
-        return "노출 기록: " + ' '.join(i['id'] for i in selected)
+        msg = "노출 기록: " + ' '.join(i['id'] for i in selected)
+        skipped = [i['id'] for i in found if i not in selected]
+        if skipped:
+            msg += " / 건너뜀(닫힘·오늘 기록됨·재노출일 전): " + ' '.join(skipped)
+        return msg
     i = find(items, args.id)
     if cmd == 'set-action':
         # 2026-09-16 memory-layer-refactor M2: 다음 행동은 미결(트랙) 단위로 귀속·갱신한다.

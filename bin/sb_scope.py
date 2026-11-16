@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,8 @@ def _load_aliases(path: Optional[str] = None) -> Dict[str, List[str]]:
             data = json.load(source)
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):   # [], null, 문자열 등 — 파싱 오류와 같게 빈 별칭으로 본다(M3 Pro 리뷰 P2-2)
+        return {}
     return {k: (v if isinstance(v, list) else [v]) for k, v in data.items() if isinstance(k, str)}
 
 
@@ -66,8 +69,25 @@ def path_within(child: str, root: str) -> bool:
     return child.startswith(base)
 
 
+def _nfc(s: str) -> str:
+    """맥 파일시스템의 NFD 한글과 입력의 NFC 한글을 같은 이름으로 본다(M3 Pro 리뷰 P2-1)."""
+    return unicodedata.normalize('NFC', s)
+
+
+def _name_key(s: str) -> str:
+    """이름 비교 공통 규칙: NFC, 소문자, '_'→'-', '-' 옆 공백은 없애고 나머지 공백 연속은 '-'.
+    'my app'·'My_App'·'my - app' 은 'my-app' 으로 같고 'myapp' 과는 다르다."""
+    t = _nfc(s).strip().lower().replace('_', '-')
+    t = re.sub(r'\s*-\s*', '-', t)
+    return '-'.join(t.split())
+
+
 def _norm_name(s: str) -> str:
-    return ''.join(s.lower().replace('_', '-').split())
+    """미결·상태·별칭 이름 비교 키 — project_key 의 이름 규칙(_name_key)과 같다(M3 Pro 리뷰 P1-6).
+    끄기: SB_SCOPE_NAME_LEGACY=1 (예전처럼 공백을 모두 없앤다 — 'my app' == 'myapp')."""
+    if os.environ.get('SB_SCOPE_NAME_LEGACY') == '1':
+        return ''.join(_nfc(s).lower().replace('_', '-').split())
+    return _name_key(s)
 
 
 # ── claude-mem project 꼬리표 비교 키(M3-T2, 2026-11-16) ────────────────────────────────
@@ -86,7 +106,7 @@ def scope_norm_on() -> bool:
 
 def slash_key(p: str) -> str:
     """비교용 경로 문자열 — 구분자 '/' 통일, 끝 구분자 제거, 소문자(맥·윈도우 기본 파일시스템은 대소문자 무시)."""
-    s = re.sub(r'/+', '/', p.replace('\\', '/'))
+    s = re.sub(r'/+', '/', _nfc(p).replace('\\', '/'))
     return (s.rstrip('/') or '/').lower()
 
 
@@ -113,7 +133,7 @@ def home_forms() -> Tuple[frozenset, frozenset]:
     except (OSError, ValueError):
         pass
     names = {slash_key(home).rsplit('/', 1)[-1]}
-    names |= {x.strip().lower() for x in ck[1].split(',') if x.strip()}
+    names |= {_nfc(x).strip().lower() for x in ck[1].split(',') if x.strip()}
     names.discard('')
     names.discard('/')
     out = (frozenset(paths), frozenset(names))
@@ -124,8 +144,8 @@ def home_forms() -> Tuple[frozenset, frozenset]:
 
 
 def _tag_name_key(s: str) -> str:
-    # 대소문자·'_'/'-' 차이만 없앤다. 공백은 '-' 로 바꿔 'my app' 과 'myapp' 을 합치지 않는다
-    return '-'.join(s.strip().lower().replace('_', '-').split())
+    # 대소문자·'_'/'-' 차이만 없앤다. 공백은 '-' 로 바꿔 'my app' 과 'myapp' 을 합치지 않는다(_norm_name 과 같은 규칙)
+    return _name_key(s)
 
 
 def project_key(name) -> str:
@@ -137,6 +157,7 @@ def project_key(name) -> str:
         return ''
     if not scope_norm_on():
         return s
+    s = _nfc(s)
     home_paths, home_names = home_forms()
     if is_pathlike_tag(s):
         p = slash_key(os.path.expanduser(s) if s.startswith('~') else s)
@@ -218,7 +239,7 @@ def require_scope(scope_id: Optional[str]) -> str:
 def loop_matches_scope(loop_project: Optional[str], scope_id: str) -> bool:
     """미결의 project 값이 현재 scope 에 속하는가.
 
-    허용: 정확 일치, 또는 표기 정규화(대소문자·'_'↔'-'·공백) 후 일치.
+    허용: 정확 일치, 또는 표기 정규화(NFC·대소문자·'_'↔'-'·공백→'-', _norm_name) 후 일치.
     금지: basename 폴백 — project 이름이 폴더 이름과 우연히 같다는 이유로 붙이지 않는다.
     레거시 이름 project 는 project_aliases.json 에 경로를 등록해 resolve_scope_id 가 그 키를
     돌려주게 만들어서 연결한다.

@@ -156,7 +156,12 @@ class LoopsTests(unittest.TestCase):
 
     def test_six_exposures_apply_backoff_and_stale(self):
         sb_store.save_loops([self.item()])
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
         for count in range(1, 7):
+            if count > 1:  # 노출은 하루 한 번·재노출일 도래분만 센다(M3 Pro 리뷰 P1-4) — 날이 지난 것처럼 되돌린다
+                rec = sb_store.load_loops()[0]
+                rec.update(last_exposed=yesterday, next_review=yesterday)
+                sb_store.save_loops([rec])
             result = self.cli('record-exposure', 'L12345678')
             self.assertEqual(result.returncode, 0, result.stderr)
             record = sb_store.load_loops()[0]
