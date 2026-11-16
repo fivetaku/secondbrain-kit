@@ -92,6 +92,53 @@ class OtherKitLocationTests(unittest.TestCase):
         self.assertFalse(json.loads(r.stdout)['configured'])
         self.assertFalse((self.sbhome / 'config' / 'vault.json').exists())   # status 는 읽기만 한다
 
+    def test_doctor_codex_trust_hint_points_to_kit(self):
+        """doctor 의 Codex 훅 신뢰 ❌ 안내도 복사본 위치의 codex_trust.py 를 가리킨다(상대 경로 'installer/' 없음).
+        codex·app-server 는 가짜로 바꿔 끼운다(미신뢰 훅 1개)."""
+        drv = textwrap.dedent('''
+            import importlib.util, json, sys, types
+            from pathlib import Path
+            kit = Path(sys.argv[1])
+            spec = importlib.util.spec_from_file_location('sbkit_doctor_loc', str(kit / 'installer' / 'doctor.py'))
+            d = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(d)
+            d.shutil.which = lambda n: '/bin/codex'
+            d._has_kit_hook = lambda p, e: True
+            cmd = '"py" "%s/hooks/sb_recall.py"' % str(d.KIT).replace('\\\\', '/')
+            d.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+                stdout=json.dumps([{'command': cmd, 'trustStatus': 'untrusted'}]), stderr='')
+            d.check_codex()
+            print(json.dumps([r for r in d.rows if r[1] == 'Codex 훅 신뢰'], ensure_ascii=False))
+        ''')
+        r = self._py(['-c', drv, str(self.kit)], timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = json.loads(r.stdout)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], '❌')
+        self.assertIn(str(self.kit / 'installer' / 'codex_trust.py'), rows[0][2])
+        self.assertNotIn('python installer/', rows[0][2])
+
+    def test_install_done_message_points_to_kit(self):
+        """설치 완료 문구의 --doctor 안내가 복사본 위치의 install.py 를 가리킨다. 설치 단계는 모두 빈 함수로 바꿔 끼운다."""
+        drv = textwrap.dedent('''
+            import importlib.util, sys
+            from pathlib import Path
+            kit = Path(sys.argv[1])
+            spec = importlib.util.spec_from_file_location('sbkit_install_loc', str(kit / 'installer' / 'install.py'))
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            for name in ('check_prereqs', 'setup_venv', 'install_claude_mem', 'pin_chroma_mcp', 'setup_embedding',
+                         'merge_claude_mem_settings', 'claude_hooks', 'codex_setup', 'rules', 'sb_launcher',
+                         'schedule', 'vault_onboarding', 'setup_stage'):
+                setattr(m, name, lambda *a, **k: {})
+            del m.WARNINGS[:]
+            sys.argv = ['install.py', '--no-vault', '--no-setup']
+            m.main()
+        ''')
+        r = self._py(['-c', drv, str(self.kit)], timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('완료. 확인: python "%s" --doctor' % (self.kit / 'installer' / 'install.py'), r.stdout)
+
     def test_setup_run_non_interactive_from_other_location(self):
         """복사본의 sb_setup.py 로 CLI 전체 경로 — 1단계(가짜 ❌)에서 멈추고, 입력을 기다리지 않는다."""
         drv = textwrap.dedent('''
