@@ -329,6 +329,7 @@ FRESH_MINUTES = 20   # observations younger than this are "what is happening rig
 
 def enrich(items, content_session_id: str):
     """One read-only SQLite pass: add date+project, drop this session's own observations and very fresh ones."""
+    LAST.pop("enrich_failed", None)
     if not items:
         return items
     try:
@@ -342,8 +343,11 @@ def enrich(items, content_session_id: str):
         meta = {r[0]: (r[1], r[2], r[3], r[4] or "") for r in con.execute(
             f"SELECT id, substr(created_at,1,10), project, created_at_epoch, metadata FROM observations WHERE id IN ({','.join('?'*len(ids))})", ids)}
         con.close()
-    except Exception:
-        return items
+    except Exception as exc:
+        # DB 를 못 읽으면(설치 직후 없음·스키마 변경·잠김) 자기 세션·20분 내 기록과 project 를 거를 수 없다.
+        # 거르지 않은 후보를 내보내지 않고 실패만 남긴다(M3 Pro 리뷰 P1-9). 예전처럼 그대로 내보내기: SB_RECALL_ENRICH_FAIL_OPEN=1
+        LAST["enrich_failed"] = type(exc).__name__
+        return items if os.environ.get("SB_RECALL_ENRICH_FAIL_OPEN") == "1" else []
     cutoff = (time.time() - FRESH_MINUTES * 60) * 1000
     out = []
     for it in items:
@@ -472,6 +476,32 @@ def prompt_hash(p: str) -> str:
     return hashlib.sha256(p.strip().encode("utf-8")).hexdigest()[:16]
 
 
+def state_file(sid: str, suffix: str) -> str:
+    """세션 상태 파일 경로. UUID·영숫자 sid 는 이름 그대로(기존 원장 유지), 그 밖의 문자가 든 sid 는 해시 이름으로 —
+    'a/b'·'a_b'·'a.b' 가 한 원장을 같이 쓰지 않게(M3 Pro 리뷰 P1-12)."""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
+        name = sid
+    else:
+        import hashlib
+        name = "h_" + hashlib.sha256(sid.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+    return os.path.join(STATE_DIR, name + suffix)
+
+
+def write_json_atomic(path: str, obj) -> None:
+    """같은 폴더 임시 파일에 쓰고 바꿔 끼운다 — 쓰다 실패해도 기존 원장이 잘리지 않게(M3 Pro 리뷰 P1-12)."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class _Locked:
     """세션 원장 파일 하나에 대한 잠금 — 동시 훅 실행이 원장을 덮어쓰지 않게."""
 
@@ -542,7 +572,7 @@ def briefed_corrections() -> set:
 
 def correction_note(sid: str, prompt: str, cwd: str) -> str:
     """교정 판정 작업을 프롬프트당 한 번 띄우고, 이 세션에 쌓인 미통지 후보를 최대 3건 알린다(보여 준 것만 통지 완료)."""
-    path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".corr.json")
+    path = state_file(sid, ".corr.json")
     note = ""
     try:
         with _Locked(path):
@@ -560,8 +590,7 @@ def correction_note(sid: str, prompt: str, cwd: str) -> str:
                 note = ("[교정 감지] 이 세션의 사용자 교정이 지속 규칙으로 보인다. 맞으면 지금 규칙·메모리에 저장하고, 아니면 무시한다.\n"
                         + "\n".join("- " + rule for _, rule in shown))
                 cst["notified"] = cst["notified"] + [k for k, _ in shown]
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(cst, fh)
+            write_json_atomic(path, cst)
     except Exception:
         pass
     return note
@@ -578,6 +607,7 @@ def main():
     except Exception:
         return
     prompt = str(raw.get("prompt") or "")
+    sid = str(raw.get("session_id") or "nosession")
     if "codex" in sys.argv[1:]:   # Codex: exec 자동화 세션에는 주입·교정 판정을 하지 않는다
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -585,15 +615,22 @@ def main():
             if is_automation(raw):
                 return
         except Exception:
-            pass
-    sid = str(raw.get("session_id") or "nosession")
+            # 판정기를 못 불러오거나 판정 중 오류 — 자동화 세션에 주입·교정 판정이 새지 않게 닫는 쪽으로 멈추고,
+            # sb_health·sb_setup 이 볼 수 있게 남긴다(M3 Pro 리뷰 P1-8). 예전처럼 진행: SB_CODEX_DETECTOR_FAIL_OPEN=1
+            if os.environ.get("SB_CODEX_DETECTOR_FAIL_OPEN") != "1":
+                if not (os.environ.get("CLAUDE_MEM_INTERNAL") == "1" or os.environ.get("SB_RECALL", "1") == "0"):
+                    recall_log({"sid": hashlib_sid(sid), "automation": True, "why": "codex_detector_error"})
+                return
     os.makedirs(STATE_DIR, exist_ok=True)
     internal = os.environ.get("CLAUDE_MEM_INTERNAL") == "1" or os.environ.get("SB_RECALL", "1") == "0"
-    corr = "" if internal else correction_note(sid, prompt, str(raw.get("cwd") or ""))
     if internal:   # 관찰기·야간 호출은 예전처럼 아무것도 쓰지 않는다(recall.jsonl 도 남기지 않음)
         return
     why = automation_reason(raw, prompt)
-    if why:   # M3-T3: 자동화면 회수 주입 없이 기록만(교정 알림은 이전과 같다). sb_health 는 automation 줄을 주입으로 세지 않는다
+    # M3 Pro 리뷰 P1-13: 자동화 판정을 교정 처리보다 먼저 한다 — 자동화 세션에는 교정 알림 주입·LLM 판정 기동·상태 기록을 하지 않는다.
+    # 예전처럼 자동화 세션에도 교정 알림: SB_RECALL_AUTOMATION_CORRECTION=1
+    corr = "" if (why and os.environ.get("SB_RECALL_AUTOMATION_CORRECTION") != "1") \
+        else correction_note(sid, prompt, str(raw.get("cwd") or ""))
+    if why:   # M3-T3: 자동화면 회수 주입 없이 기록만. sb_health 는 automation 줄을 주입으로 세지 않는다
         recall_log({"sid": hashlib_sid(sid), "project": _cwd_project(str(raw.get("cwd") or "")),
                     "automation": True, "why": why})
         emit(corr)
@@ -603,7 +640,7 @@ def main():
         return
     # claude-mem 의 project 는 cwd 폴더 이름이다(sb_scope id 와 다른 이름공간). 홈 표기·별칭은 hook_project 가 맞춘다.
     project = hook_project(raw.get("cwd"))
-    state_path = os.path.join(STATE_DIR, re.sub(r"[^\w-]", "_", sid) + ".json")
+    state_path = state_file(sid, ".json")
     if not os.path.exists(state_path):   # 새 세션일 때만: 오래된 세션 상태 파일 정리
         cutoff = time.time() - STATE_TTL_DAYS * 86400
         for name in os.listdir(STATE_DIR):
@@ -616,6 +653,13 @@ def main():
     lk = _Locked(state_path)
     try:
         lk.__enter__()
+    except TimeoutError:
+        # 같은 세션의 다른 훅이 원장을 쥐고 있다 — 잠금 없이 돌면 원장이 엇갈려 같은 기록이 다시 주입된다.
+        # 이번 회수는 건너뛰고 교정 알림만 낸다(M3 Pro 리뷰 P1-12). 잠금 파일 자체를 못 여는 경우는 예전처럼 진행한다.
+        if lk.f:
+            lk.f.close()
+        emit(corr)
+        return
     except Exception:
         lk = None
     try:
@@ -657,7 +701,8 @@ def _main_locked(raw, prompt, sid, project, state_path, corr):
     recall_log({"sid": hashlib_sid(sid), "project": project, "ids": [it["id"] for it in fresh],
                 "hint": bool(hint), "gated": gated, "ms": int((time.time() - t0) * 1000),
                 "prompt_sha": hashlib_sid(prompt.strip()), "cand": LAST.get("cand", []), "gate": LAST.get("gate"),
-                "kept": [it["id"] for it in items], "max": MAX_ITEMS})
+                "kept": [it["id"] for it in items], "max": MAX_ITEMS,
+                **({"enrich_failed": LAST["enrich_failed"]} if LAST.get("enrich_failed") else {})})
     if not fresh and not hint:
         emit(corr)
         return
@@ -676,8 +721,8 @@ def _main_locked(raw, prompt, sid, project, state_path, corr):
     if corr:
         ctx = corr + "\n\n" + ctx
     try:
-        with open(state_path, "w", encoding="utf-8") as fh:
-            json.dump({"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt_sha": ph, "updated": time.time()}, fh)
+        write_json_atomic(state_path, {"ids": sorted(seen | {it["id"] for it in fresh}), "last_prompt_sha": ph,
+                                       "updated": time.time()})
     except Exception:
         pass
     # recall_gate 의 Stop 게이트 기준 시각 — 기간·이력 질문에만 건다(회수 목록만 붙은 프롬프트는 제외: 매 답변 되돌림 방지)
