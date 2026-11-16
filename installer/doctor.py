@@ -302,7 +302,7 @@ def check_codex():
     bad = [h for h in ours if h.get('trustStatus') != 'trusted']
     plugin_on = [h for h in hs if 'claude-mem' in str(h.get('pluginId') or '') and h.get('enabled')]
     rec('✅' if ours and not bad else '❌', 'Codex 훅 신뢰', '%d개 신뢰됨' % len(ours) if ours and not bad else
-        '%d/%d개 미신뢰 — python installer/codex_trust.py trust --match "%s"' % (len(bad), len(ours), kit))
+        '%d/%d개 미신뢰 — python "%s" trust --match "%s"' % (len(bad), len(ours), KIT / 'installer' / 'codex_trust.py', kit))
     rec('✅' if not plugin_on else '⚠', 'Codex claude-mem 플러그인 훅',
         '꺼짐(우리 훅이 대신 캡처)' if not plugin_on else '켜져 있음 — exec 자동화까지 캡처됨')
 

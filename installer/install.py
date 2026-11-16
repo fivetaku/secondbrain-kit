@@ -1057,7 +1057,7 @@ def main() -> None:
         for w in WARNINGS:
             say('  ⚠ ' + w)
     else:
-        say('\n완료. 확인: python installer/install.py --doctor  (새 세션을 열면 재개 브리핑이 뜹니다)')
+        say('\n완료. 확인: python "%s" --doctor  (새 세션을 열면 재개 브리핑이 뜹니다)' % (KIT / 'installer' / 'install.py'))
 
 
 if __name__ == '__main__':
