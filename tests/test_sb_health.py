@@ -221,6 +221,56 @@ class HealthTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class ChromaOwnerTests(unittest.TestCase):
+    """2026-11-09 포트 전환 때 옛 워커가 Chroma 쓰기 잠금을 쥔 채 남아 새 워커를 이틀간 막았다."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix='sb-owner-test-')
+        self.addCleanup(tmp.cleanup)
+        self.cm = Path(tmp.name)
+        (self.cm / 'chroma').mkdir()
+        env = patch.dict(os.environ, {'SB_CLAUDE_MEM_DIR': str(self.cm)})
+        env.start()
+        self.addCleanup(env.stop)
+        from datetime import datetime, timezone
+        self.now = datetime(2026, 11, 16, 1, 0, 0, tzinfo=timezone.utc)
+
+    def write(self, lock_pid: int, worker_pid: int, started: str = '2026-11-16T00:00:00.000Z') -> None:
+        (self.cm / 'chroma' / '.claude-mem-chroma-writer.lock').write_text(json.dumps({'pid': lock_pid}), encoding='utf-8')
+        (self.cm / 'worker.pid').write_text(json.dumps({'pid': worker_pid, 'port': 37761, 'startedAt': started}),
+                                            encoding='utf-8')
+
+    def check(self, cmdlines):
+        with patch.object(sb_health, '_proc_cmdline', side_effect=lambda pid: cmdlines.get(pid)):
+            return sb_health.check_chroma_owner(self.now)
+
+    def test_no_files_or_same_pid_is_ok(self) -> None:
+        self.assertEqual(self.check({})['skipped'], 'no lock or worker.pid')
+        self.write(10, 10)
+        self.assertTrue(self.check({})['ok'])
+
+    def test_orphan_worker_holding_lock_is_flagged(self) -> None:
+        self.write(47616, 46140)
+        w = 'bun.exe worker-service.cjs --daemon'
+        r = self.check({47616: w, 46140: w})
+        self.assertFalse(r['ok'])
+        self.assertEqual((r['fix'], r['lock_pid']), ('chroma-owner', 47616))
+
+    def test_dead_or_foreign_lock_holder_and_fresh_worker_are_not_flagged(self) -> None:
+        w = 'bun.exe worker-service.cjs --daemon'
+        self.write(47616, 46140)
+        self.assertTrue(self.check({46140: w})['ok'])                       # 낡은 잠금 — 워커가 스스로 지운다
+        self.assertTrue(self.check({47616: 'notepad.exe', 46140: w})['ok'])  # PID 재사용
+        self.write(47616, 46140, started='2026-11-16T00:58:00.000Z')         # 막 뜬 워커(재시작 중 전환기)
+        self.assertTrue(self.check({47616: w, 46140: w})['ok'])
+
+    def test_kill_rechecks_worker_before_killing(self) -> None:
+        with patch.object(sb_health, '_proc_cmdline', return_value='notepad.exe'), \
+                patch.object(sb_health.subprocess, 'run') as run:
+            self.assertFalse(sb_health.kill_orphan_worker(123))
+        run.assert_not_called()
+
+
 class VectorBackfillTests(unittest.TestCase):
     """벡터 미반영은 워커 시작 때만 백필된다 — 서비스가 떠 있으면 --fix 가 하루 1회 워커를 재시작한다."""
 

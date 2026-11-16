@@ -745,6 +745,12 @@ def run_mode(args) -> Dict[str, Any]:
 
 
 def main(argv: List[str] = None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows 파이프는 cp949 — 한글 JSON·표를 UTF-8 로 내보낸다(loops.py 와 같은 방식)
+        try:
+            if stream is not None and hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8')
+        except Exception:  # noqa: BLE001
+            pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('query', nargs='?')
     group = parser.add_mutually_exclusive_group()

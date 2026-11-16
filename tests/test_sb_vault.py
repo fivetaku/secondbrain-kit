@@ -42,7 +42,8 @@ class VaultEnv(unittest.TestCase):
         self.small = self.home / 'small'          # 관측이 적어 scope 로 제안하지 않는다
         self.small.mkdir()
         env = mock.patch.dict(os.environ, {
-            'HOME': str(self.home), 'SB_HOME': str(self.sbhome), 'CLAUDE_CONFIG_DIR': str(self.claude),
+            'HOME': str(self.home), 'USERPROFILE': str(self.home),   # 윈도우 expanduser 는 HOME 이 아니라 USERPROFILE 을 본다
+            'SB_HOME': str(self.sbhome), 'CLAUDE_CONFIG_DIR': str(self.claude),
             'SB_CLAUDE_MEM_DIR': str(self.home / '.claude-mem'), 'SB_VAULT_LLM': 'off',
             'SB_PROJECT_ALIASES': str(self.sbhome / 'config' / 'project_aliases.json')})
         env.start()
@@ -381,7 +382,8 @@ class PlanApplyTests(VaultEnv):
     def test_new_files_are_private(self):
         p = self.plan()
         sb_vault.apply_plan(p, p['plan_hash'])
-        self.assertEqual(sb_vault.vault_json_path().stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':   # 윈도우는 chmod 권한 비트가 없다
+            self.assertEqual(sb_vault.vault_json_path().stat().st_mode & 0o777, 0o600)
 
     def test_non_git_nested_folders_share_root(self):
         ws = self.home / 'ws'
@@ -420,7 +422,10 @@ class PlanApplyTests(VaultEnv):
         real.parent.mkdir()
         real.write_text('{"env": {}}\n', encoding='utf-8')
         link = self.claude / 'settings.json'
-        link.symlink_to(real)
+        try:
+            link.symlink_to(real)
+        except OSError:   # 윈도우 일반 사용자는 심볼릭 링크 권한이 없다(WinError 1314)
+            self.skipTest('심볼릭 링크를 만들 수 없는 환경')
         p = self.plan('listed')
         rec = sb_vault.apply_plan(p, p['plan_hash'])
         self.assertTrue(rec['verify']['ok'])
@@ -707,7 +712,10 @@ class Round3Tests(VaultEnv):
         (real / 'x').mkdir(parents=True)
         subprocess.run(['git', 'init', '-q', str(real)], check=True)
         link = self.home / '.codex'
-        link.symlink_to(real)
+        try:
+            link.symlink_to(real)
+        except OSError:   # 윈도우 일반 사용자는 심볼릭 링크 권한이 없다(WinError 1314)
+            self.skipTest('심볼릭 링크를 만들 수 없는 환경')
         self.assertEqual(sb_vault.classify_path(str(link / 'x')), 'automation')
 
 

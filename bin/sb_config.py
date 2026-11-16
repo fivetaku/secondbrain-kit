@@ -57,9 +57,14 @@ def claude_mem_settings() -> dict:
 
 
 def _default_port() -> int:
-    """claude-mem 기본 포트 규칙: 37700 + (uid % 100). Windows 는 uid 가 없어 37777."""
+    """claude-mem 기본 포트 규칙(15.12+): 37700 + (uid % 100). uid 가 없는 Windows 는
+    37700 + sha256(소문자 데이터 폴더 절대경로) 앞 4바이트 % 100 — 예전 37777 이 아니다(2026-11-09 포트 전환 사고)."""
     getuid = getattr(os, 'getuid', None)
-    return 37700 + (getuid() % 100) if getuid else 37777
+    if getuid:
+        return 37700 + (getuid() % 100)
+    import hashlib
+    path = os.path.abspath(str(claude_mem_dir())).lower()
+    return 37700 + int.from_bytes(hashlib.sha256(path.encode('utf-8')).digest()[:4], 'big') % 100
 
 
 def worker_base_url() -> str:

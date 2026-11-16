@@ -327,7 +327,10 @@ class ChromaPinTest(unittest.TestCase):
         real.write_text('{}', encoding='utf-8')
         os.chmod(real, 0o600)
         link = tmp / 'settings.json'
-        link.symlink_to(real)
+        try:
+            link.symlink_to(real)
+        except OSError:   # 윈도우 일반 사용자는 심볼릭 링크 권한이 없다(WinError 1314)
+            self.skipTest('심볼릭 링크를 만들 수 없는 환경')
         with mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'backup'):
             inst.write_json(link, {'a': 1})
         self.assertTrue(link.is_symlink())

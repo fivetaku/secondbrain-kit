@@ -511,6 +511,80 @@ def uses_ollama() -> bool:
         return False
 
 
+CHROMA_OWNER_GRACE_SEC = int(os.environ.get('SB_HEALTH_CHROMA_OWNER_GRACE', '300'))
+
+
+def _proc_cmdline(pid: int) -> Optional[str]:
+    """pid 의 명령줄. 프로세스가 없거나 못 읽으면 None. (Windows 의 os.kill(pid, 0) 은 프로세스를 죽이므로 쓰지 않는다.)"""
+    try:
+        if os.name == 'nt':
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                                '(Get-CimInstance Win32_Process -Filter "ProcessId={}").CommandLine'.format(int(pid))],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            r = subprocess.run(['ps', '-o', 'command=', '-p', str(int(pid))], capture_output=True, text=True,
+                               timeout=10)
+    except Exception:  # noqa: BLE001
+        return None
+    out = (r.stdout or '').strip()
+    return out or None
+
+
+def _parse_iso(s: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def check_chroma_owner(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Chroma 쓰기 잠금을 현재 워커가 아닌 다른 claude-mem 워커가 쥐고 있는지(고아 워커).
+    2026-11-09 claude-mem 15.12 업데이트로 기본 포트가 37777→37761 로 바뀌자, 훅이 옛 워커(37777)를 '포트 없는 PID'로
+    보고 PID 파일만 지운 채 새 워커를 띄웠다. 옛 워커는 살아서 잠금을 쥐고 있어 새 워커의 Chroma 연결이 이틀간
+    'already owned by PID … refusing to start a second writer' 로 막혔다(ERROR·WARN 700여 줄, 벡터 동기화 정지).
+    오탐을 막으려고 ① 잠금 PID ≠ 워커 PID ② 잠금 PID 가 claude-mem worker-service 프로세스 ③ 현재 워커가
+    CHROMA_OWNER_GRACE_SEC 넘게 떠 있음 — 셋이 모두 맞을 때만 경고하고, fix 는 잠금 쥔 고아 워커를 끝낸다."""
+    base = sb_config.claude_mem_dir()
+    try:
+        lock = json.loads((base / 'chroma' / '.claude-mem-chroma-writer.lock').read_text(encoding='utf-8'))
+        worker = json.loads((base / 'worker.pid').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {'ok': True, 'msg': '', 'skipped': 'no lock or worker.pid'}
+    lock_pid, worker_pid_ = lock.get('pid'), worker.get('pid')
+    if not isinstance(lock_pid, int) or not isinstance(worker_pid_, int) or lock_pid == worker_pid_:
+        return {'ok': True, 'msg': ''}
+    started = _parse_iso(worker.get('startedAt'))
+    now = now or datetime.now(timezone.utc)
+    if started is None or (now - started).total_seconds() < CHROMA_OWNER_GRACE_SEC:
+        return {'ok': True, 'msg': '', 'skipped': 'worker just started'}
+    lock_cmd = _proc_cmdline(lock_pid)
+    if not lock_cmd or 'worker-service' not in lock_cmd:
+        return {'ok': True, 'msg': '', 'skipped': 'lock holder not a live worker'}   # 낡은 잠금은 워커가 스스로 지운다
+    if 'worker-service' not in (_proc_cmdline(worker_pid_) or ''):
+        return {'ok': True, 'msg': '', 'skipped': 'current worker not live'}
+    return {'ok': False, 'lock_pid': lock_pid, 'worker_pid': worker_pid_,
+            'msg': 'Chroma 쓰기 잠금을 고아 워커(PID {})가 쥐고 있음 — 현재 워커(PID {})의 벡터 저장·검색 막힘'.format(
+                lock_pid, worker_pid_),
+            'fix': 'chroma-owner'}
+
+
+def kill_orphan_worker(pid: int) -> bool:
+    """잠금 쥔 고아 워커와 그 자식(chroma-mcp)을 끝낸다. 끝내기 직전에 worker-service 프로세스인지 다시 확인한다."""
+    if 'worker-service' not in (_proc_cmdline(pid) or ''):
+        return False
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(int(pid)), '/T', '/F'], capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            import signal
+            os.kill(int(pid), signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        return False
+    return _proc_cmdline(pid) is None
+
+
 def run_checks(services: bool = True, worker: bool = True, recall: bool = True) -> Dict[str, Any]:
     """worker=False: 세션 시작 훅용 — 그 시점엔 claude-mem 이 워커를 막 띄우는 중이라 '꺼짐'이 오탐이 되고,
     같은 순간 복구가 워커를 또 띄우면 충돌한다. 워커는 claude-mem 자체 훅에 맡긴다."""
@@ -544,6 +618,7 @@ def run_checks(services: bool = True, worker: bool = True, recall: bool = True) 
     out['spool'] = check_spool(prev)
     out['chroma-pending'] = check_chroma_pending()
     out['chroma-log'] = check_chroma_log()
+    out['chroma-owner'] = check_chroma_owner()
     out['usage'] = recall_usage()
     problems = [k for k, v in out.items() if isinstance(v, dict) and v.get('ok') is False]
     out['ok'] = not problems
@@ -566,6 +641,10 @@ def fix(result: Dict[str, Any]) -> List[str]:
     wants = {v.get('fix') for v in result.values() if isinstance(v, dict) and v.get('fix')}
     # 아래 기동 복구 전의 워커 상태. 꺼져 있던 워커는 방금 기동이 백필을 하므로 재시작이 필요 없다.
     worker_was_up = result['worker'].get('ok') if isinstance(result.get('worker'), dict) else worker_up()
+    if 'chroma-owner' in wants:
+        pid = (result.get('chroma-owner') or {}).get('lock_pid')
+        # 고아를 끝내면 워커의 다음 Chroma 연결이 낡은 잠금을 지우고 잡는다. 밀린 벡터는 아래 vector-backfill 이 맡는다.
+        done.append('chroma-owner:' + ('ok' if isinstance(pid, int) and kill_orphan_worker(pid) else 'fail'))
     if 'proxy' in wants:
         done.append('proxy:' + ('ok' if ensure_proxy(observer_proxy() or '') else 'fail'))
     if wants & {'worker', 'automemory'}:
