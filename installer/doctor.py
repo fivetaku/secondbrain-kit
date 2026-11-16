@@ -348,6 +348,8 @@ def check_state_and_capture():
                 rec(INFO, '캡처 %s' % src, detail + ' — 셋업 답에서 쓰지 않는 에이전트(정보)')
             else:
                 rec('⚠', '캡처 %s' % src, detail)
+        elif used is not None and src not in used:
+            rec(INFO, '캡처 %s' % src, '아직 없음 — 셋업 답에서 쓰지 않는 에이전트(정보)')
         else:
             rec('⚠', '캡처 %s' % src, '아직 없음 — 세션을 한 번 열고 도구를 써 보세요')
     con.close()
@@ -365,14 +367,19 @@ LOG_TAIL_BYTES = 20 * 1024 * 1024  # 파일당 끝에서 이만큼만 읽는다(
 INFO = 'ℹ'                         # 정보 — 판정에 영향 없음(❌ 가 아니므로 sb setup 1단계도 통과)
 
 
+# 워커가 직접 찍은 경고·오류 줄의 머리(claude-mem 로거 형식 '[YYYY-MM-DD HH:MM:SS.mmm] [ERROR] '·'[WARN ] ').
+# INFO 줄(훅·큐가 찍는 도구 입력)과 머리 없는 이어짐 줄(관측 본문·여러 줄 출력)은 문구가 들어 있어도 잠금 증상이 아니다.
+_WORKER_PROBLEM_HEAD = re.compile(rb'\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?\] \[(?:ERROR|WARN) ?\]')
+
+
 def _count_log_lines(data: bytes, patterns=CHROMA_LOCK_PATTERNS) -> int:
-    """patterns 중 하나라도 든 줄 수(한 줄에 둘 이상 있어도 1). 훅 줄([HOOK …])은 실행 명령이 찍혀 오탐이라 뺀다."""
+    """patterns 중 하나라도 든 워커 경고·오류 줄 수(한 줄에 둘 이상 있어도 1). INFO·훅 줄과 이어짐 줄은 뺀다."""
     starts = set()
     for p in patterns:
         i = data.find(p)
         while i >= 0:
             s = data.rfind(b'\n', 0, i) + 1
-            if s not in starts and b'] [HOOK' not in data[s:i]:
+            if s not in starts and _WORKER_PROBLEM_HEAD.match(data, s, i) and b'] [HOOK' not in data[s:i]:
                 starts.add(s)
             i = data.find(p, i + len(p))
     return len(starts)
@@ -439,9 +446,16 @@ def chroma_lock_owner():
     return True, pid, pid_alive(pid)
 
 
+def _log_today():
+    """오늘 로그 파일의 날짜. 워커는 파일 이름을 new Date().toISOString() 의 UTC 날짜로 정한다(줄 안의 시각은 현지 시각)
+    — 현지 날짜로 고르면 UTC 보다 늦은 시간대의 저녁에는 가장 최근 파일을 놓친다."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date()
+
+
 def check_chroma_lock(today=None):
     """최근 7일 claude-mem 워커 로그의 잠금 충돌·backoff 줄 수와 잠금 파일 주인 PID 생존 여부(읽기 전용)."""
-    from datetime import date, timedelta
+    from datetime import timedelta
     logs = sb_config.claude_mem_dir() / 'logs'
     has, pid, alive = chroma_lock_owner()
     owner = ''
@@ -450,7 +464,7 @@ def check_chroma_lock(today=None):
                  if pid is not None else ' · 잠금 파일 pid 못 읽음')
     if not logs.is_dir():
         return rec(INFO, 'Chroma 잠금', '로그 없음(%s)%s' % (_short(logs), owner))
-    today = today or date.today()   # 로그 파일 이름은 워커가 찍은 현지 날짜다
+    today = today or _log_today()
     total, files = 0, 0
     for k in range(CHROMA_LOCK_DAYS):
         p = logs / ('claude-mem-%s.log' % (today - timedelta(days=k)).isoformat())
@@ -507,12 +521,14 @@ def _tree_bytes(path: Path) -> int:
 
 
 def _claude_mem_backups() -> list:
-    """claude-mem 폴더의 DB 백업(이름이나 담긴 폴더 이름에 backup·bak). claude-mem.db 와 그 -wal·-shm 은 뺀다."""
+    """claude-mem 폴더의 DB 백업(이름이나 담긴 폴더 이름에 backup·bak). 운영 DB(claude-mem.db 와 그 -wal·-shm·-journal)만 뺀다
+    — claude-mem.db.bak-… 처럼 운영 DB 이름으로 시작하는 백업은 센다."""
     cm = sb_config.claude_mem_dir()
+    live = {'claude-mem.db', 'claude-mem.db-wal', 'claude-mem.db-shm', 'claude-mem.db-journal'}
     out = []
     for p in list(cm.glob('*')) + list(cm.glob('backup*/*')) + list(cm.glob('bak*/*')):
         name = p.name.lower()
-        if not p.is_file() or p.is_symlink() or '.db' not in name or name.startswith('claude-mem.db'):
+        if not p.is_file() or p.is_symlink() or '.db' not in name or (p.parent == cm and name in live):
             continue
         if any(t in name or t in p.parent.name.lower() for t in ('backup', 'bak')):
             out.append(p)

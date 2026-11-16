@@ -111,6 +111,28 @@ class ChromaLockTests(Base):
         self.assertNotIn('npx', detail)
         self.assertNotIn('--restart-worker', detail)
 
+    def test_info_and_continuation_lines_are_not_counted(self):
+        # 큐가 찍는 도구 입력(INFO)과 머리 없는 이어짐 줄(관측 본문·여러 줄 출력)에 문구가 있어도 잠금 증상이 아니다
+        today = date(2026, 11, 16)
+        self.write_log(today, ['[{d} 10:00:05.000] [INFO ] [QUEUE ] [session-1] ENQUEUED | tool_input=grep "Batch add failed" x\n',
+                               '[{d} 10:00:06.000] [INFO ] [WORKER] 관측 본문:\n',
+                               '  문서에 "falling back to FTS" 와 "is already owned by PID" 를 적었다\n',
+                               "err = b'[{d} 10:00:00.000] [ERROR] [CHROMA_MCP] is already owned by PID 1'\n",
+                               '[{d} 10:00:07.000] [ERROR] [CHROMA_SYNC] Batch add failed — watermark will not advance\n'])
+        self.d.check_chroma_lock(today=today)
+        level, _, detail = self.row('Chroma 잠금')
+        self.assertEqual(level, '⚠')
+        self.assertIn('줄 1건', detail)
+
+    def test_log_file_date_is_utc(self):
+        # 워커는 파일 이름을 UTC 날짜로 정한다 — 현지 날짜가 하루 늦은 저녁에도 오늘(UTC) 파일을 읽어야 한다
+        from datetime import datetime, timezone
+        self.assertEqual(self.d._log_today(), datetime.now(timezone.utc).date())
+        utc_today = self.d._log_today()
+        self.write_log(utc_today, [LOCK_LINE])
+        self.d.check_chroma_lock()
+        self.assertIn('로그 1개', self.row('Chroma 잠금')[2])
+
     def test_reads_only_tail_of_big_log(self):
         today = date(2026, 11, 16)
         self.write_log(today, [LOCK_LINE] * 100 + [OK_LINE] * 100)
@@ -206,6 +228,16 @@ class DiskUsageTests(Base):
         self.sparse(self.cm / 'backups' / 'old.db', 1)
         self.assertEqual(sorted(p.name for p in self.d._claude_mem_backups()), ['a.db.bak', 'old.db', 'x-backup.db'])
 
+    def test_backup_named_after_live_db_is_counted(self):
+        # claude-mem.db.bak-… 처럼 운영 DB 이름으로 시작하는 백업도 백업이다. 운영 DB 와 -wal·-shm·-journal 만 뺀다
+        for n in ('claude-mem.db', 'claude-mem.db-wal', 'claude-mem.db-shm', 'claude-mem.db-journal',
+                  'claude-mem.db.bak-20260926', 'claude-mem.db.backup', 'claude-mem-backup.db'):
+            self.sparse(self.cm / n, 1)
+        self.sparse(self.cm / 'backups' / 'claude-mem.db', 1)   # 백업 폴더 안의 같은 이름은 백업이다
+        found = sorted(str(p.relative_to(self.cm)).replace(os.sep, '/') for p in self.d._claude_mem_backups())
+        self.assertEqual(found, ['backups/claude-mem.db', 'claude-mem-backup.db', 'claude-mem.db.backup',
+                                 'claude-mem.db.bak-20260926'])
+
 
 class CaptureAgentTests(Base):
     def make_db(self, ages_h):
@@ -232,6 +264,20 @@ class CaptureAgentTests(Base):
         level, _, detail = self.row('캡처 codex')
         self.assertEqual(level, self.d.INFO)
         self.assertIn('쓰지 않는', detail)
+
+    def test_never_captured_unused_agent_is_info(self):
+        self.make_db({'claude': 1})
+        self.answer(['claude'])
+        self.run_capture()
+        level, _, detail = self.row('캡처 codex')
+        self.assertEqual(level, self.d.INFO)
+        self.assertIn('아직 없음', detail)
+
+    def test_never_captured_used_agent_still_warns(self):
+        self.make_db({'claude': 1})
+        self.answer(['claude', 'codex'])
+        self.run_capture()
+        self.assertEqual(self.row('캡처 codex')[0], '⚠')
 
     def test_stale_used_agent_still_warns(self):
         self.make_db({'claude': 1, 'codex': 24 * 51})
