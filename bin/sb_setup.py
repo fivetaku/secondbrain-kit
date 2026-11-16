@@ -383,8 +383,9 @@ def stage1(answers: Dict[str, Any]) -> Dict[str, Any]:
     metrics = [metric(name, level, '❌ 아님', level != '❌', detail) for level, name, detail in rows]
     bad = [name for level, name, _ in rows if level == '❌']
     if bad:
-        return result(1, 'stop', metrics, '고칠 항목: %s — 설치기를 다시 돌리거나(python installer/install.py) '
-                      '`python installer/install.py --doctor`로 확인한 뒤 sb setup' % ', '.join(bad[:5]))
+        inst = KIT / 'installer' / 'install.py'   # 키트가 어느 폴더에 있든(기본 위치가 아니어도) 그대로 따라 칠 수 있게
+        return result(1, 'stop', metrics, '고칠 항목: %s — 설치기를 다시 돌리거나(python "%s") '
+                      '`python "%s" --doctor`로 확인한 뒤 sb setup' % (', '.join(bad[:5]), inst, inst))
     return result(1, 'pass', metrics)
 
 

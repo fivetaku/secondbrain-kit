@@ -103,7 +103,8 @@ def check_claude_mem_version() -> Dict[str, Any]:
         return {'ok': True, 'version': v}
     lo, hi = sb_claude_mem.TESTED
     return {'ok': False, 'version': v, 'fix': None,
-            'msg': 'claude-mem {}는 키트 검증 범위({}~{}) 밖 — `python installer/install.py --doctor`로 chroma-mcp 기동 확인'.format(v, lo, hi)}
+            'msg': 'claude-mem {}는 키트 검증 범위({}~{}) 밖 — `python "{}" --doctor`로 chroma-mcp 기동 확인'.format(
+                v, lo, hi, BIN.parent / 'installer' / 'install.py')}
 
 
 def ensure_worker(wait: float = 30.0) -> bool:
