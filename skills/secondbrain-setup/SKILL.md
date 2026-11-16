@@ -31,6 +31,7 @@ description: 세컨브레인(secondbrain-kit) 셋업을 대화로 진행한다 �
    받은 답만 넘겨 기록한다(답하지 않은 항목은 빼면 자동값이 남는다).
    자료 위치 답이 바뀌면 엔진이 2단계(등록)부터 다시 돌게 되감는다 — 설치기가 이미 1~4단계를 지났어도 3에서 반영된다.
    과거 세션은 감지만 하고 적재하지 않는다(skip). 사용자가 특정 세션 소스를 넣자고 하면 `sb sources select <id> --json`.
+   MCP 커넥터(Slack·Confluence·Drive 등)는 설정의 서버 이름만 감지해 `kind: mcp`, `mode: live`로 남긴다. MCP 커넥터 자료는 자동으로 넣지 않는다. 넣고 싶으면 에이전트에게 내보내기(md/txt)를 시켜 그 폴더를 `sb sources add <폴더> --json`(또는 `--sources` 답)으로 등록한다.
    ```
    sb setup answer --agents claude,codex --sources "~/meetings,~/docs" --llm-route claude --embedding y --json
    ```
